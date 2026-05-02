@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/misa-actuator",
+    "crates/misa-actuator-tui",
+    "crates/lkmotor-protocol",
+    "crates/lkmotor-driver",
+    "crates/robstride-protocol",
+    "crates/robstride-driver",
+    "crates/robstride-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Takara Kasai <takara.kasai@gmail.com>"]
+repository = "https://github.com/kasai-takara/misa-actuator"
+
+[workspace.dependencies]
+# Workspace-internal crates
+misa-actuator = { path = "crates/misa-actuator", version = "0.1.0" }
+lkmotor-protocol = { path = "crates/lkmotor-protocol", version = "0.1.0" }
+lkmotor-driver = { path = "crates/lkmotor-driver", version = "0.1.0" }
+robstride-protocol = { path = "crates/robstride-protocol", version = "0.1.0" }
+robstride-driver = { path = "crates/robstride-driver", version = "0.1.0" }
+
+# Shared third-party deps
+serialport = "4"
+socketcan = "3.3"
+embedded-can = "0.4"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+confy = "0.6"

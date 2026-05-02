@@ -1,0 +1,11 @@
+[package]
+name = "misa-actuator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Common actuator-control trait, SI-unit feedback types, and unified error type shared by lkmotor / robstride / myactuator drivers"
+
+[dependencies]
+thiserror = { workspace = true }

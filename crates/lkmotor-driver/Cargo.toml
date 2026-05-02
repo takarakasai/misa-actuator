@@ -1,0 +1,67 @@
+[package]
+name = "lkmotor-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Rust driver for LKMTech V3 servo motors (MG / MS / RMD-X) over RS485"
+
+[dependencies]
+misa-actuator = { workspace = true }
+lkmotor-protocol = { workspace = true, features = ["alloc"] }
+serialport = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+
+[[example]]
+name = "probe"
+path = "examples/probe.rs"
+
+[[example]]
+name = "scan"
+path = "examples/scan.rs"
+
+[[example]]
+name = "dump"
+path = "examples/dump.rs"
+
+[[example]]
+name = "spin"
+path = "examples/spin.rs"
+
+[[example]]
+name = "spin_revs"
+path = "examples/spin_revs.rs"
+
+[[example]]
+name = "wake"
+path = "examples/wake.rs"
+
+[[example]]
+name = "mit_hold"
+path = "examples/mit_hold.rs"
+
+[[example]]
+name = "mit_chirp"
+path = "examples/mit_chirp.rs"
+
+[[example]]
+name = "pos_chirp"
+path = "examples/pos_chirp.rs"
+
+[[example]]
+name = "dump_params"
+path = "examples/dump_params.rs"
+
+[[example]]
+name = "param_probe"
+path = "examples/param_probe.rs"
+
+[[example]]
+name = "dialect_probe"
+path = "examples/dialect_probe.rs"

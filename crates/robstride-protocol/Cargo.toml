@@ -1,0 +1,15 @@
+[package]
+name = "robstride-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Pure protocol layer for the Robstride CAN servo motor family (no_std-friendly)"
+
+[features]
+default = []
+# Enables `alloc`-using helpers that produce owned data payload buffers.
+alloc = []
+
+[dependencies]

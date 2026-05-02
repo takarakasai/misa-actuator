@@ -1,0 +1,15 @@
+[package]
+name = "lkmotor-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Pure protocol layer for the LKMTech V3 servo motor family (no_std-friendly)"
+
+[features]
+default = []
+# When enabled, brings in `alloc` for owned response types.
+alloc = []
+
+[dependencies]

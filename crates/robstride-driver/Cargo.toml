@@ -1,0 +1,16 @@
+[package]
+name = "robstride-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Rust SocketCAN driver for Robstride RS-series servo motors (RS-00..06 + Edulite01/02/05)"
+
+[dependencies]
+misa-actuator = { workspace = true }
+robstride-protocol = { workspace = true }
+socketcan = { workspace = true }
+embedded-can = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }

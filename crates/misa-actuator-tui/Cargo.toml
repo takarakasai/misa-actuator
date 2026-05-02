@@ -1,0 +1,25 @@
+[package]
+name = "misa-actuator-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Driver-agnostic ratatui debug TUI for any misa-actuator-compatible motor driver"
+
+[dependencies]
+misa-actuator = { workspace = true }
+lkmotor-driver = { workspace = true }
+robstride-driver = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+serde = { workspace = true }
+confy = { workspace = true }
+
+[[bin]]
+name = "misa-actuator-tui"
+path = "src/main.rs"

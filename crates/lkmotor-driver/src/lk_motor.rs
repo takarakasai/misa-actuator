@@ -26,6 +26,7 @@
 //! - **No run-mode parameter** — each motion command picks its own
 //!   controller, so `Actuator::set_run_mode` is a no-op.
 
+use std::ops::RangeInclusive;
 use std::time::Duration;
 
 use misa_actuator::{
@@ -33,7 +34,7 @@ use misa_actuator::{
     MotorStatus as MisaStatus, Result as MisaResult, RunMode,
 };
 
-use crate::bus::LkBus;
+use crate::bus::{LkBus, LkCommands};
 use crate::driver::Rs485Driver;
 use crate::error::Result as LkResult;
 use crate::motor::{ErrorFlags as LkErrorFlags, Motor, MotorConfig, MotorFeedback as LkFeedback,
@@ -273,6 +274,36 @@ impl<B: LkBus> Actuator for LkMotor<B> {
 
     fn is_enabled_hint(&self) -> bool {
         self.enabled
+    }
+
+    fn scan_bus(
+        &mut self,
+        id_range: RangeInclusive<u8>,
+        timeout_per_id: Duration,
+    ) -> MisaResult<Vec<u8>> {
+        let mut found = Vec::new();
+        for id in id_range {
+            if self.probe_motor(id, timeout_per_id)? {
+                found.push(id);
+            }
+        }
+        Ok(found)
+    }
+
+    fn probe_motor(&mut self, id: u8, _timeout: Duration) -> MisaResult<bool> {
+        // lkmotor V3 has no broadcast / device-discovery command. We
+        // probe by sending `ReadMotorState1` (`0x9A`) — a side-effect-free
+        // read — and check for a response.
+        //
+        // Note: `_timeout` is currently ignored because the LkBus trait
+        // doesn't expose per-request timeout setting; we use whatever the
+        // bus was configured with at construction. Override `--timeout-ms`
+        // at the TUI / driver level to control scan speed.
+        let Some(motor_id) = MotorId::new(id) else {
+            return Ok(false);
+        };
+        let _ = self.bus.flush_rx();
+        Ok(self.bus.read_state1(motor_id).is_ok())
     }
 }
 

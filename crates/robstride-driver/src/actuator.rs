@@ -33,6 +33,9 @@
 //! them in the wrong mode silently does nothing on the wire — confusing.
 //! We return an explicit error instead.
 
+use std::ops::RangeInclusive;
+use std::time::Duration;
+
 use misa_actuator::{
     Actuator, Error as MisaError, ErrorFlags, MotorFeedback as MisaFeedback, MotorStatus,
     Result as MisaResult, RunMode as MisaRunMode,
@@ -41,6 +44,7 @@ use robstride_protocol::{MotorFeedback as RsFeedback, MotorStatusBits, ParamInde
 
 use crate::bus::RobstrideBus;
 use crate::driver::Motor;
+use crate::scan::scan_bus_on;
 
 /// Default `LimitSpd` (rad/s) written before enabling in Position mode so
 /// that a freshly-enabled motor doesn't run away at maximum speed.
@@ -227,5 +231,25 @@ impl<B: RobstrideBus> Actuator for Motor<B> {
 
     fn is_enabled_hint(&self) -> bool {
         self.is_enabled()
+    }
+
+    fn scan_bus(
+        &mut self,
+        id_range: RangeInclusive<u8>,
+        timeout_per_id: Duration,
+    ) -> MisaResult<Vec<u8>> {
+        let host_id = self.host_id();
+        // scan_bus_on borrows the bus mutably. Since we're inside &mut self
+        // we can hand it our own bus.
+        let results =
+            scan_bus_on(self.bus(), host_id, id_range, timeout_per_id, None)?;
+        Ok(results.into_iter().map(|r| r.motor_id).collect())
+    }
+
+    fn probe_motor(&mut self, motor_id: u8, timeout: Duration) -> MisaResult<bool> {
+        let host_id = self.host_id();
+        let results =
+            scan_bus_on(self.bus(), host_id, motor_id..=motor_id, timeout, None)?;
+        Ok(results.iter().any(|r| r.motor_id == motor_id))
     }
 }

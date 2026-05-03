@@ -1,5 +1,7 @@
 //! Command catalog and parameter dialogs for the TUI.
 
+use std::time::Duration;
+
 use misa_actuator::{Actuator, RunMode};
 
 /// Every command the debug TUI can dispatch through the [`Actuator`] trait.
@@ -9,6 +11,7 @@ use misa_actuator::{Actuator, RunMode};
 /// Enter — no editing required.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Command {
+    Scan,
     Enable,
     Disable,
     SetZero,
@@ -26,6 +29,7 @@ pub enum Command {
 
 impl Command {
     pub const ALL: &'static [Command] = &[
+        Command::Scan,
         Command::Enable,
         Command::Disable,
         Command::SetZero,
@@ -43,6 +47,7 @@ impl Command {
 
     pub fn label(self) -> &'static str {
         match self {
+            Command::Scan            => "Scan Bus",
             Command::Enable          => "Enable",
             Command::Disable         => "Disable",
             Command::SetZero         => "Set Zero (anchor position)",
@@ -96,6 +101,11 @@ impl ParamField {
 
 pub fn params_for(cmd: Command) -> Vec<ParamField> {
     match cmd {
+        Command::Scan => vec![
+            ParamField::new("from", "1", "Start motor ID"),
+            ParamField::new("to", "32", "End motor ID (lkmotor max=32, robstride max=127)"),
+            ParamField::new("timeout_ms", "50", "Per-ID timeout [ms]"),
+        ],
         Command::SetPosition => vec![
             ParamField::new("pos", "0.0", "Target position [rad]"),
             ParamField::new("max_speed", "5.0", "Max speed [rad/s]"),
@@ -118,10 +128,29 @@ fn pf(params: &[ParamField], name: &str) -> Option<f32> {
     params.iter().find(|p| p.name == name)?.value.parse::<f32>().ok()
 }
 
+fn pf_u8(params: &[ParamField], name: &str, default: u8) -> u8 {
+    params
+        .iter()
+        .find(|p| p.name == name)
+        .and_then(|p| p.value.parse::<u8>().ok())
+        .unwrap_or(default)
+}
+
+fn pf_u64(params: &[ParamField], name: &str, default: u64) -> u64 {
+    params
+        .iter()
+        .find(|p| p.name == name)
+        .and_then(|p| p.value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 /// Outcome of dispatching a command through the actuator.
 pub struct Dispatch {
     pub log_line: String,
     pub feedback: Option<misa_actuator::MotorFeedback>,
+    /// For commands that produce extra log lines (e.g. per-id scan results),
+    /// these get appended after `log_line`.
+    pub extra_log_lines: Vec<String>,
 }
 
 pub fn dispatch(
@@ -129,7 +158,29 @@ pub fn dispatch(
     params: &[ParamField],
     actuator: &mut dyn Actuator,
 ) -> Dispatch {
+    let mut extra: Vec<String> = Vec::new();
     let result = match cmd {
+        Command::Scan => {
+            let from = pf_u8(params, "from", 1);
+            let to = pf_u8(params, "to", 32);
+            let timeout_ms = pf_u64(params, "timeout_ms", 50);
+            let lo = from.max(1);
+            let hi = to.max(lo);
+            match actuator.scan_bus(lo..=hi, Duration::from_millis(timeout_ms)) {
+                Ok(ids) => {
+                    if ids.is_empty() {
+                        extra.push(format!("  no motors found in {}..={}", lo, hi));
+                    } else {
+                        extra.push(format!("  found {} motor(s):", ids.len()));
+                        for id in &ids {
+                            extra.push(format!("    id={}", id));
+                        }
+                    }
+                    Ok(None)
+                }
+                Err(e) => Err(e),
+            }
+        }
         Command::Enable => actuator.enable().map(Some),
         Command::Disable => actuator.disable().map(|_| None),
         Command::SetZero => actuator.set_zero().map(|_| None),
@@ -181,11 +232,13 @@ pub fn dispatch(
             Dispatch {
                 log_line: line,
                 feedback: fb,
+                extra_log_lines: extra,
             }
         }
         Err(e) => Dispatch {
             log_line: format!("{} FAILED: {}", cmd.label(), e),
             feedback: None,
+            extra_log_lines: extra,
         },
     }
 }

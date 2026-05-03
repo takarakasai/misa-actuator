@@ -1,6 +1,9 @@
 //! The `Actuator` trait — the bus-independent SI-unit motor-control API.
 
-use crate::error::Result;
+use core::ops::RangeInclusive;
+use core::time::Duration;
+
+use crate::error::{Error, Result};
 use crate::feedback::{MotorFeedback, MotorStatus, RunMode};
 
 /// High-level motor-control interface.
@@ -99,5 +102,34 @@ pub trait Actuator {
     /// not a fresh query.
     fn is_enabled_hint(&self) -> bool {
         false
+    }
+
+    /// Probe the underlying bus for responding motors in `id_range`.
+    ///
+    /// Returns the list of motor IDs that responded. Implementations
+    /// share the actuator's open bus (no second `open` of the
+    /// transport), so this works even on RS485 ports that the OS only
+    /// allows one process to hold.
+    ///
+    /// Default returns [`Error::Unsupported`]; drivers that can scan
+    /// their bus override this.
+    fn scan_bus(
+        &mut self,
+        id_range: RangeInclusive<u8>,
+        timeout_per_id: Duration,
+    ) -> Result<Vec<u8>> {
+        let _ = (id_range, timeout_per_id);
+        Err(Error::Unsupported("scan_bus"))
+    }
+
+    /// Probe a single motor id and report whether it responded.
+    ///
+    /// This is the building block used by progress-reporting scan UIs:
+    /// the caller drives the loop one id at a time and renders progress
+    /// between probes. Default implementation falls back to
+    /// [`Self::scan_bus`] over a single-element range.
+    fn probe_motor(&mut self, motor_id: u8, timeout: Duration) -> Result<bool> {
+        let found = self.scan_bus(motor_id..=motor_id, timeout)?;
+        Ok(found.iter().any(|&id| id == motor_id))
     }
 }

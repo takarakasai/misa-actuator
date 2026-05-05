@@ -163,6 +163,10 @@ pub struct RunReport {
     pub n_samples: usize,
     pub achieved_rate_hz: f32,
     pub n_freqs: usize,
+    /// Median magnitude-squared coherence over the identified band. Near 1 ⇒ a
+    /// clean identification; low ⇒ the motor barely responded (not enabled /
+    /// faulted), the amplitude was too small, or the response was too noisy.
+    pub median_coherence: f32,
 }
 
 /// Convenience for CLIs: run a chirp, write the raw log + the estimated Bode to
@@ -180,10 +184,21 @@ pub fn run_chirp_to_csv(
     log.write_csv(raw_csv)?; // io::Error → misa Error via From
     let fr = log.frf();
     fr.write_csv(bode_csv)?;
+
+    // Median coherence as a one-number "did this identification work?" score.
+    let mut coh = fr.coherence.clone();
+    coh.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+    let median_coherence = if coh.is_empty() {
+        0.0
+    } else {
+        coh[coh.len() / 2]
+    };
+
     Ok(RunReport {
         n_samples: log.samples.len(),
         achieved_rate_hz: log.achieved_rate_hz,
         n_freqs: fr.freqs_hz.len(),
+        median_coherence,
     })
 }
 

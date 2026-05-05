@@ -175,11 +175,12 @@ mod tests {
         assert_eq!(fb.t_mos, 40.0);
         assert_eq!(fb.t_rotor, 50.0);
 
-        // The enable frame and a MIT frame should both have gone out on CAN_ID=1.
+        // enable() clears a latched fault (FF..FB) before enabling (FF..FC);
+        // then the MIT frame goes out. All on CAN_ID=1.
         let sent = &motor.bus().sent;
-        assert_eq!(sent[0].can_id, 0x001);
-        assert_eq!(sent[0].data, vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC]);
-        assert_eq!(sent[1].can_id, 0x001); // MIT command id == CAN_ID
+        assert_eq!(sent[0].data, vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFB]); // clear-error
+        assert_eq!(sent[1].data, vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC]); // enable
+        assert_eq!(sent[2].can_id, 0x001); // MIT command id == CAN_ID
     }
 
     #[test]

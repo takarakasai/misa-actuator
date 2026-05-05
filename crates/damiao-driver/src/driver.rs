@@ -246,7 +246,15 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
 
     /// Enable closed-loop control (`FF*7 FC`). Returns feedback if the motor
     /// replies.
+    ///
+    /// Clears any latched fault first (`FF*7 FB`): a faulted motor silently
+    /// ignores control commands while still reporting feedback — observed on the
+    /// DM-J3507, where a stale fault made MIT commands produce no torque. The
+    /// clear is harmless when there is no fault.
     pub fn enable(&mut self) -> Result<Option<Feedback>> {
+        let (cid, cdata) = build_clear_error_frame(self.can_id);
+        self.send(cid, &cdata)?;
+        let _ = self.try_recv_feedback();
         let (id, data) = build_enable_frame(self.can_id);
         self.send(id, &data)?;
         let fb = self.try_recv_feedback()?;

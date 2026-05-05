@@ -1,3 +1,5 @@
 /target
 /.venv
 *.bak
+# chirp / sysid run outputs
+*.csv

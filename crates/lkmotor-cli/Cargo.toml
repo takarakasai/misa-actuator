@@ -10,6 +10,7 @@ description = "Command-line test app for LKMTech V3 servo motors (MG4005 / MG / 
 [dependencies]
 lkmotor-driver = { workspace = true }
 misa-actuator = { workspace = true }
+misa-sysid = { workspace = true }
 log = { workspace = true }
 env_logger = "0.11"
 anyhow = "1"

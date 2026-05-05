@@ -156,6 +156,45 @@ enum Command {
         #[arg(long)]
         save: bool,
     },
+    /// Chirp-excitation system identification → CSV log + Bode (frequency
+    /// response). Position channel is safest (bounded around current pos).
+    Chirp {
+        /// Channel: position | velocity | torque | mit.
+        #[arg(long, default_value = "position")]
+        channel: String,
+        /// Start frequency (Hz).
+        #[arg(long, default_value_t = 0.5)]
+        f0: f32,
+        /// End frequency (Hz).
+        #[arg(long, default_value_t = 30.0)]
+        f1: f32,
+        /// Sweep duration (s).
+        #[arg(long, default_value_t = 10.0)]
+        duration: f32,
+        /// Amplitude (rad / rad·s / N·m by channel). Keep small.
+        #[arg(long, default_value_t = 0.15)]
+        amp: f32,
+        /// Logarithmic sweep (default linear).
+        #[arg(long)]
+        log: bool,
+        /// Target loop rate (Hz).
+        #[arg(long, default_value_t = 500.0)]
+        rate: f32,
+        /// Position channel max speed (rad/s).
+        #[arg(long, default_value_t = 5.0)]
+        max_speed: f32,
+        /// MIT channel kp / kd.
+        #[arg(long, default_value_t = 0.0)]
+        kp: f32,
+        #[arg(long, default_value_t = 0.0)]
+        kd: f32,
+        /// Raw log CSV path.
+        #[arg(long, default_value = "chirp.csv")]
+        out: String,
+        /// Bode CSV path.
+        #[arg(long, default_value = "chirp_bode.csv")]
+        bode: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -367,7 +406,108 @@ fn run<B: DamiaoBus>(motor: &mut DamiaoMotor<B>, cli: &Cli) -> Result<()> {
                 eprintln!("note: CAN_ID/MST_ID changes take effect only after a power cycle");
             }
         }
+        Command::Chirp {
+            channel,
+            f0,
+            f1,
+            duration,
+            amp,
+            log,
+            rate,
+            max_speed,
+            kp,
+            kd,
+            out,
+            bode,
+        } => {
+            chirp_cmd(
+                &mut *motor,
+                channel,
+                *f0,
+                *f1,
+                *duration,
+                *amp,
+                *log,
+                *rate,
+                *max_speed,
+                *kp,
+                *kd,
+                out,
+                bode,
+            )?;
+        }
     }
+    Ok(())
+}
+
+/// Chirp-identification command: build the excitation, run it, write the raw
+/// log + Bode CSVs. Takes the actuator as `dyn` so it's transport-agnostic.
+#[allow(clippy::too_many_arguments)]
+fn chirp_cmd(
+    act: &mut dyn misa_actuator::Actuator,
+    channel: &str,
+    f0: f32,
+    f1: f32,
+    duration: f32,
+    amp: f32,
+    log_sweep: bool,
+    rate: f32,
+    max_speed: f32,
+    kp: f32,
+    kd: f32,
+    out: &str,
+    bode: &str,
+) -> Result<()> {
+    use misa_sysid::{run_chirp_to_csv, Chirp, Excitation, Sweep};
+
+    let exc = match channel.to_lowercase().as_str() {
+        "position" | "pos" => Excitation::Position {
+            max_speed_rad_s: max_speed,
+        },
+        "velocity" | "vel" => Excitation::Velocity,
+        "torque" | "current" => Excitation::Torque,
+        "mit" => Excitation::MitPosition { kp, kd },
+        other => bail!("unknown --channel '{other}' (position|velocity|torque|mit)"),
+    };
+    let chirp = Chirp {
+        f_start_hz: f0,
+        f_end_hz: f1,
+        duration_s: duration,
+        amplitude: amp,
+        bias: 0.0,
+        sweep: if log_sweep {
+            Sweep::Logarithmic
+        } else {
+            Sweep::Linear
+        },
+    };
+
+    let abort = Arc::new(AtomicBool::new(false));
+    {
+        let a = abort.clone();
+        let _ = ctrlc::set_handler(move || a.store(true, Ordering::SeqCst));
+    }
+    println!("chirp {f0}->{f1} Hz over {duration}s, amp {amp}, channel={channel} (Ctrl-C aborts)...");
+
+    let mut raw = std::io::BufWriter::new(
+        std::fs::File::create(out).with_context(|| format!("create {out}"))?,
+    );
+    let mut bod = std::io::BufWriter::new(
+        std::fs::File::create(bode).with_context(|| format!("create {bode}"))?,
+    );
+    let rep = run_chirp_to_csv(act, &chirp, exc, rate, &abort, &mut raw, &mut bod)?;
+
+    println!(
+        "collected {} samples @ {:.0} Hz (target {:.0})",
+        rep.n_samples, rep.achieved_rate_hz, rate
+    );
+    if rep.achieved_rate_hz < rate * 0.8 {
+        eprintln!(
+            "note: achieved rate is well below target — usable band limited to ~{:.0} Hz",
+            rep.achieved_rate_hz / 2.0
+        );
+    }
+    println!("wrote {out} (raw log) and {bode} ({} freq points)", rep.n_freqs);
     Ok(())
 }
 

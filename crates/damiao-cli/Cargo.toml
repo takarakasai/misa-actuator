@@ -11,6 +11,7 @@ description = "Command-line test app for DAMIAO CAN/CAN-FD servo motors"
 damiao-driver = { workspace = true }
 damiao-protocol = { workspace = true }
 misa-actuator = { workspace = true }
+misa-sysid = { workspace = true }
 log = { workspace = true }
 env_logger = "0.11"
 anyhow = "1"

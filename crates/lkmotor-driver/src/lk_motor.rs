@@ -102,6 +102,35 @@ impl<B: LkBus> LkMotor<B> {
     pub fn motor(&self) -> &Motor {
         &self.motor
     }
+
+    /// Wake the closed-loop controller (`MotorRun`) **without** re-anchoring
+    /// zero (unlike [`Actuator::enable`], which also rezeros and holds).
+    pub fn run(&mut self) -> LkResult<()> {
+        self.motor.enable(&mut self.bus)
+    }
+
+    /// Move to an **absolute** output-frame angle in the motor's power-on
+    /// multi-turn frame (LK-specific; bypasses the rezero anchor). Within a
+    /// power cycle, `move_to_absolute(x)` always targets the same physical
+    /// position, and pairs with [`Self::read_absolute_position`]. The returned
+    /// feedback's velocity / torque are valid; read the absolute position
+    /// separately.
+    pub fn move_to_absolute(
+        &mut self,
+        pos_rad: f32,
+        max_speed_rad_s: f32,
+    ) -> LkResult<MisaFeedback> {
+        Ok(lk_to_misa_feedback(self.motor.set_position_absolute(
+            &mut self.bus,
+            pos_rad,
+            max_speed_rad_s,
+        )?))
+    }
+
+    /// Read the absolute multi-turn position (output-frame rad, power-on frame).
+    pub fn read_absolute_position(&mut self) -> LkResult<f32> {
+        self.motor.read_absolute_angle(&mut self.bus)
+    }
 }
 
 impl LkMotor<Rs485Driver> {
@@ -400,5 +429,28 @@ mod tests {
         let st = m.read_status().unwrap();
         assert_eq!(st.voltage_v, 0.0);
         assert!(!st.error.any());
+    }
+
+    #[test]
+    fn move_to_absolute_commands_absolute_centideg() {
+        let mut m = motor(); // gear_ratio 1.0
+        m.move_to_absolute(std::f32::consts::PI, 5.0).unwrap();
+        // π rad output = 180° = 18000 centideg, sent on PositionClosedLoop2 (0xA4).
+        let frame = m
+            .bus()
+            .sent
+            .iter()
+            .find(|(c, _, _)| *c == 0xA4)
+            .expect("a position frame was sent");
+        let centideg = i64::from_le_bytes(frame.2[0..8].try_into().unwrap());
+        assert!((centideg - 18_000).abs() <= 1, "centideg={centideg}");
+    }
+
+    #[test]
+    fn read_absolute_position_reads_multi_turn_angle() {
+        let mut m = motor();
+        // Mock returns an all-zero 0x92 reply → 0 rad.
+        assert_eq!(m.read_absolute_position().unwrap(), 0.0);
+        assert!(sent_commands(&mut m).contains(&0x92)); // ReadMultiTurnAngle
     }
 }

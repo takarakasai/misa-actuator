@@ -260,6 +260,36 @@ impl Motor {
         Ok(self.feedback_from_state2(s))
     }
 
+    /// Absolute multi-turn position control (`0xA4`) in the motor's **power-on
+    /// multi-turn frame** — no software anchor.
+    ///
+    /// Unlike [`Self::set_position`] (relative to the last [`Self::rezero`]),
+    /// this commands the same frame that [`Self::read_absolute_angle`] reports,
+    /// so a given `pos_rad` maps to a fixed physical position for the duration
+    /// of a power cycle. The returned feedback's velocity / torque are valid;
+    /// its `position_rad` is the host-tracked single-turn value, so use
+    /// [`Self::read_absolute_angle`] for the absolute position.
+    pub fn set_position_absolute<B: LkBus + ?Sized>(
+        &mut self,
+        bus: &mut B,
+        pos_rad: f32,
+        max_speed_rad_s: f32,
+    ) -> Result<MotorFeedback> {
+        let centideg = (pos_rad * DEG_PER_RAD * 100.0 * self.config.gear_ratio) as i64;
+        let max_speed = (max_speed_rad_s.abs() * DEG_PER_RAD * 100.0 * self.config.gear_ratio)
+            .max(100.0) as u32;
+        let resp = bus.position_control_with_speed(self.id, centideg, max_speed)?;
+        let s = parse_state2_from_response(&resp)?;
+        Ok(self.feedback_from_state2(s))
+    }
+
+    /// Read the absolute multi-turn position (`0x92`) in output-frame rad
+    /// (motor power-on frame). Pairs with [`Self::set_position_absolute`].
+    pub fn read_absolute_angle<B: LkBus + ?Sized>(&mut self, bus: &mut B) -> Result<f32> {
+        let centideg = bus.read_multi_turn_angle(self.id)?;
+        Ok(centideg as f32 / 100.0 / DEG_PER_RAD / self.config.gear_ratio)
+    }
+
     /// Velocity control (`0xA2`). `vel_rad_s` is output-frame.
     pub fn set_velocity<B: LkBus + ?Sized>(
         &mut self,

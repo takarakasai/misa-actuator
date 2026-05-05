@@ -84,6 +84,14 @@ enum Command {
         /// Stop after this many seconds (omit for Ctrl-C).
         #[arg(long)]
         duration: Option<f32>,
+        /// Drive via MIT velocity-tracking (kd) instead of the velocity loop.
+        /// MIT feedback reports torque (the velocity loop does not on some
+        /// firmware), so use this to read the friction torque at speed.
+        #[arg(long)]
+        mit: bool,
+        /// MIT velocity-tracking gain Kd (N·m·s/rad), used with --mit.
+        #[arg(long, default_value_t = 1.0)]
+        mit_kd: f32,
     },
     /// Continuous torque command (Nm).
     Torque {
@@ -336,29 +344,54 @@ fn run(cli: Cli) -> Result<()> {
             }
             motor.disable()?;
         }
-        Command::Spin { velocity, duration } => {
+        Command::Spin {
+            velocity,
+            duration,
+            mit,
+            mit_kd,
+        } => {
             let mut motor = open_motor(&cli)?;
             let _ = motor.disable();
-            motor.set_run_mode(RunMode::Velocity)?;
-            motor.set_velocity(0.0)?;
-            motor.enable()?;
-            motor.set_velocity(*velocity)?;
-            println!("spinning at {velocity} rad/s — Ctrl-C to stop");
-
             let stop = Arc::new(AtomicBool::new(false));
             install_ctrl_c(stop.clone());
             let start = Instant::now();
             let max = duration.map(Duration::from_secs_f32);
-            while !stop.load(Ordering::SeqCst) {
-                if max.is_some_and(|d| start.elapsed() > d) {
-                    break;
+
+            if *mit {
+                // MIT velocity-tracking: τ = kd·(vel_des − vel). MIT feedback
+                // carries torque, so this reads the friction torque at speed.
+                motor.set_run_mode(RunMode::Mit)?;
+                motor.enable()?;
+                println!("spinning at {velocity} rad/s via MIT (kd={mit_kd}) — Ctrl-C to stop");
+                while !stop.load(Ordering::SeqCst) {
+                    if max.is_some_and(|d| start.elapsed() > d) {
+                        break;
+                    }
+                    let fb = motor.mit_control(0.0, *velocity, 0.0, *mit_kd, 0.0)?;
+                    println!(
+                        "  pos={:+.3} rad  vel={:+.3} rad/s  τ={:+.3} Nm",
+                        fb.position, fb.velocity, fb.torque
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
                 }
-                let pos = motor.read_param(ParamIndex::MechPos)?;
-                let vel = motor.read_param(ParamIndex::MechVel)?;
-                println!("  pos={:+.3} rad  vel={:+.3} rad/s", pos, vel);
-                std::thread::sleep(Duration::from_millis(100));
+            } else {
+                motor.set_run_mode(RunMode::Velocity)?;
+                motor.set_velocity(0.0)?;
+                motor.enable()?;
+                motor.set_velocity(*velocity)?;
+                println!("spinning at {velocity} rad/s — Ctrl-C to stop");
+                while !stop.load(Ordering::SeqCst) {
+                    if max.is_some_and(|d| start.elapsed() > d) {
+                        break;
+                    }
+                    let pos = motor.read_param(ParamIndex::MechPos)?;
+                    let vel = motor.read_param(ParamIndex::MechVel)?;
+                    let tau = motor.read_torque().unwrap_or(f32::NAN);
+                    println!("  pos={:+.3} rad  vel={:+.3} rad/s  τ={:+.3} Nm", pos, vel, tau);
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                motor.set_velocity(0.0)?;
             }
-            motor.set_velocity(0.0)?;
             motor.disable()?;
         }
         Command::Torque { torque, duration } => {

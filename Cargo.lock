@@ -990,6 +990,8 @@ dependencies = [
  "ctrlc",
  "env_logger",
  "log",
+ "misa-actuator",
+ "misa-sysid",
  "robstride-driver",
  "robstride-protocol",
 ]

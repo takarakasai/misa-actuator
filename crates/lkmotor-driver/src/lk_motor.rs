@@ -312,3 +312,93 @@ impl<B: LkBus> Drop for LkMotor<B> {
         let _ = self.motor.disable(&mut self.bus);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bus::{LkBus, Response};
+    use crate::error::Result as LkResult;
+    use crate::motor::MotorConfig;
+    use crate::motor_id::MotorId;
+    use misa_actuator::Actuator;
+
+    /// In-memory [`LkBus`] that records every transaction and replies with a
+    /// command-appropriate zero payload, so the `Actuator` command routing can
+    /// be checked without a serial port.
+    #[derive(Default)]
+    struct MockBus {
+        /// (command, motor_id, data) for every `transact`.
+        sent: Vec<(u8, u8, Vec<u8>)>,
+    }
+
+    impl LkBus for MockBus {
+        fn transact(&mut self, command: u8, motor_id: MotorId, data: &[u8]) -> LkResult<Response> {
+            self.sent.push((command, motor_id.get(), data.to_vec()));
+            // ReadMultiTurnAngle (0x92) replies with 8 bytes; State1/State2 and
+            // motion replies are 7 bytes.
+            let len = if command == 0x92 { 8 } else { 7 };
+            Ok(Response {
+                command,
+                motor_id: motor_id.get(),
+                data: vec![0u8; len],
+            })
+        }
+        fn flush_rx(&mut self) -> LkResult<()> {
+            Ok(())
+        }
+    }
+
+    fn motor() -> LkMotor<MockBus> {
+        LkMotor::new(
+            MockBus::default(),
+            MotorId::new(1).unwrap(),
+            MotorConfig::current_units(1.0),
+        )
+    }
+
+    fn sent_commands(m: &mut LkMotor<MockBus>) -> Vec<u8> {
+        m.bus().sent.iter().map(|(c, _, _)| *c).collect()
+    }
+
+    #[test]
+    fn set_velocity_sends_speed_closed_loop() {
+        let mut m = motor();
+        m.set_velocity(1.0).unwrap();
+        assert!(sent_commands(&mut m).contains(&0xA2)); // SpeedClosedLoop
+    }
+
+    #[test]
+    fn set_torque_sends_torque_closed_loop() {
+        let mut m = motor();
+        m.set_torque(0.5).unwrap();
+        assert!(sent_commands(&mut m).contains(&0xA1)); // TorqueClosedLoop
+    }
+
+    #[test]
+    fn probe_motor_true_on_reply() {
+        let mut m = motor();
+        assert!(m.probe_motor(1, Duration::from_millis(10)).unwrap());
+    }
+
+    #[test]
+    fn probe_motor_false_and_silent_for_out_of_range_id() {
+        let mut m = motor();
+        assert!(!m.probe_motor(33, Duration::from_millis(10)).unwrap());
+        assert!(m.bus().sent.is_empty(), "no frame should be sent for an invalid id");
+    }
+
+    #[test]
+    fn scan_bus_collects_responders() {
+        let mut m = motor();
+        let found = m.scan_bus(1..=3, Duration::from_millis(10)).unwrap();
+        assert_eq!(found, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn read_status_parses_zeroed_state1() {
+        let mut m = motor();
+        let st = m.read_status().unwrap();
+        assert_eq!(st.voltage_v, 0.0);
+        assert!(!st.error.any());
+    }
+}

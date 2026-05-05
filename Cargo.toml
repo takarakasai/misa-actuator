@@ -5,6 +5,7 @@ members = [
     "crates/misa-actuator-tui",
     "crates/lkmotor-protocol",
     "crates/lkmotor-driver",
+    "crates/lkmotor-cli",
     "crates/robstride-protocol",
     "crates/robstride-driver",
     "crates/robstride-cli",

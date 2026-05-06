@@ -126,6 +126,7 @@ fn main() -> Result<()> {
         Command::Status => {
             let st = motor.read_status()?;
             let fb = motor.measure()?;
+            let abs = motor.read_absolute_position()?;
             println!(
                 "voltage={:.2} V  temp={:.0}°C  error=0x{:08X}{}",
                 st.voltage_v,
@@ -133,9 +134,11 @@ fn main() -> Result<()> {
                 st.error.raw(),
                 if st.error.any() { " (FAULT)" } else { "" }
             );
+            // pos is the absolute multi-turn angle (power-on frame), the same
+            // frame `move-to` targets.
             println!(
-                "pos={:+.3} rad  vel={:+.3} rad/s  torque={:+.3} N·m  iq={:+.3} A",
-                fb.position_rad, fb.velocity_rad_per_s, fb.torque_nm, fb.current_a
+                "pos(abs)={:+.3} rad  vel={:+.3} rad/s  torque={:+.3} N·m  iq={:+.3} A",
+                abs, fb.velocity_rad_per_s, fb.torque_nm, fb.current_a
             );
         }
         Command::Enable => {
@@ -156,21 +159,39 @@ fn main() -> Result<()> {
             speed,
             duration,
         } => {
-            motor.enable()?;
-            run_for(*duration, || {
-                let fb = motor.set_position(*position, *speed)?;
-                Ok(fb)
+            // Absolute move in the motor's power-on multi-turn frame: `move-to X`
+            // always targets the same physical position (no rezero), matching
+            // the `status` pos readout.
+            motor.run()?; // wake the controller without re-anchoring
+            run_loop(*duration, || {
+                let fb = motor.move_to_absolute(*position, *speed)?;
+                let abs = motor.read_absolute_position()?;
+                Ok(format!(
+                    "pos(abs)={:+.3} rad  vel={:+.3} rad/s  torque={:+.3} N·m",
+                    abs, fb.velocity_rad_per_s, fb.torque_nm
+                ))
             })?;
         }
         Command::Spin { velocity, duration } => {
-            motor.enable()?;
-            run_for(*duration, || motor.set_velocity(*velocity))?;
-            // Drop disables, but stop explicitly for clarity.
+            motor.run()?;
+            run_loop(*duration, || {
+                let fb = motor.set_velocity(*velocity)?;
+                Ok(format!(
+                    "vel={:+.3} rad/s  torque={:+.3} N·m",
+                    fb.velocity_rad_per_s, fb.torque_nm
+                ))
+            })?;
             motor.disable()?;
         }
         Command::Torque { torque, duration } => {
-            motor.enable()?;
-            run_for(*duration, || motor.set_torque(*torque))?;
+            motor.run()?;
+            run_loop(*duration, || {
+                let fb = motor.set_torque(*torque)?;
+                Ok(format!(
+                    "vel={:+.3} rad/s  torque={:+.3} N·m  iq={:+.3} A",
+                    fb.velocity_rad_per_s, fb.torque_nm, fb.current_a
+                ))
+            })?;
             motor.disable()?;
         }
         Command::Pid => {
@@ -206,10 +227,13 @@ fn open_motor(cli: &Cli) -> Result<LkMotor<Rs485Driver>> {
 }
 
 /// Re-issue a command at ~100 Hz for `duration` seconds (or until Ctrl-C),
-/// printing the latest feedback periodically.
-fn run_for<F>(duration: f32, mut tick: F) -> Result<()>
+/// printing the status line returned by `tick` at most every 200 ms.
+///
+/// `tick` is responsible for sending the command and formatting the line; this
+/// just handles the loop timing, Ctrl-C, and print throttling.
+fn run_loop<F>(duration: f32, mut tick: F) -> Result<()>
 where
-    F: FnMut() -> misa_actuator::Result<misa_actuator::MotorFeedback>,
+    F: FnMut() -> Result<String>,
 {
     let running = Arc::new(AtomicBool::new(true));
     {
@@ -217,18 +241,15 @@ where
         let _ = ctrlc::set_handler(move || r.store(false, Ordering::SeqCst));
     }
     let start = Instant::now();
-    let mut last_print = Instant::now();
+    let mut last_print: Option<Instant> = None;
     let period = Duration::from_millis(10);
     while running.load(Ordering::SeqCst) && start.elapsed().as_secs_f32() < duration {
         let loop_start = Instant::now();
         match tick() {
-            Ok(fb) => {
-                if last_print.elapsed() >= Duration::from_millis(200) {
-                    println!(
-                        "pos={:+.3} rad  vel={:+.3} rad/s  torque={:+.3} N·m",
-                        fb.position_rad, fb.velocity_rad_per_s, fb.torque_nm
-                    );
-                    last_print = Instant::now();
+            Ok(line) => {
+                if last_print.map_or(true, |t| t.elapsed() >= Duration::from_millis(200)) {
+                    println!("{line}");
+                    last_print = Some(Instant::now());
                 }
             }
             Err(e) => {

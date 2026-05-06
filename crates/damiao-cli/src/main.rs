@@ -45,7 +45,7 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     master_id: u16,
 
-    /// Motor model (e.g. DM4310 / DM-J4310-2EC).
+    /// Motor model: DM4310 (DM-J4310-2EC) or DM3507 (DM-J3507-2EC).
     #[arg(long, default_value = "DM4310")]
     model: String,
 

@@ -1,0 +1,12 @@
+[package]
+name = "misa-sysid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Chirp-excitation system identification (frequency response) for any misa-actuator Actuator"
+
+[dependencies]
+misa-actuator = { workspace = true }
+rustfft = { workspace = true }

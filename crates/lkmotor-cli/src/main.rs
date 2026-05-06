@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use lkmotor_driver::{LkCommands, LkMotor, MotorConfig, MotorId, Rs485Driver};
@@ -104,6 +104,47 @@ enum Command {
     },
     /// Read the position / speed / current PID triples.
     Pid,
+    /// Chirp-excitation system identification → CSV log + Bode (frequency
+    /// response). Drives a swept sine on the chosen channel and estimates the
+    /// frequency response. Position channel is safest (bounded around current
+    /// pos). Use `--gear-ratio 10` for MG4005 output-frame units.
+    Chirp {
+        /// Channel: position | velocity | torque | mit.
+        #[arg(long, default_value = "position")]
+        channel: String,
+        /// Start frequency (Hz).
+        #[arg(long, default_value_t = 0.5)]
+        f0: f32,
+        /// End frequency (Hz).
+        #[arg(long, default_value_t = 30.0)]
+        f1: f32,
+        /// Sweep duration (s).
+        #[arg(long, default_value_t = 10.0)]
+        duration: f32,
+        /// Amplitude (rad / rad·s / N·m by channel). Keep small.
+        #[arg(long, default_value_t = 0.15)]
+        amp: f32,
+        /// Logarithmic sweep (default linear).
+        #[arg(long)]
+        log: bool,
+        /// Target loop rate (Hz).
+        #[arg(long, default_value_t = 500.0)]
+        rate: f32,
+        /// Position channel max speed (rad/s).
+        #[arg(long, default_value_t = 5.0)]
+        max_speed: f32,
+        /// MIT channel kp / kd.
+        #[arg(long, default_value_t = 0.0)]
+        kp: f32,
+        #[arg(long, default_value_t = 0.0)]
+        kd: f32,
+        /// Raw log CSV path.
+        #[arg(long, default_value = "chirp.csv")]
+        out: String,
+        /// Bode CSV path.
+        #[arg(long, default_value = "chirp_bode.csv")]
+        bode: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -205,7 +246,96 @@ fn main() -> Result<()> {
             println!("speed    PID: kp={} ki={} kd={}", spd.kp, spd.ki, spd.kd);
             println!("current  PID: kp={} ki={} kd={}", cur.kp, cur.ki, cur.kd);
         }
+        Command::Chirp {
+            channel,
+            f0,
+            f1,
+            duration,
+            amp,
+            log,
+            rate,
+            max_speed,
+            kp,
+            kd,
+            out,
+            bode,
+        } => {
+            chirp_cmd(
+                &mut motor, channel, *f0, *f1, *duration, *amp, *log, *rate, *max_speed, *kp, *kd,
+                out, bode,
+            )?;
+        }
     }
+    Ok(())
+}
+
+/// Shared chirp-identification command: build the excitation, run it, and write
+/// the raw log + Bode CSVs. Generic over the (already-built) actuator.
+#[allow(clippy::too_many_arguments)]
+fn chirp_cmd(
+    act: &mut dyn Actuator,
+    channel: &str,
+    f0: f32,
+    f1: f32,
+    duration: f32,
+    amp: f32,
+    log_sweep: bool,
+    rate: f32,
+    max_speed: f32,
+    kp: f32,
+    kd: f32,
+    out: &str,
+    bode: &str,
+) -> Result<()> {
+    use misa_sysid::{run_chirp_to_csv, Chirp, Excitation, Sweep};
+
+    let exc = match channel.to_lowercase().as_str() {
+        "position" | "pos" => Excitation::Position {
+            max_speed_rad_s: max_speed,
+        },
+        "velocity" | "vel" => Excitation::Velocity,
+        "torque" | "current" => Excitation::Torque,
+        "mit" => Excitation::MitPosition { kp, kd },
+        other => bail!("unknown --channel '{other}' (position|velocity|torque|mit)"),
+    };
+    let chirp = Chirp {
+        f_start_hz: f0,
+        f_end_hz: f1,
+        duration_s: duration,
+        amplitude: amp,
+        bias: 0.0,
+        sweep: if log_sweep {
+            Sweep::Logarithmic
+        } else {
+            Sweep::Linear
+        },
+    };
+
+    let abort = Arc::new(AtomicBool::new(false));
+    {
+        let a = abort.clone();
+        let _ = ctrlc::set_handler(move || a.store(true, Ordering::SeqCst));
+    }
+    println!("chirp {f0}->{f1} Hz over {duration}s, amp {amp}, channel={channel} (Ctrl-C aborts)...");
+
+    let mut raw =
+        std::io::BufWriter::new(std::fs::File::create(out).with_context(|| format!("create {out}"))?);
+    let mut bod = std::io::BufWriter::new(
+        std::fs::File::create(bode).with_context(|| format!("create {bode}"))?,
+    );
+    let rep = run_chirp_to_csv(act, &chirp, exc, rate, &abort, &mut raw, &mut bod)?;
+
+    println!(
+        "collected {} samples @ {:.0} Hz (target {:.0})",
+        rep.n_samples, rep.achieved_rate_hz, rate
+    );
+    if rep.achieved_rate_hz < rate * 0.8 {
+        eprintln!(
+            "note: achieved rate is well below target — usable band limited to ~{:.0} Hz",
+            rep.achieved_rate_hz / 2.0
+        );
+    }
+    println!("wrote {out} (raw log) and {bode} ({} freq points)", rep.n_freqs);
     Ok(())
 }
 
@@ -248,7 +378,7 @@ where
         let loop_start = Instant::now();
         match tick() {
             Ok(line) => {
-                if last_print.map_or(true, |t| t.elapsed() >= Duration::from_millis(200)) {
+                if last_print.is_none_or(|t| t.elapsed() >= Duration::from_millis(200)) {
                     println!("{line}");
                     last_print = Some(Instant::now());
                 }

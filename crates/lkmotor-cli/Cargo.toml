@@ -1,0 +1,21 @@
+[package]
+name = "lkmotor-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Command-line test app for LKMTech V3 servo motors (MG4005 / MG / MS / RMD-X) over RS485"
+
+[dependencies]
+lkmotor-driver = { workspace = true }
+misa-actuator = { workspace = true }
+log = { workspace = true }
+env_logger = "0.11"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+
+[[bin]]
+name = "lkmotor-cli"
+path = "src/main.rs"

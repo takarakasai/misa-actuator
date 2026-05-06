@@ -10,10 +10,11 @@
 //! ```
 //!
 //! Notes:
-//! - MG4005 (bare gimbal) is direct-drive → `--gear-ratio 1.0`; geared variants
-//!   (e.g. `-i10`) use their reduction (`--gear-ratio 10`).
-//! - `--baud` must match the motor's configured RS485 baud (LK V3 default is
-//!   often 115200).
+//! - MG4005 has a **10:1** reduction → use `--gear-ratio 10` for output-frame
+//!   units (rad / rad/s at the gearbox output). `--gear-ratio 1` reports raw
+//!   motor-shaft units (10× the output).
+//! - `--baud` must match the motor's configured RS485 baud (the MG4005 here
+//!   runs at 1000000; LK V3 default is often 115200).
 //! - `spin` / `torque` *latch* on the firmware; the CLI re-sends for the
 //!   requested duration and the motor is disabled on exit (Drop), so motion
 //!   stops when the command ends.
@@ -43,7 +44,7 @@ struct Cli {
     #[arg(long, default_value_t = 115_200)]
     baud: u32,
 
-    /// Gear ratio (MG4005 bare = 1.0, geared variants e.g. 10.0).
+    /// Gear ratio (MG4005 = 10.0 for output-frame units; 1.0 = raw motor shaft).
     #[arg(long, default_value_t = 1.0)]
     gear_ratio: f32,
 

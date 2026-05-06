@@ -36,11 +36,16 @@ impl Rs485Driver {
             .flow_control(serialport::FlowControl::None)
             .open()?;
         log::info!("lkmotor RS485: opened {} @ {} baud", device, baud);
-        Ok(Self {
+        let mut driver = Self {
             port,
             rx_buf: Vec::with_capacity(MAX_FRAME * 2),
             response_timeout,
-        })
+        };
+        // Discard any stale bytes the kernel buffered from a previous session —
+        // otherwise the first transaction decodes leftover garbage and fails
+        // with a checksum error (and the failure can cascade).
+        let _ = driver.flush_rx();
+        Ok(driver)
     }
 
     /// Wrap an already-open port (useful for tests or custom setups).
@@ -115,13 +120,16 @@ impl Rs485Driver {
                     }
                 }
                 Err(DecodeError::NeedMore { .. }) => {}
-                Err(DecodeError::BadHeader { .. }) => {
-                    // Resync by dropping one byte and retrying.
-                    self.rx_buf.remove(0);
+                Err(_) => {
+                    // Any other decode failure (bad header, bad checksum, ...)
+                    // means the byte stream is misaligned — usually leftover or
+                    // corrupted bytes. Resync by dropping one byte and retrying
+                    // rather than aborting the whole transaction; the deadline
+                    // below still bounds the search.
+                    if !self.rx_buf.is_empty() {
+                        self.rx_buf.remove(0);
+                    }
                     continue;
-                }
-                Err(e) => {
-                    return Err(e.into());
                 }
             }
 

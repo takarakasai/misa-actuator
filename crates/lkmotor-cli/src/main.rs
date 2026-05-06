@@ -329,13 +329,20 @@ fn chirp_cmd(
     let rep = run_chirp_to_csv(act, &chirp, exc, rate, &abort, &mut raw, &mut bod)?;
 
     println!(
-        "collected {} samples @ {:.0} Hz (target {:.0})",
-        rep.n_samples, rep.achieved_rate_hz, rate
+        "collected {} samples @ {:.0} Hz (target {:.0}), median coherence {:.2}",
+        rep.n_samples, rep.achieved_rate_hz, rate, rep.median_coherence
     );
     if rep.achieved_rate_hz < rate * 0.8 {
         eprintln!(
             "note: achieved rate is well below target — usable band limited to ~{:.0} Hz",
             rep.achieved_rate_hz / 2.0
+        );
+    }
+    if rep.median_coherence < 0.5 {
+        eprintln!(
+            "WARNING: low coherence ({:.2}) — poor identification. Is the motor enabled and \
+             fault-free? Try a larger --amp, or check wiring.",
+            rep.median_coherence
         );
     }
     println!("wrote {out} (raw log) and {bode} ({} freq points)", rep.n_freqs);

@@ -1,0 +1,10 @@
+[package]
+name = "damiao-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Pure protocol layer for the DAMIAO (达妙) CAN/CAN-FD servo motor family (no_std-friendly)"
+
+[dependencies]

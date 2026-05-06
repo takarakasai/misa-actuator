@@ -258,6 +258,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "damiao-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "damiao-driver",
+ "damiao-protocol",
+ "env_logger",
+ "log",
+ "misa-actuator",
+]
+
+[[package]]
+name = "damiao-driver"
+version = "0.1.0"
+dependencies = [
+ "damiao-protocol",
+ "embedded-can",
+ "log",
+ "misa-actuator",
+ "socketcan",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "damiao-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -650,6 +680,7 @@ dependencies = [
  "clap",
  "confy",
  "crossterm",
+ "damiao-driver",
  "env_logger",
  "lkmotor-driver",
  "log",

@@ -10,8 +10,13 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use misa_actuator::Actuator;
 
+use damiao_driver::{DamiaoMotor, MotorModel as DmModel};
 use lkmotor_driver::{LkMotor, MotorConfig as LkMotorConfig, MotorId as LkMotorId};
 use robstride_driver::{Motor as RsMotor, MotorModel};
+
+/// The shared `--model` default. Robstride-centric for historical reasons; the
+/// DAMIAO driver treats this sentinel as "use the DAMIAO default model".
+const DEFAULT_ROBSTRIDE_MODEL: &str = "Edulite05";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum DriverKind {
@@ -19,6 +24,18 @@ pub enum DriverKind {
     Robstride,
     /// LK Motor (RMD) on an RS485 serial port.
     Lkmotor,
+    /// DAMIAO CAN / CAN-FD motor on a SocketCAN interface (Linux).
+    Damiao,
+}
+
+/// Physical CAN layer for the DAMIAO driver. Classic CAN and CAN-FD carry the
+/// identical DAMIAO payload; this only selects the socket type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BusKind {
+    /// Classic CAN (1 Mbps).
+    Can,
+    /// CAN-FD (1–5 Mbps); the interface must be `fd on`.
+    CanFd,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +55,8 @@ pub struct DriverConfig {
     pub gear_ratio: f32,
     /// Lkmotor: torque constant Kt (N·m/A). 0 → use `MotorConfig::current_units`.
     pub kt: f32,
+    /// Damiao: physical CAN layer (classic CAN or CAN-FD). Ignored otherwise.
+    pub bus_kind: BusKind,
     /// Per-request timeout.
     pub timeout: Duration,
 }
@@ -48,11 +67,12 @@ impl Default for DriverConfig {
             kind: DriverKind::Robstride,
             interface: "can0".to_string(),
             motor_id: 1,
-            model: "Edulite05".to_string(),
+            model: DEFAULT_ROBSTRIDE_MODEL.to_string(),
             host_id: robstride_driver::DEFAULT_HOST_ID,
             baud: 1_000_000,
             gear_ratio: 10.0,
             kt: 0.0,
+            bus_kind: BusKind::Can,
             timeout: Duration::from_millis(100),
         }
     }
@@ -93,6 +113,49 @@ pub fn build_actuator(cfg: &DriverConfig) -> Result<Box<dyn Actuator + Send>> {
                         )
                     })?;
             Ok(Box::new(motor))
+        }
+        DriverKind::Damiao => {
+            // The shared `--model` default is Robstride-centric; on the DAMIAO
+            // driver, treat the untouched default as "use the DAMIAO default"
+            // rather than erroring. A genuinely wrong override still errors.
+            let model = match DmModel::from_name(&cfg.model) {
+                Some(m) => m,
+                None if cfg.model == DEFAULT_ROBSTRIDE_MODEL => DmModel::Dm4310,
+                None => bail!(
+                    "unknown DAMIAO motor model: {} (try --model DM4310)",
+                    cfg.model
+                ),
+            };
+            // Classic CAN and CAN-FD share the DAMIAO protocol; only the socket
+            // type differs. Both yield a `DamiaoMotor<B>` that implements
+            // `Actuator`, so box whichever the user selected.
+            let motor: Box<dyn Actuator + Send> = match cfg.bus_kind {
+                BusKind::Can => {
+                    let mut m = DamiaoMotor::open(&cfg.interface, cfg.motor_id, model)
+                        .with_context(|| {
+                            format!(
+                                "failed to open classic-CAN interface {} for motor {}",
+                                cfg.interface, cfg.motor_id
+                            )
+                        })?;
+                    m.set_timeout(cfg.timeout)
+                        .context("failed to set CAN socket timeout")?;
+                    Box::new(m)
+                }
+                BusKind::CanFd => {
+                    let mut m = DamiaoMotor::open_fd(&cfg.interface, cfg.motor_id, model)
+                        .with_context(|| {
+                            format!(
+                                "failed to open CAN-FD interface {} for motor {} (is it `fd on`?)",
+                                cfg.interface, cfg.motor_id
+                            )
+                        })?;
+                    m.set_timeout(cfg.timeout)
+                        .context("failed to set CAN-FD socket timeout")?;
+                    Box::new(m)
+                }
+            };
+            Ok(motor)
         }
     }
 }

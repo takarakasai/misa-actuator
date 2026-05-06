@@ -28,7 +28,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::app::App;
-use crate::factory::{DriverConfig, DriverKind, build_actuator, validate_driver_args};
+use crate::factory::{BusKind, DriverConfig, DriverKind, build_actuator, validate_driver_args};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Driver-agnostic debug TUI for misa-actuator-compatible motors")]
@@ -66,6 +66,11 @@ struct Cli {
     #[arg(long, default_value_t = 0.0)]
     kt: f32,
 
+    // -- damiao-only --
+    /// Damiao: physical CAN layer — `can` (classic 1 Mbps) or `can-fd`.
+    #[arg(long, value_enum, default_value_t = BusKind::Can)]
+    bus: BusKind,
+
     /// Per-request timeout, in ms.
     #[arg(long, default_value_t = 100)]
     timeout_ms: u64,
@@ -84,6 +89,7 @@ fn main() -> Result<()> {
         baud: cli.baud,
         gear_ratio: cli.gear_ratio,
         kt: cli.kt,
+        bus_kind: cli.bus,
         timeout: Duration::from_millis(cli.timeout_ms),
     };
     validate_driver_args(&cfg)?;

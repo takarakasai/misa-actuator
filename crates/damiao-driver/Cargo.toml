@@ -1,0 +1,16 @@
+[package]
+name = "damiao-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Rust SocketCAN / CAN-FD driver for DAMIAO (达妙) servo motors (DM-J4310-2EC, ...)"
+
+[dependencies]
+misa-actuator = { workspace = true }
+damiao-protocol = { workspace = true }
+socketcan = { workspace = true }
+embedded-can = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }

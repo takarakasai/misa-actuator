@@ -11,6 +11,7 @@ description = "Driver-agnostic ratatui debug TUI for any misa-actuator-compatibl
 misa-actuator = { workspace = true }
 lkmotor-driver = { workspace = true }
 robstride-driver = { workspace = true }
+damiao-driver = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 anyhow = { workspace = true }

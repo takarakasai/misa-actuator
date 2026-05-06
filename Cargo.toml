@@ -8,6 +8,9 @@ members = [
     "crates/robstride-protocol",
     "crates/robstride-driver",
     "crates/robstride-cli",
+    "crates/damiao-protocol",
+    "crates/damiao-driver",
+    "crates/damiao-cli",
 ]
 
 [workspace.package]
@@ -24,6 +27,8 @@ lkmotor-protocol = { path = "crates/lkmotor-protocol", version = "0.1.0" }
 lkmotor-driver = { path = "crates/lkmotor-driver", version = "0.1.0" }
 robstride-protocol = { path = "crates/robstride-protocol", version = "0.1.0" }
 robstride-driver = { path = "crates/robstride-driver", version = "0.1.0" }
+damiao-protocol = { path = "crates/damiao-protocol", version = "0.1.0" }
+damiao-driver = { path = "crates/damiao-driver", version = "0.1.0" }
 
 # Shared third-party deps
 serialport = "4"

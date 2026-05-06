@@ -116,8 +116,18 @@ mod tests {
             self.step(torque_nm);
             Ok(self.fb())
         }
-        fn mit_control(&mut self, _p: f32, _v: f32, _kp: f32, _kd: f32, _t: f32) -> Result<MotorFeedback> {
-            Err(Error::Unsupported("mock: mit"))
+        fn mit_control(
+            &mut self,
+            p_des: f32,
+            v_des: f32,
+            kp: f32,
+            kd: f32,
+            tau_ff: f32,
+        ) -> Result<MotorFeedback> {
+            // MIT law: τ = kp(p_des−p) + kd(v_des−v) + tau_ff.
+            let tau = kp * (p_des - self.pos) + kd * (v_des - self.vel) + tau_ff;
+            self.step(tau);
+            Ok(self.fb())
         }
         fn measure(&mut self) -> Result<MotorFeedback> {
             Ok(self.fb())
@@ -198,5 +208,26 @@ mod tests {
         // first command ≈ chirp.value(0) ≈ 0
         assert!(log.samples[0].cmd.abs() < 0.1);
         let _ = log.frf(); // must not panic
+    }
+
+    /// MIT torque-feed-forward excitation with a small leash drives the plant
+    /// via `mit_control`; the chirp value is the torque FF (the FRF input).
+    #[test]
+    fn run_chirp_mit_torque_excites_via_feedforward() {
+        let mut plant = MockPlant::new(0.02, 0.5, 500.0);
+        let chirp = Chirp::linear(2.0, 50.0, 0.2, 0.3);
+        let abort = AtomicBool::new(false);
+        let log = run_chirp(
+            &mut plant,
+            &chirp,
+            Excitation::MitTorque { kp: 1.0, kd: 0.05 },
+            500.0,
+            &abort,
+        )
+        .unwrap();
+        assert!(log.samples.len() >= 16);
+        // cmd is the torque feed-forward (≈ chirp value), not a position.
+        assert!(log.samples[0].cmd.abs() < 0.1);
+        let _ = log.frf();
     }
 }

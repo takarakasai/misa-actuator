@@ -109,7 +109,7 @@ enum Command {
     /// frequency response. Position channel is safest (bounded around current
     /// pos). Use `--gear-ratio 10` for MG4005 output-frame units.
     Chirp {
-        /// Channel: position | velocity | torque | mit.
+        /// Channel: position | velocity | torque | mit | mit-torque.
         #[arg(long, default_value = "position")]
         channel: String,
         /// Start frequency (Hz).
@@ -296,7 +296,10 @@ fn chirp_cmd(
         "velocity" | "vel" => Excitation::Velocity,
         "torque" | "current" => Excitation::Torque,
         "mit" => Excitation::MitPosition { kp, kd },
-        other => bail!("unknown --channel '{other}' (position|velocity|torque|mit)"),
+        "mit-torque" | "mittorque" => Excitation::MitTorque { kp, kd },
+        other => {
+            bail!("unknown --channel '{other}' (position|velocity|torque|mit|mit-torque)")
+        }
     };
     let chirp = Chirp {
         f_start_hz: f0,

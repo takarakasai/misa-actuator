@@ -161,7 +161,8 @@ impl ChirpLog {
         }
         let input: Vec<f32> = self.samples.iter().map(|s| s.cmd).collect();
         let output: Vec<f32> = match self.excitation {
-            Excitation::Velocity | Excitation::Torque => {
+            // Torque-input channels identify the plant ω/τ → output is velocity.
+            Excitation::Velocity | Excitation::Torque | Excitation::MitTorque { .. } => {
                 self.samples.iter().map(|s| s.velocity_rad_per_s).collect()
             }
             _ => self.samples.iter().map(|s| s.position_rad).collect(),

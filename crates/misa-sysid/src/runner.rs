@@ -23,8 +23,16 @@ pub enum Excitation {
     /// Torque / current. Open-loop plant excitation (identifies ω/τ); position
     /// can drift or run away — use small amplitude and short runs.
     Torque,
-    /// MIT position reference with fixed impedance `kp` / `kd`.
+    /// MIT position reference chirp with fixed impedance `kp` / `kd` — a
+    /// closed-loop impedance identification (reference → output).
     MitPosition { kp: f32, kd: f32 },
+    /// MIT **torque feed-forward** chirp with a small `kp` / `kd` position
+    /// "leash" that holds the motor near its start position while the
+    /// feed-forward excites the plant. This is the safe way to identify the
+    /// open-loop plant (ω/τ) on an impedance-controlled motor: small gains keep
+    /// it from running away while staying close to open loop. Native MIT only
+    /// (DAMIAO / Robstride); on LK the gains/feed-forward are ignored.
+    MitTorque { kp: f32, kd: f32 },
 }
 
 impl Excitation {
@@ -33,16 +41,18 @@ impl Excitation {
             Excitation::Position { .. } => RunMode::Position,
             Excitation::Velocity => RunMode::Velocity,
             Excitation::Torque => RunMode::Torque,
-            Excitation::MitPosition { .. } => RunMode::Mit,
+            Excitation::MitPosition { .. } | Excitation::MitTorque { .. } => RunMode::Mit,
         }
     }
 
-    /// Whether the channel is referenced to a center position (chirp added to
-    /// the start position).
+    /// Whether the channel holds a center position (chirp added to / referenced
+    /// against the start position).
     fn is_position_like(&self) -> bool {
         matches!(
             self,
-            Excitation::Position { .. } | Excitation::MitPosition { .. }
+            Excitation::Position { .. }
+                | Excitation::MitPosition { .. }
+                | Excitation::MitTorque { .. }
         )
     }
 }
@@ -194,6 +204,8 @@ fn command(
             let cmd = center + u;
             (cmd, act.mit_control(cmd, 0.0, kp, kd, 0.0)?)
         }
+        // Hold at center with a small leash (kp, kd); chirp the torque FF.
+        Excitation::MitTorque { kp, kd } => (u, act.mit_control(center, 0.0, kp, kd, u)?),
     })
 }
 
@@ -202,7 +214,9 @@ fn safe_stop(act: &mut dyn Actuator, exc: Excitation, center: f32) -> Result<Mot
         Excitation::Position { max_speed_rad_s } => act.set_position(center, max_speed_rad_s),
         Excitation::Velocity => act.set_velocity(0.0),
         Excitation::Torque => act.set_torque(0.0),
-        Excitation::MitPosition { kp, kd } => act.mit_control(center, 0.0, kp, kd, 0.0),
+        Excitation::MitPosition { kp, kd } | Excitation::MitTorque { kp, kd } => {
+            act.mit_control(center, 0.0, kp, kd, 0.0)
+        }
     }
 }
 

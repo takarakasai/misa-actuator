@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use socketcan::{CanSocket, EmbeddedFrame, ExtendedId, Id, Socket, StandardId};
 
+use misa_actuator::Shared;
+
 use crate::error::{Error, Result};
 
 /// One CAN frame as seen by the bus layer.
@@ -39,6 +41,24 @@ pub trait RobstrideBus {
     /// Set the per-receive timeout. Subsequent [`Self::recv`] calls return
     /// `Error::Timeout` after this duration of silence.
     fn set_timeout(&mut self, timeout: Duration) -> Result<()>;
+}
+
+/// Share one Robstride bus across several [`crate::Motor`] handles on the same
+/// wire: wrap an opened bus in [`misa_actuator::Shared`] and hand each motor a
+/// clone. Access is serialized by the mutex — drive the motors from a single
+/// control loop per bus.
+impl<B: RobstrideBus> RobstrideBus for Shared<B> {
+    fn send(&mut self, can_id: u32, data: &[u8]) -> Result<()> {
+        self.lock().send(can_id, data)
+    }
+
+    fn recv(&mut self) -> Result<CanFrame> {
+        self.lock().recv()
+    }
+
+    fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
+        self.lock().set_timeout(timeout)
+    }
 }
 
 /// SocketCAN-backed implementation of [`RobstrideBus`] (Linux only).

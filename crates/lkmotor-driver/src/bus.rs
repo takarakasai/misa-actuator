@@ -12,6 +12,8 @@ use lkmotor_protocol::response::{
     parse_multi_turn_angle, parse_state1, parse_state2, parse_state2_payload,
 };
 
+use misa_actuator::Shared;
+
 use crate::error::Result;
 use crate::motor_id::MotorId;
 
@@ -38,6 +40,20 @@ pub trait LkBus {
 
     /// Discard any buffered/in-flight bytes on the wire.
     fn flush_rx(&mut self) -> Result<()>;
+}
+
+/// Share one RS485 bus across several [`crate::LkMotor`] handles (a multi-drop
+/// V3 bus): wrap an opened bus in [`misa_actuator::Shared`] and hand each motor
+/// a clone. Each `transact` is serialized by the mutex — drive the motors from
+/// a single control loop per bus.
+impl<B: LkBus> LkBus for Shared<B> {
+    fn transact(&mut self, command: u8, motor_id: MotorId, data: &[u8]) -> Result<Response> {
+        self.lock().transact(command, motor_id, data)
+    }
+
+    fn flush_rx(&mut self) -> Result<()> {
+        self.lock().flush_rx()
+    }
 }
 
 /// Decode the State2 payload from any motion-control reply

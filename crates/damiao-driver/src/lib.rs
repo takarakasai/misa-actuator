@@ -43,11 +43,37 @@
 //! 3. power-cycle the motor (CAN_ID / MST_ID changes apply only after that);
 //! 4. repeat for the next motor.
 //!
-//! Then open each motor with its Master ID via
-//! [`DamiaoMotor::open_with_master`] / [`DamiaoMotor::open_fd_with_master`]
-//! (or [`DamiaoMotor::set_master_id`]). To drive several motors on one bus
-//! concurrently, share the bus behind an `Arc<Mutex<_>>` at the application
-//! level — the driver itself owns a single bus per handle.
+//! ### Several motors on one bus
+//!
+//! Each motor handle owns its bus, so to put several motors on one wire wrap the
+//! opened bus in [`Shared`] (an `Arc<Mutex<_>>` from `misa-actuator`) and give
+//! each motor a clone. Drive them from one control loop per bus; different buses
+//! (`can0`, `can1`) use independent `Shared` instances and run in parallel.
+//!
+//! ```no_run
+//! use damiao_driver::{DamiaoMotor, MotorModel, Shared, SocketCanBus};
+//! use misa_actuator::{Actuator, RunMode};
+//!
+//! let bus0 = Shared::new(SocketCanBus::open("can0")?);
+//! // CAN_ID 1 / 2, MST_ID 0x11 / 0x12 (the 0x10 + CAN_ID convention):
+//! let mut m1 = DamiaoMotor::with_bus_and_master(bus0.clone(), 1, 0x11, MotorModel::Dm4310);
+//! let mut m2 = DamiaoMotor::with_bus_and_master(bus0.clone(), 2, 0x12, MotorModel::Dm4310);
+//! for m in [&mut m1, &mut m2] {
+//!     m.set_run_mode(RunMode::Mit)?;
+//!     m.enable()?;
+//! }
+//! // single loop: each transaction briefly locks the shared bus
+//! loop {
+//!     m1.mit_control(0.0, 0.0, 0.0, 0.5, 0.0)?;
+//!     m2.mit_control(0.0, 0.0, 0.0, 0.5, 0.0)?;
+//! #   break;
+//! }
+//! # Ok::<(), misa_actuator::Error>(())
+//! ```
+//!
+//! See `examples/multi_motor.rs` for a two-bus version. Per-motor *threads* on
+//! the same bus also work but don't lock a request+reply as one transaction, so
+//! the single-loop-per-bus pattern is preferred.
 
 pub mod actuator;
 pub mod bus;
@@ -56,6 +82,8 @@ pub mod error;
 pub mod scan;
 
 pub use bus::{CanFrame, DamiaoBus, SocketCanBus, SocketCanFdBus};
+/// Re-exported for sharing one bus across motors — see the multi-motor docs.
+pub use misa_actuator::Shared;
 pub use driver::DamiaoMotor;
 pub use error::{Error, Result};
 pub use scan::{probe_one, scan_bus_on, ScanProgress};

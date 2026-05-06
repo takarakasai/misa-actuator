@@ -29,8 +29,10 @@
 
 pub mod error;
 pub mod feedback;
+pub mod shared;
 pub mod traits;
 
 pub use error::{Error, Result};
 pub use feedback::{ErrorFlags, MotorFeedback, MotorStatus, RunMode};
+pub use shared::Shared;
 pub use traits::Actuator;

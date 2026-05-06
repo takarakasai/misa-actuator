@@ -21,6 +21,8 @@ use socketcan::{
     CanAnyFrame, CanFdFrame, CanFdSocket, CanSocket, EmbeddedFrame, Id, Socket, StandardId,
 };
 
+use misa_actuator::Shared;
+
 use crate::error::{Error, Result};
 
 /// One CAN frame as seen by the bus layer.
@@ -47,6 +49,27 @@ pub trait DamiaoBus {
 
     /// Set the per-receive timeout.
     fn set_timeout(&mut self, timeout: Duration) -> Result<()>;
+}
+
+/// Share one DAMIAO bus across several [`crate::DamiaoMotor`] handles on the
+/// same wire: wrap an opened bus in [`misa_actuator::Shared`] and hand each
+/// motor a clone. Access is serialized by the mutex — drive the motors from a
+/// single control loop per bus (see the crate-level multi-motor docs).
+///
+/// Note: [`DamiaoBus::set_timeout`] here affects the *shared* socket, so the
+/// last value set wins across all motors on the bus.
+impl<B: DamiaoBus> DamiaoBus for Shared<B> {
+    fn send(&mut self, can_id: u16, data: &[u8]) -> Result<()> {
+        self.lock().send(can_id, data)
+    }
+
+    fn recv(&mut self) -> Result<CanFrame> {
+        self.lock().recv()
+    }
+
+    fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
+        self.lock().set_timeout(timeout)
+    }
 }
 
 /// Build a standard-id from a `u16`, rejecting ids above 0x7FF.

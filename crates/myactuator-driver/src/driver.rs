@@ -22,11 +22,13 @@ use std::time::{Duration, Instant};
 
 use myactuator_protocol::{
     build_brake_lock, build_brake_release, build_function_control, build_motion_control,
-    build_position_control, build_read_motor_model, build_read_multi_turn_angle,
-    build_read_status1, build_read_status2, build_read_version_date, build_set_zero_rom,
-    build_shutdown, build_speed_control, build_stop, build_system_reset, build_torque_control,
-    can_id, parse_motion_reply, parse_motor_model, parse_multi_turn_angle, parse_status1,
-    parse_status2, parse_version_date, ErrorState, MotionFeedback, Status1, Status2, DATA_LEN,
+    build_position_control, build_read_acceleration, build_read_motor_model,
+    build_read_multi_turn_angle, build_read_pid, build_read_status1, build_read_status2,
+    build_read_version_date, build_set_zero_rom, build_shutdown, build_speed_control, build_stop,
+    build_system_reset, build_torque_control, can_id, parse_acceleration, parse_motion_reply,
+    parse_motor_model, parse_multi_turn_angle, parse_pid_gains, parse_status1, parse_status2,
+    parse_version_date, AccelIndex, ErrorState, MotionFeedback, PidGains, Status1, Status2,
+    DATA_LEN,
 };
 
 use crate::bus::{MyActuatorBus, SocketCanBus};
@@ -250,6 +252,21 @@ impl<B: MyActuatorBus> MyActuatorMotor<B> {
             .position(|&b| b == 0)
             .unwrap_or(raw.len());
         Ok(String::from_utf8_lossy(&raw[..end]).trim().to_string())
+    }
+
+    /// Read current/speed/position-loop PID gains (`0x30`), all six at once.
+    /// Each value is a 0-255 normalized unit — see [`PidGains`] for how to
+    /// turn it into a physical gain.
+    pub fn read_pid(&mut self) -> Result<PidGains> {
+        let reply = self.transact(build_read_pid())?;
+        parse_pid_gains(&reply).ok_or_else(|| Error::InvalidResponse("bad 0x30 reply".into()))
+    }
+
+    /// Read one acceleration/deceleration value (`0x42`) in 1 dps/s
+    /// (manual range 50-60000).
+    pub fn read_acceleration(&mut self, index: AccelIndex) -> Result<i32> {
+        let reply = self.transact(build_read_acceleration(index))?;
+        parse_acceleration(&reply).ok_or_else(|| Error::InvalidResponse("bad 0x42 reply".into()))
     }
 
     /// Slow status read for monitoring (voltage / error flags / brake).

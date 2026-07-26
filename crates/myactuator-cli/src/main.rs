@@ -8,17 +8,20 @@
 //! myactuator-cli -i can0 -m 1 spin 1.0 --duration 3
 //! myactuator-cli -i can0 -m 1 --kt 0.83 torque 0.5 --duration 2
 //! myactuator-cli -i can0 -m 1 mit --kp 10 --kd 1 --duration 5
+//! myactuator-cli -i can0 -m 1 params --toml --out dump.toml
 //! ```
 //!
 //! Without `--kt`, torque values are raw current in **A** (current-units
 //! mode); pass the datasheet torque constant to speak N·m.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 
 use myactuator_driver::{scan_bus_on, MotorConfig, MotorFeedback, MyActuatorMotor};
 use myactuator_protocol::AccelIndex;
@@ -92,6 +95,17 @@ enum Command {
         /// Which value to read.
         #[arg(value_enum)]
         index: AccelArg,
+    },
+    /// Read every known readable parameter in one pass (0x9A/0x9C/0x92/0x30/
+    /// 0x42×4/0xB2/0xB5) and print it. A read that times out or fails is
+    /// reported and omitted rather than aborting the whole dump.
+    Params {
+        /// Also emit a TOML dump to stdout (or to --out if given).
+        #[arg(long)]
+        toml: bool,
+        /// Write the TOML dump to this file (implies --toml).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Anchor the soft zero at the current position. --rom persists to
     /// encoder ROM instead (wears flash; needs a reset to take effect).
@@ -253,6 +267,25 @@ fn main() -> Result<()> {
             let dps_s = motor.read_acceleration((*index).into())?;
             println!("{index:?} = {dps_s} dps/s");
         }
+        Command::Params { toml, out } => {
+            let params = AllParams::read_all(&mut motor);
+            params.print();
+            if *toml || out.is_some() {
+                let text =
+                    toml::to_string_pretty(&params).context("failed to serialize TOML dump")?;
+                match out {
+                    Some(path) => {
+                        std::fs::write(path, &text)
+                            .with_context(|| format!("failed to write {}", path.display()))?;
+                        println!("\nwrote TOML dump to {}", path.display());
+                    }
+                    None => {
+                        println!("\n--- TOML ---");
+                        print!("{text}");
+                    }
+                }
+            }
+        }
         Command::Zero { rom, reset } => {
             if *rom {
                 motor.set_zero_rom()?;
@@ -338,6 +371,171 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Every readable parameter this crate knows about, gathered in one pass.
+/// Fields are `Option` because a motor model/firmware may lack a command
+/// (e.g. `0x30`/`0x42` on non-motion-mode firmware); a failed read is
+/// reported to stderr and just omitted rather than aborting the whole dump.
+#[derive(Serialize)]
+struct AllParams {
+    motor_id: u8,
+    // Status1 (0x9A)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature_c: Option<i8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    voltage_v: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    brake_released: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_flags: Option<u16>,
+    // Status2 (0x9C)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_a: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed_dps: Option<i16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    angle_deg: Option<i16>,
+    // Multi-turn absolute angle (0x92)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    multi_turn_centideg: Option<i32>,
+    // PID gains (0x30)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_kp: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_ki: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed_kp: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed_ki: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_kp: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_ki: Option<u8>,
+    // Acceleration/deceleration limits (0x42)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_accel_dps_s: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_decel_dps_s: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed_accel_dps_s: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed_decel_dps_s: Option<i32>,
+    // Version / model (0xB2 / 0xB5)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version_date_raw: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    motor_model: Option<String>,
+}
+
+impl AllParams {
+    fn read_all<B: myactuator_driver::MyActuatorBus>(motor: &mut MyActuatorMotor<B>) -> Self {
+        let status1 = try_read("Status1 (0x9A)", || motor.read_status1());
+        let status2 = try_read("Status2 (0x9C)", || motor.read_status2());
+        let pid = try_read("PID gains (0x30)", || motor.read_pid());
+
+        Self {
+            motor_id: motor.motor_id(),
+            temperature_c: status1.map(|s| s.temperature_c),
+            voltage_v: status1.map(|s| s.voltage_v()),
+            brake_released: status1.map(|s| s.brake_released),
+            error_flags: status1.map(|s| s.error.raw()),
+            current_a: status2.map(|s| s.current_a()),
+            speed_dps: status2.map(|s| s.speed_dps),
+            angle_deg: status2.map(|s| s.angle_deg),
+            multi_turn_centideg: try_read("multi-turn angle (0x92)", || {
+                motor.read_multi_turn_centideg()
+            }),
+            current_kp: pid.map(|g| g.current_kp),
+            current_ki: pid.map(|g| g.current_ki),
+            speed_kp: pid.map(|g| g.speed_kp),
+            speed_ki: pid.map(|g| g.speed_ki),
+            position_kp: pid.map(|g| g.position_kp),
+            position_ki: pid.map(|g| g.position_ki),
+            position_accel_dps_s: try_read("position accel (0x42/0x00)", || {
+                motor.read_acceleration(AccelIndex::PositionAccel)
+            }),
+            position_decel_dps_s: try_read("position decel (0x42/0x01)", || {
+                motor.read_acceleration(AccelIndex::PositionDecel)
+            }),
+            speed_accel_dps_s: try_read("speed accel (0x42/0x02)", || {
+                motor.read_acceleration(AccelIndex::SpeedAccel)
+            }),
+            speed_decel_dps_s: try_read("speed decel (0x42/0x03)", || {
+                motor.read_acceleration(AccelIndex::SpeedDecel)
+            }),
+            version_date_raw: try_read("version date (0xB2)", || motor.read_version_date()),
+            motor_model: try_read("motor model (0xB5)", || motor.read_motor_model()),
+        }
+    }
+
+    fn print(&self) {
+        fn fmt<T: std::fmt::Display>(v: Option<T>) -> String {
+            v.map(|v| v.to_string()).unwrap_or_else(|| "—".to_string())
+        }
+        fn fmt_f32(v: Option<f32>) -> String {
+            v.map(|v| format!("{v:.2}")).unwrap_or_else(|| "—".to_string())
+        }
+
+        println!("== MyActuator params (motor_id={}) ==", self.motor_id);
+        println!(
+            "[Status1]  temp={}°C  voltage={}V  brake_released={}  error=0x{}",
+            fmt(self.temperature_c),
+            fmt_f32(self.voltage_v),
+            fmt(self.brake_released),
+            self.error_flags
+                .map(|e| format!("{e:04X}"))
+                .unwrap_or_else(|| "----".to_string())
+        );
+        println!(
+            "[Status2]  iq={}A  speed={}dps  angle={}°",
+            fmt_f32(self.current_a),
+            fmt(self.speed_dps),
+            fmt(self.angle_deg)
+        );
+        println!(
+            "[MultiTurn] 0x92 = {} centideg",
+            fmt(self.multi_turn_centideg)
+        );
+        println!(
+            "[PID]      current kp={} ki={}  speed kp={} ki={}  position kp={} ki={}",
+            fmt(self.current_kp),
+            fmt(self.current_ki),
+            fmt(self.speed_kp),
+            fmt(self.speed_ki),
+            fmt(self.position_kp),
+            fmt(self.position_ki)
+        );
+        println!(
+            "[Accel]    pos_accel={}  pos_decel={}  speed_accel={}  speed_decel={}  (dps/s)",
+            fmt(self.position_accel_dps_s),
+            fmt(self.position_decel_dps_s),
+            fmt(self.speed_accel_dps_s),
+            fmt(self.speed_decel_dps_s)
+        );
+        println!(
+            "[Version]  raw={}  model={}",
+            fmt(self.version_date_raw),
+            match self.motor_model.as_deref() {
+                None => "—",
+                Some("") => "<none> (empty on this firmware)",
+                Some(m) => m,
+            }
+        );
+    }
+}
+
+/// Run `f`, reporting a failure to stderr and returning `None` instead of
+/// aborting — used by [`AllParams::read_all`] so one unsupported command
+/// doesn't blank out the rest of the dump.
+fn try_read<T>(label: &str, f: impl FnOnce() -> myactuator_driver::Result<T>) -> Option<T> {
+    match f() {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!("warn: {label} read failed: {e}");
+            None
+        }
+    }
 }
 
 fn control_loop<F>(duration: Option<f32>, mut tick: F) -> Result<()>

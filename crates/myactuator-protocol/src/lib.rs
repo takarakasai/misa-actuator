@@ -35,14 +35,22 @@ pub use can_id::{
     command_id, is_valid_motor_id, motion_id, motion_reply_id, reply_id, MAX_MOTOR_ID,
     MULTI_MOTOR_ID,
 };
-pub use feedback::{ErrorState, PidGains, Status1, Status2};
+pub use feedback::{
+    ErrorState, PidGains, PidIndex, RunMode, SingleTurnEncoder, Status1, Status2, Status3,
+};
 pub use frame::{
     build_brake_lock, build_brake_release, build_function_control, build_position_control,
-    build_read_acceleration, build_read_motor_model, build_read_multi_turn_angle, build_read_pid,
-    build_read_status1, build_read_status2, build_read_version_date, build_set_zero_rom,
-    build_shutdown, build_speed_control, build_stop, build_system_reset, build_torque_control,
-    parse_acceleration, parse_motor_model, parse_multi_turn_angle, parse_pid_gains, parse_status1,
-    parse_status2, parse_version_date, AccelIndex, Cmd, DATA_LEN,
+    build_read_acceleration, build_read_motor_model, build_read_motor_power,
+    build_read_multi_turn_angle, build_read_multi_turn_encoder, build_read_multi_turn_encoder_raw,
+    build_read_multi_turn_zero_offset, build_read_pid, build_read_run_mode,
+    build_read_single_turn_angle, build_read_single_turn_encoder, build_read_status1,
+    build_read_status2, build_read_status3, build_read_uptime, build_read_version_date,
+    build_set_zero_rom, build_shutdown, build_speed_control, build_stop, build_system_reset,
+    build_torque_control, parse_acceleration, parse_motor_model, parse_motor_power,
+    parse_multi_turn_angle, parse_multi_turn_encoder, parse_multi_turn_encoder_raw,
+    parse_multi_turn_zero_offset, parse_pid_value, parse_run_mode, parse_single_turn_angle,
+    parse_single_turn_encoder, parse_status1, parse_status2, parse_status3, parse_uptime,
+    parse_version_date, AccelIndex, Cmd, DATA_LEN,
 };
 pub use motion::{
     build_motion_control, parse_motion_reply, MotionFeedback, KD_MAX, KP_MAX, P_MAX, T_MAX, V_MAX,

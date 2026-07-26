@@ -234,10 +234,17 @@ mod tests {
     }
 
     #[test]
-    fn read_pid_sends_0x30() {
+    fn read_pid_sends_one_0x30_per_index() {
+        use myactuator_protocol::PidIndex;
         let mut m = motor();
         m.read_pid().unwrap();
-        assert!(sent_cmds(&mut m).contains(&0x30));
+        let sent = m.bus().sent.clone();
+        for index in PidIndex::ALL {
+            assert!(
+                sent.iter().any(|(_, d)| d[0] == 0x30 && d[1] == index as u8),
+                "missing 0x30 read for index {index:?}"
+            );
+        }
     }
 
     #[test]
@@ -248,5 +255,33 @@ mod tests {
         let (_, frame) = m.bus().sent[0];
         assert_eq!(frame[0], 0x42);
         assert_eq!(frame[1], AccelIndex::SpeedDecel as u8);
+    }
+
+    #[test]
+    fn read_multi_turn_encoder_sends_0x60() {
+        let mut m = motor();
+        m.read_multi_turn_encoder().unwrap();
+        assert!(sent_cmds(&mut m).contains(&0x60));
+    }
+
+    #[test]
+    fn read_run_mode_sends_0x70() {
+        let mut m = motor();
+        m.read_run_mode().unwrap();
+        assert!(sent_cmds(&mut m).contains(&0x70));
+    }
+
+    #[test]
+    fn read_status3_sends_0x9d() {
+        let mut m = motor();
+        m.read_status3().unwrap();
+        assert!(sent_cmds(&mut m).contains(&0x9D));
+    }
+
+    #[test]
+    fn read_uptime_sends_0xb1() {
+        let mut m = motor();
+        m.read_uptime_ms().unwrap();
+        assert!(sent_cmds(&mut m).contains(&0xB1));
     }
 }

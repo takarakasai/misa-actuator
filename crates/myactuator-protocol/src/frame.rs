@@ -3,7 +3,9 @@
 //! Every builder returns the 8-byte payload; the caller pairs it with
 //! [`crate::can_id::command_id`]. Replies echo the command byte in `data[0]`.
 
-use crate::feedback::{ErrorState, PidGains, Status1, Status2};
+use crate::feedback::{
+    ErrorState, PidIndex, RunMode, SingleTurnEncoder, Status1, Status2, Status3,
+};
 
 /// All V3 frames carry exactly 8 data bytes.
 pub const DATA_LEN: usize = 8;
@@ -26,14 +28,24 @@ pub enum AccelIndex {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Cmd {
-    /// Read current/speed/position-loop PID gains (0-255 normalized units).
+    /// Read one current/speed/position-loop PID gain, selected by [`PidIndex`].
     ReadPid = 0x30,
     /// Read a position/speed-planning acceleration or deceleration value.
     ReadAcceleration = 0x42,
     /// Function control (compound; e.g. clear multi-turn value).
     FunctionControl = 0x20,
+    /// Read the multi-turn encoder position (zero offset applied), pulses.
+    ReadMultiTurnEncoder = 0x60,
+    /// Read the raw multi-turn encoder position (no zero offset), pulses.
+    ReadMultiTurnEncoderRaw = 0x61,
+    /// Read the multi-turn encoder's zero-offset value, pulses.
+    ReadMultiTurnZeroOffset = 0x62,
     /// Write current multi-turn position to ROM as zero (effective after reset).
     SetZeroRom = 0x64,
+    /// Read the current run mode (current/speed/position loop).
+    ReadRunMode = 0x70,
+    /// Read the motor's instantaneous output power.
+    ReadMotorPower = 0x71,
     /// System reset (restart the motor firmware).
     SystemReset = 0x76,
     /// Release the holding brake.
@@ -44,18 +56,26 @@ pub enum Cmd {
     Shutdown = 0x80,
     /// Motor stop — halt motion but stay in closed-loop mode.
     Stop = 0x81,
+    /// Read the single-turn encoder position (direct-drive models).
+    ReadSingleTurnEncoder = 0x90,
     /// Read multi-turn absolute angle (0.01 °/LSB).
     ReadMultiTurnAngle = 0x92,
+    /// Read the single-turn angle (0.01 °/LSB, wraps 0-359.99°).
+    ReadSingleTurnAngle = 0x94,
     /// Read Status1 (temperature / voltage / error flags).
     ReadStatus1 = 0x9A,
     /// Read Status2 (temperature / iq / speed / angle).
     ReadStatus2 = 0x9C,
+    /// Read Status3 (temperature / per-phase current).
+    ReadStatus3 = 0x9D,
     /// Torque (current) closed-loop control.
     TorqueControl = 0xA1,
     /// Speed closed-loop control.
     SpeedControl = 0xA2,
     /// Absolute (multi-turn) position closed-loop control.
     PositionControl = 0xA4,
+    /// Read system uptime since last reset/reboot, in ms.
+    ReadUptime = 0xB1,
     /// Read the system software version date (YYYYMMDD).
     ReadVersionDate = 0xB2,
     /// Read the motor model name (ASCII).
@@ -82,13 +102,59 @@ pub const fn build_read_multi_turn_angle() -> [u8; DATA_LEN] {
     plain(Cmd::ReadMultiTurnAngle)
 }
 
-/// `0x30` — read current/speed/position-loop PID gains (all six at once).
-pub const fn build_read_pid() -> [u8; DATA_LEN] {
-    plain(Cmd::ReadPid)
+/// `0x30` — read one PID gain, selected by `index` (V4.2+ indexed protocol).
+pub const fn build_read_pid(index: PidIndex) -> [u8; DATA_LEN] {
+    [Cmd::ReadPid as u8, index as u8, 0, 0, 0, 0, 0, 0]
+}
+
+/// `0x60` — read the multi-turn encoder position (zero offset applied), pulses.
+pub const fn build_read_multi_turn_encoder() -> [u8; DATA_LEN] {
+    plain(Cmd::ReadMultiTurnEncoder)
+}
+
+/// `0x61` — read the raw multi-turn encoder position (no zero offset), pulses.
+pub const fn build_read_multi_turn_encoder_raw() -> [u8; DATA_LEN] {
+    plain(Cmd::ReadMultiTurnEncoderRaw)
+}
+
+/// `0x62` — read the multi-turn encoder's zero-offset value, pulses.
+pub const fn build_read_multi_turn_zero_offset() -> [u8; DATA_LEN] {
+    plain(Cmd::ReadMultiTurnZeroOffset)
+}
+
+/// `0x70` — read the current run mode.
+pub const fn build_read_run_mode() -> [u8; DATA_LEN] {
+    plain(Cmd::ReadRunMode)
+}
+
+/// `0x71` — read the motor's instantaneous output power (0.1 W/LSB).
+pub const fn build_read_motor_power() -> [u8; DATA_LEN] {
+    plain(Cmd::ReadMotorPower)
+}
+
+/// `0x90` — read the single-turn encoder position (direct-drive models).
+pub const fn build_read_single_turn_encoder() -> [u8; DATA_LEN] {
+    plain(Cmd::ReadSingleTurnEncoder)
+}
+
+/// `0x94` — read the single-turn angle (0.01 °/LSB, wraps 0-359.99°).
+pub const fn build_read_single_turn_angle() -> [u8; DATA_LEN] {
+    plain(Cmd::ReadSingleTurnAngle)
+}
+
+/// `0x9D` — read Status3 (temperature + per-phase current).
+pub const fn build_read_status3() -> [u8; DATA_LEN] {
+    plain(Cmd::ReadStatus3)
+}
+
+/// `0xB1` — read system uptime since last reset/reboot, in ms.
+pub const fn build_read_uptime() -> [u8; DATA_LEN] {
+    plain(Cmd::ReadUptime)
 }
 
 /// `0x42` — read one acceleration/deceleration value (1 dps/s, range
-/// 50-60000 per the manual).
+/// 100-60000 per the X4-36 V4.3 manual — the V3.9 manual's own text
+/// disagrees with itself, citing 50 in one section and 100 in another).
 pub const fn build_read_acceleration(index: AccelIndex) -> [u8; DATA_LEN] {
     [Cmd::ReadAcceleration as u8, index as u8, 0, 0, 0, 0, 0, 0]
 }
@@ -183,6 +249,7 @@ pub fn parse_status1(data: &[u8]) -> Option<Status1> {
     }
     Some(Status1 {
         temperature_c: data[1] as i8,
+        mos_temperature_c: data[2] as i8,
         brake_released: data[3] != 0,
         voltage_dv: u16::from_le_bytes([data[4], data[5]]),
         error: ErrorState(u16::from_le_bytes([data[6], data[7]])),
@@ -219,19 +286,95 @@ pub fn parse_multi_turn_angle(data: &[u8]) -> Option<i32> {
     Some(i32::from_le_bytes([data[4], data[5], data[6], data[7]]))
 }
 
-/// Parse a PID-gains reply (`0x30`).
-pub fn parse_pid_gains(data: &[u8]) -> Option<PidGains> {
+/// Shared layout for `0x60`/`0x61`/`0x62`/`0xB1`: command echo, `data[1..4]`
+/// `NULL`, a 32-bit little-endian value at `data[4..8]`.
+fn parse_i32_at_4(data: &[u8], cmd: Cmd) -> Option<i32> {
+    if data.len() < DATA_LEN || data[0] != cmd as u8 {
+        return None;
+    }
+    Some(i32::from_le_bytes([data[4], data[5], data[6], data[7]]))
+}
+
+/// Parse a multi-turn encoder reply (`0x60`) into pulses (zero offset applied).
+pub fn parse_multi_turn_encoder(data: &[u8]) -> Option<i32> {
+    parse_i32_at_4(data, Cmd::ReadMultiTurnEncoder)
+}
+
+/// Parse a raw multi-turn encoder reply (`0x61`) into pulses (no zero offset).
+pub fn parse_multi_turn_encoder_raw(data: &[u8]) -> Option<i32> {
+    parse_i32_at_4(data, Cmd::ReadMultiTurnEncoderRaw)
+}
+
+/// Parse a multi-turn zero-offset reply (`0x62`) into pulses.
+pub fn parse_multi_turn_zero_offset(data: &[u8]) -> Option<i32> {
+    parse_i32_at_4(data, Cmd::ReadMultiTurnZeroOffset)
+}
+
+/// Parse a system-uptime reply (`0xB1`) into milliseconds since last reset.
+pub fn parse_uptime(data: &[u8]) -> Option<u32> {
+    parse_i32_at_4(data, Cmd::ReadUptime).map(|v| v as u32)
+}
+
+/// Parse a run-mode reply (`0x70`).
+pub fn parse_run_mode(data: &[u8]) -> Option<RunMode> {
+    if data.len() < DATA_LEN || data[0] != Cmd::ReadRunMode as u8 {
+        return None;
+    }
+    Some(RunMode::from_raw(data[7]))
+}
+
+/// Parse a motor-power reply (`0x71`) into watts.
+pub fn parse_motor_power(data: &[u8]) -> Option<f32> {
+    if data.len() < DATA_LEN || data[0] != Cmd::ReadMotorPower as u8 {
+        return None;
+    }
+    Some(u16::from_le_bytes([data[6], data[7]]) as f32 * 0.1)
+}
+
+/// Parse a single-turn encoder reply (`0x90`).
+pub fn parse_single_turn_encoder(data: &[u8]) -> Option<SingleTurnEncoder> {
+    if data.len() < DATA_LEN || data[0] != Cmd::ReadSingleTurnEncoder as u8 {
+        return None;
+    }
+    Some(SingleTurnEncoder {
+        encoder: i16::from_le_bytes([data[2], data[3]]),
+        encoder_raw: i16::from_le_bytes([data[4], data[5]]),
+        encoder_offset: i16::from_le_bytes([data[6], data[7]]),
+    })
+}
+
+/// Parse a single-turn angle reply (`0x94`) into 0.01°/LSB (0-35999). The
+/// manual labels this field `int16_t` but documents a 0-35999 range, which
+/// overflows `i16` — decoded as `u16` per the stated range, not the stated type.
+pub fn parse_single_turn_angle(data: &[u8]) -> Option<u16> {
+    if data.len() < DATA_LEN || data[0] != Cmd::ReadSingleTurnAngle as u8 {
+        return None;
+    }
+    Some(u16::from_le_bytes([data[6], data[7]]))
+}
+
+/// Parse a Status3 reply (`0x9D`): temperature + per-phase current.
+pub fn parse_status3(data: &[u8]) -> Option<Status3> {
+    if data.len() < DATA_LEN || data[0] != Cmd::ReadStatus3 as u8 {
+        return None;
+    }
+    Some(Status3 {
+        temperature_c: data[1] as i8,
+        phase_a_centi_amps: i16::from_le_bytes([data[2], data[3]]),
+        phase_b_centi_amps: i16::from_le_bytes([data[4], data[5]]),
+        phase_c_centi_amps: i16::from_le_bytes([data[6], data[7]]),
+    })
+}
+
+/// Parse a single PID-gain reply (`0x30`) into its raw `Float` value.
+/// `data[1]` echoes the requested [`PidIndex`] but isn't checked here —
+/// callers issuing concurrent requests for different indices should verify
+/// it matches.
+pub fn parse_pid_value(data: &[u8]) -> Option<f32> {
     if data.len() < DATA_LEN || data[0] != Cmd::ReadPid as u8 {
         return None;
     }
-    Some(PidGains {
-        current_kp: data[2],
-        current_ki: data[3],
-        speed_kp: data[4],
-        speed_ki: data[5],
-        position_kp: data[6],
-        position_ki: data[7],
-    })
+    Some(f32::from_le_bytes([data[4], data[5], data[6], data[7]]))
 }
 
 /// Parse an acceleration reply (`0x42`) into 1 dps/s units. `data[1]` echoes
@@ -268,6 +411,97 @@ pub fn parse_motor_model(data: &[u8]) -> Option<[u8; 7]> {
 }
 
 #[cfg(test)]
+mod new_command_tests {
+    use super::*;
+
+    #[test]
+    fn multi_turn_encoder_reply_matches_manual_example() {
+        // X4-36 V4.3 §2.6 Example 1: reply 60 00 00 00 10 27 00 00 → 10000 pulses.
+        let data = [0x60, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00];
+        assert_eq!(parse_multi_turn_encoder(&data), Some(10_000));
+        assert_eq!(parse_multi_turn_encoder_raw(&data), None);
+    }
+
+    #[test]
+    fn multi_turn_encoder_raw_reply_matches_manual_example() {
+        // X4-36 V4.3 §2.7 Example 1: reply 61 00 00 00 10 27 00 00 → 10000 pulses.
+        let data = [0x61, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00];
+        assert_eq!(parse_multi_turn_encoder_raw(&data), Some(10_000));
+    }
+
+    #[test]
+    fn multi_turn_zero_offset_reply_matches_manual_example() {
+        // X4-36 V4.3 §2.8 Example 1: reply 62 00 00 00 10 27 00 00 → 10000 pulses.
+        let data = [0x62, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00];
+        assert_eq!(parse_multi_turn_zero_offset(&data), Some(10_000));
+    }
+
+    #[test]
+    fn uptime_reply_matches_manual_example() {
+        // X4-36 V4.3 §2.29 Example 1: reply B1 00 00 00 00 00 00 10 → 268435456 ms.
+        let data = [0xB1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10];
+        assert_eq!(parse_uptime(&data), Some(268_435_456));
+    }
+
+    #[test]
+    fn run_mode_reply_matches_manual_example() {
+        // X4-36 V4.3 §2.25 Example 1: reply 70 00 00 00 00 00 00 03 → position loop.
+        let data = [0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03];
+        assert_eq!(parse_run_mode(&data), Some(RunMode::PositionLoop));
+    }
+
+    #[test]
+    fn run_mode_unknown_value_is_preserved() {
+        let data = [0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09];
+        assert_eq!(parse_run_mode(&data), Some(RunMode::Unknown(0x09)));
+    }
+
+    #[test]
+    fn motor_power_reply_matches_manual_example() {
+        // V3.9 §2.25.4 Example 1: reply 71 .. D0 07 → 0x07D0=2000 → 200.0 W.
+        let data = [0x71, 0x00, 0x00, 0x00, 0x00, 0x00, 0xD0, 0x07];
+        assert_eq!(parse_motor_power(&data), Some(200.0));
+    }
+
+    #[test]
+    fn single_turn_encoder_reply_matches_manual_example() {
+        // X4-36 V4.3 §2.11 Example 1: reply 90 00 33 08 BE 2C 8B 24.
+        let data = [0x90, 0x00, 0x33, 0x08, 0xBE, 0x2C, 0x8B, 0x24];
+        let e = parse_single_turn_encoder(&data).unwrap();
+        assert_eq!(e.encoder, 2099);
+        assert_eq!(e.encoder_raw, 11454);
+        assert_eq!(e.encoder_offset, 9355);
+    }
+
+    #[test]
+    fn single_turn_angle_reply_matches_manual_example() {
+        // X4-36 V4.3 §2.13 Example 1: reply 94 00 00 00 00 00 10 27 → 10000 → 100.00°.
+        let data = [0x94, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x27];
+        assert_eq!(parse_single_turn_angle(&data), Some(10_000));
+    }
+
+    #[test]
+    fn status3_reply_matches_manual_example() {
+        // X4-36 V4.3 §2.16 Example 1: reply 9D 32 C2 0B 10 FA C0 F9.
+        let data = [0x9D, 0x32, 0xC2, 0x0B, 0x10, 0xFA, 0xC0, 0xF9];
+        let s = parse_status3(&data).unwrap();
+        assert_eq!(s.temperature_c, 50);
+        assert_eq!(s.phase_a_centi_amps, 3010);
+        assert_eq!(s.phase_b_centi_amps, -1520);
+        assert_eq!(s.phase_c_centi_amps, -1600);
+    }
+
+    #[test]
+    fn status1_decodes_mos_temperature() {
+        // X4-36 V4.3 §2.14 Example 1: reply 9A 32 00 01 E5 01 04 00.
+        let data = [0x9A, 0x32, 0x00, 0x01, 0xE5, 0x01, 0x04, 0x00];
+        let s = parse_status1(&data).unwrap();
+        assert_eq!(s.temperature_c, 50);
+        assert_eq!(s.mos_temperature_c, 0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -290,25 +524,20 @@ mod tests {
     }
 
     #[test]
-    fn read_pid_frame_is_plain() {
-        assert_eq!(build_read_pid(), [0x30, 0, 0, 0, 0, 0, 0, 0]);
+    fn read_pid_frame_carries_index() {
+        // X4-36 V4.3 manual §2.1.4 Example 1: index 0x01 (current KP).
+        assert_eq!(
+            build_read_pid(PidIndex::CurrentKp),
+            [0x30, 0x01, 0, 0, 0, 0, 0, 0]
+        );
     }
 
     #[test]
-    fn pid_gains_reply_matches_manual_example() {
-        // Manual 2.1.4 Example 1: reply 30 00 55 19 55 19 55 19.
-        let gains = parse_pid_gains(&[0x30, 0x00, 0x55, 0x19, 0x55, 0x19, 0x55, 0x19]).unwrap();
-        assert_eq!(
-            gains,
-            PidGains {
-                current_kp: 0x55,
-                current_ki: 0x19,
-                speed_kp: 0x55,
-                speed_ki: 0x19,
-                position_kp: 0x55,
-                position_ki: 0x19,
-            }
-        );
+    fn pid_value_reply_matches_manual_example() {
+        // X4-36 V4.3 manual §2.1.4 Example 1: reply 30 01 00 00 00 00 80 3F
+        // → float 0x3F800000 = 1.0 (current loop KP).
+        let value = parse_pid_value(&[0x30, 0x01, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3F]).unwrap();
+        assert!((value - 1.0).abs() < 1e-6);
     }
 
     #[test]

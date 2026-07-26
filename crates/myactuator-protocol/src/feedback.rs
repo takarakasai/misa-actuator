@@ -15,8 +15,14 @@ impl ErrorState {
     pub const POWER_OVERRUN: u16 = 0x0040;
     pub const CALIBRATION_WRITE_ERROR: u16 = 0x0080;
     pub const OVER_SPEED: u16 = 0x0100;
+    /// Added in the X4-36 V4.3 firmware generation (absent from the plain
+    /// V3.9 manual's table).
+    pub const COMPONENT_OVER_TEMPERATURE: u16 = 0x0800;
     pub const MOTOR_OVER_TEMPERATURE: u16 = 0x1000;
     pub const ENCODER_CALIBRATION_ERROR: u16 = 0x2000;
+    /// Added in the X4-36 V4.3 firmware generation (absent from the plain
+    /// V3.9 manual's table).
+    pub const ENCODER_DATA_ERROR: u16 = 0x4000;
 
     /// Raw bitfield as reported by the motor.
     #[inline]
@@ -45,6 +51,12 @@ impl ErrorState {
     #[inline] pub const fn encoder_calibration_error(self) -> bool {
         self.0 & Self::ENCODER_CALIBRATION_ERROR != 0
     }
+    #[inline] pub const fn component_over_temperature(self) -> bool {
+        self.0 & Self::COMPONENT_OVER_TEMPERATURE != 0
+    }
+    #[inline] pub const fn encoder_data_error(self) -> bool {
+        self.0 & Self::ENCODER_DATA_ERROR != 0
+    }
 }
 
 /// Reply to `0x9A` — temperature, brake state, bus voltage, error flags.
@@ -52,6 +64,9 @@ impl ErrorState {
 pub struct Status1 {
     /// Motor temperature, 1 °C/LSB.
     pub temperature_c: i8,
+    /// MOSFET/driver-stage temperature, 1 °C/LSB. X4-36 V4.3+ firmware only
+    /// (`data[2]` is `NULL` on plain V3.9 firmware, which decodes as `0`).
+    pub mos_temperature_c: i8,
     /// `true` = last brake control command was "release".
     pub brake_released: bool,
     /// Bus voltage, 0.1 V/LSB.
@@ -90,16 +105,91 @@ impl Status2 {
     }
 }
 
-/// Reply to `0x30` — current/speed/position-loop PID gains. Each value is a
-/// `uint8` (0-255) normalized unit, not a physical gain: per the manual, the
-/// firmware maps the model-specific gain range onto 256 equal steps, so the
-/// same raw byte means a different real gain on different motor models.
+/// Which PID gain `0x30`/`0x31`/`0x32` reads/writes (V4.2+ indexed-`Float`
+/// protocol, confirmed against real X4-36 firmware). Pre-V4.2 firmware used a
+/// different, index-less "all six gains as `uint8`" layout — this crate
+/// targets the current indexed protocol since that's what shipping hardware
+/// (X4-36, firmware ≥ 2024.5) actually speaks; a bare `0x30` probe on such
+/// firmware returns an all-zero float rather than six gain bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PidIndex {
+    CurrentKp = 0x01,
+    CurrentKi = 0x02,
+    SpeedKp = 0x04,
+    SpeedKi = 0x05,
+    PositionKp = 0x07,
+    PositionKi = 0x08,
+    PositionKd = 0x09,
+}
+
+impl PidIndex {
+    /// Every index, in the order [`PidGains`] presents them.
+    pub const ALL: [PidIndex; 7] = [
+        PidIndex::CurrentKp,
+        PidIndex::CurrentKi,
+        PidIndex::SpeedKp,
+        PidIndex::SpeedKi,
+        PidIndex::PositionKp,
+        PidIndex::PositionKi,
+        PidIndex::PositionKd,
+    ];
+}
+
+/// Current/speed/position-loop PID gains, gathered from one `0x30` read per
+/// [`PidIndex`]. Real (not normalized) `Float` gain values.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PidGains {
-    pub current_kp: u8,
-    pub current_ki: u8,
-    pub speed_kp: u8,
-    pub speed_ki: u8,
-    pub position_kp: u8,
-    pub position_ki: u8,
+    pub current_kp: f32,
+    pub current_ki: f32,
+    pub speed_kp: f32,
+    pub speed_ki: f32,
+    pub position_kp: f32,
+    pub position_ki: f32,
+    pub position_kd: f32,
+}
+
+/// Reply to `0x90` — single-turn encoder position (direct-drive models).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SingleTurnEncoder {
+    /// Position after subtracting the zero offset.
+    pub encoder: i16,
+    /// Raw position, zero offset not applied.
+    pub encoder_raw: i16,
+    /// The zero-offset value itself.
+    pub encoder_offset: i16,
+}
+
+/// Reply to `0x9D` — per-phase motor current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Status3 {
+    /// Motor temperature, 1 °C/LSB.
+    pub temperature_c: i8,
+    /// Phase A/B/C current, 0.01 A/LSB.
+    pub phase_a_centi_amps: i16,
+    pub phase_b_centi_amps: i16,
+    pub phase_c_centi_amps: i16,
+}
+
+/// Reply to `0x70` — current run mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    CurrentLoop,
+    SpeedLoop,
+    PositionLoop,
+    /// A value the manual doesn't document (its own text says "one of three
+    /// states" but hints at a fourth without naming it).
+    Unknown(u8),
+}
+
+impl RunMode {
+    #[inline]
+    pub const fn from_raw(raw: u8) -> Self {
+        match raw {
+            0x01 => Self::CurrentLoop,
+            0x02 => Self::SpeedLoop,
+            0x03 => Self::PositionLoop,
+            other => Self::Unknown(other),
+        }
+    }
 }

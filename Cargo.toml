@@ -12,6 +12,9 @@ members = [
     "crates/damiao-protocol",
     "crates/damiao-driver",
     "crates/damiao-cli",
+    "crates/myactuator-protocol",
+    "crates/myactuator-driver",
+    "crates/myactuator-cli",
     "crates/misa-sysid",
 ]
 
@@ -31,6 +34,8 @@ robstride-protocol = { path = "crates/robstride-protocol", version = "0.1.0" }
 robstride-driver = { path = "crates/robstride-driver", version = "0.1.0" }
 damiao-protocol = { path = "crates/damiao-protocol", version = "0.1.0" }
 damiao-driver = { path = "crates/damiao-driver", version = "0.1.0" }
+myactuator-protocol = { path = "crates/myactuator-protocol", version = "0.1.0" }
+myactuator-driver = { path = "crates/myactuator-driver", version = "0.1.0" }
 misa-sysid = { path = "crates/misa-sysid", version = "0.1.0" }
 
 # Shared third-party deps

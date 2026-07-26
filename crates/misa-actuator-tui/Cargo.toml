@@ -12,6 +12,7 @@ misa-actuator = { workspace = true }
 lkmotor-driver = { workspace = true }
 robstride-driver = { workspace = true }
 damiao-driver = { workspace = true }
+myactuator-driver = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 anyhow = { workspace = true }

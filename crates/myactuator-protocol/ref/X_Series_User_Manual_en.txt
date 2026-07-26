@@ -1,0 +1,780 @@
+Instruction Manual for the Product
+
+
+
+
+         Applicable series: X series
+               Version: V1.1
+               Date: 2025.05
+                                          Preface
+     Thanks for choosing MYACTUATOR.
+     X series joint module is a highly integrated joint module provided by the company
+under the premise of years of experience accumulation for customer service, which has
+a large transmission speed ratio, strong bearing capacity, precise control, easy to carry,
+and saves a lot of time for developers.
+     This manual introduces the parameters, usage methods, precautions and other
+information of the X series integrated harmonic module, please read carefully before
+starting to operate.
+                                  Imprint Notice
+     The copyright of this manual belongs to Suzhou Micro Actuator Technology Co.,
+Ltd. Without the permission of the company, the content of this manual cannot be
+copied or plagiarized in any way. The product manual is only used as a reference for
+users and does not constitute the basis for meeting the user's overall usage requirements.
+Please be sure to evaluate it in combination with the user's overall system. The content
+of the manual strives to be detailed and accurate, but oversights are inevitable. If you
+find any errors, please provide your valuable feedback.
+     The company reserves the right to modify and improve this manual at any time
+without prior notice. For the latest version of the manual, please visit the official
+website (www.myactuator.com) to download it by yourself, or contact the company to
+obtain it.
+                             Table I Version update instructions
+     Version                                   Update instructions
+       V1.0                                        First edition
+       V1.1                         Update the module models and parameters
+                                                    Catalog
+Preface ....................................................................................................................... I
+Imprint Notice .......................................................................................................... II
+1. Safety Precautions .................................................................................................1
+2. Quality Assurance ................................................................................................. 5
+       2.1. After-sales Policy ....................................................................................... 5
+       2.2. Disclaimer .................................................................................................. 6
+3. Basic Parameters of the Module ........................................................................... 7
+       3.1. Module Nameplate and Model ...................................................................7
+       3.2. Module Appearance Size ............................................................................8
+       3.3. Module Parameters ...................................................................................10
+       3.4. Module Stall Characteristics .................................................................... 12
+4. Mechanical Installation Requirements ................................................................13
+5. Electrical Installation Requirements ................................................................... 14
+       5.1. About the Input Power Supply ................................................................. 14
+       5.2. Interface Description ................................................................................15
+       5.3. Indicator Description ................................................................................18
+6. Cable Connection between Multi-joint Modules ................................................ 18
+       6.1. Description of the Power Supply Wiring ................................................. 18
+       6.2. CAN Communication Wiring Instructions ...............................................19
+       6.3. EtherCAT Communication Wiring Instructions .......................................19
+7. Kinetic Energy Recovery .................................................................................... 20
+       7.1. Reasons for Kinetic Energy Recovery ..................................................... 20
+       7.2. Handling Methods ....................................................................................20
+8. Encoder Description ............................................................................................22
+       8.1. Resolution and Position Feedback ........................................................... 22
+       8.2. Instructions for the Use of the Mechanical Zero Calibration Function ... 23
+9. Connect and Debug the Setup Software ..............................................................24
+10. Communication Instruction Description ........................................................... 24
+1. Safety Precautions
+     This product is a high-precision product. Only professionals with corresponding
+qualifications can perform tasks such as installation, debugging, and maintenance.
+Corresponding personnel must understand and comply with IEC60364/IEC60664 and
+national accident prevention regulations. Please read the manual carefully before
+installing, operating, or repairing this product. Wrong operation may damage the
+module or even cause casualties. Be sure to follow the safety precautions in this manual.
+     This manual has the following safety symbols:
+
+
+
+
+     In this manual, we record hazardous situations as much as possible, and please see
+Table 1-1 for details. Relevant personnel are requested to understand and follow the
+following precautions. In addition, there are too many uncertain factors that cannot be
+considered and recorded. In actual application processes It is necessary to prevent and
+handle it according to the actual situation.
+                                   Table 1-1 Safety precautions
+
+Unboxing
+
+                 Please check whether the outer packaging of the device is intact
+                 Before unpacking, please check whether the outer packaging of the
+                 device is intact and whether it is damaged, damp, deformed, etc.
+
+                 Please do not unbox violently
+                 Please unpack in accordance with the hierarchical order, and violent
+                 knocking is strictly prohibited.
+              Please check whether the module and its accessories are complete
+              Please refer to the list to check whether the module name is correct,
+              whether the accessories are complete, whether there is any damage on
+              the surface of the equipment and its accessories, etc. If there is any
+              problem, please do not install it and contact our company in time.
+
+
+
+Installation and maintenance phase
+
+                Please assemble the module in place
+                When assembling the module, assemble it in place according to the
+                screw torque standards to ensure that there will be no danger of
+                accidental falling.
+                Do not plug or unplug the power cord while the power is on
+                Make sure the power indicator light goes out before wiring and
+                maintaining the device.
+                Do not plug or unplug communication lines while the power is on
+                When the GND of the control terminal and the module are not
+                connected, the voltage is inconsistent. The voltage difference between
+                the two at the moment of connection may damage the communication
+                interface.
+                Do not disassemble the module and its associated equipment while
+                the power is on
+                It is strictly prohibited to disassemble any device or accessory of the
+                equipment while the power is on, otherwise there is a risk of electric
+                shock.
+                Please keep the module shell grounded and use shielding layer
+                properly
+                If the module shell is not grounded, it may cause charge accumulation
+                in the shell, affecting the normal operation of the motor, and even
+                causing harm to the human body. The wiring cable must meet the
+corresponding wire diameter and shielding requirements, and the
+shielding layer of the shielded cable must be reliably grounded.
+Please use a multi-turn encoder power battery that meets the
+specifications
+In order to prevent the multi-turn value from being lost due to power
+outage, the multi-turn encoder is powered by a specific battery with
+the required specification of 2.7~3.6V. Please do not use other types
+of batteries. If the module is damaged, our company will not provide
+technical support for it. .
+It is strictly prohibited to connect the power supply to the output
+of the device
+It is strictly prohibited to connect the power supply to the output
+terminal of the device to avoid damage to the device or even fire.
+Please do a risk assessment
+Please conduct a risk assessment before use and take appropriate
+measures to ensure personal safety and equipment safety.
+Please observe the technical data and specifications
+Please refer to the parameters of each model in the manual to set
+reasonable parameters to prevent damage to the module.
+Please set appropriate protection limits
+Set appropriate position limits, speed limits, current limits, etc.
+Exceeding the limits may damage the motor or even threaten personal
+safety.
+Please perform a no-load test run before using the module
+To prevent accidents, please perform a no-load test run on the module.
+
+Do not disassemble or replace parts by yourself
+Product failure due to abnormal use will void the warranty rights of
+the product.
+          Do not hit or squeeze the module and its components with gravity
+          The module is a precision device. Do not use a hammer to hit the
+          module hard. Please place it carefully to prevent the module from
+          falling off the table and causing cracks and other damage.
+          The use environment complies with regulations
+          The working environment temperature of the module is 0~50℃.
+          When the temperature is low, it is recommended to use
+          low-temperature grease to improve the operating resistance of the
+          module. Please keep the environment free of dust, corrosive gases,
+          flammable gases, etc.
+          Be careful of high temperature burns
+          During the operation of the module, the surface may be very hot,
+          please pay attention to protection. When the surface temperature
+          exceeds 40℃, please avoid long-term contact, which may cause
+          low-temperature burns. When the surface temperature exceeds 85℃,
+          please avoid touching it, which may cause minor burns.
+
+
+Storage
+          Storage environment meets standards
+          Please refer to the manual to strictly require transportation and storage
+          temperature and humidity, and avoid direct sunlight, strong magnetic
+          fields, strong electric fields, strong vibrations and other places.
+          Storage time should not be too long
+          Avoid storing the module for more than 3 months. If the storage time
+          is too long, please take more stringent protective measures and
+          necessary inspection and maintenance.
+          Do not mix and transport equipment that may cause damage
+          Please pack the module strictly before transporting it. It is strictly
+          prohibited to transport it mixed with equipment that may affect it.
+                  Regular inspection and maintenance
+                  Please perform daily and regular inspection and maintenance on the
+                  module, and keep maintenance records.
+
+
+Others
+
+                  Do not remove the anti-tear warranty label
+                  Do not remove the anti-tear warranty label, otherwise you will lose
+                  your warranty rights.
+                  Please dispose of it as industrial waste
+                  Please dispose of the module and its accessories as industrial waste.
+
+
+2. Quality Assurance
+2.1. After-sales Policy
+
+     This product strictly implements the following after-sales services in accordance
+with the “Law of the People's Republic of China on the Protection of Consumers' Rights
+and Interests” and the “Law of the People's Republic of China on Product Quality”.
+     ①All users who purchase this product can enjoy the return and exchange service if
+there is a product quality problem within 7 days. When returning or exchanging, you
+should provide a valid proof of purchase and return invoice, and ensure that the returned
+product has intact functions, no damage to appearance, and complete accessories;
+     ② Users who purchase this product will enjoy free warranty service within one
+year from the day after receipt. In the event of man-made damage, manual disassembly,
+etc., no warranty service will be provided; if after testing, it is confirmed that the motor
+needs to be replaced, the merchant will need to negotiate with customers whether to
+purchase additional repair parts;
+     ③If there is a quality problem with the product within 7 to 15 days from the day
+after receipt, you can enjoy the exchange service after confirmation. When exchanging
+goods, you should provide a valid proof of purchase and return invoice, and ensure that
+the returned product has intact functions, no damage to appearance, and complete
+accessories;
+     ④The following situations are found not to be covered by the warranty:
+   Failure to install and connect other control equipment according to the requirements
+
+   of the user manual may cause the motor to burn out;
+   When used, the specifications or standards shown in the user manual are exceeded
+
+   (such as wrong motor parameter settings);
+   The storage method and working environment exceed the specified range in the
+
+   user manual (such as pollution, salt damage, condensation, etc.);
+   Product damage caused by abnormal working conditions (such as falling, impact,
+
+   liquid intrusion, violent impact, etc.);
+   Product damage caused by force majeure (natural disasters, fires, floods, etc.);
+
+   Users dismantle the product by themselves, causing damage to the motor;
+
+   Exceeds the warranty period provided by the post-sale policy;
+
+   Unable to provide valid proof of purchase;
+
+   Failures   other than those mentioned above are not caused by Suzhou Micro
+   Actuator Technology Co., Ltd.’s responsibility.
+     In the event of a joint module failure, you must contact Suzhou Micro Actuator
+Technology Co., Ltd as soon as possible to obtain a solution. Users are not allowed to
+disassemble and assemble the joint module for any reason, otherwise the warranty
+service will be terminated.
+
+2.2. Disclaimer
+
+     Please read this statement carefully before use. Once used, it is deemed to be
+recognition and acceptance of the entire content of this statement. Please install and use
+this product in strict compliance with the manual, product instructions, and relevant
+laws, regulations, policies, and guidelines. In the process of using the product, users
+promise to be responsible for their own actions and all consequences arising therefrom.
+Myactuator will not be held legally responsible for any losses caused by improper use,
+installation, or modification by users. The final right to interpret the disclaimer belongs
+to Myactuator.
+
+3. Basic Parameters of the Module
+     The X series module integrates a frameless torque motor, absolute encoder, servo
+driver and planetary reducer. It has a compact structure, strong integration, and is easy
+to install. X series modules are currently available in X2, X4, X6, X8, X12, X15,
+making robot development more convenient and flexible.
+
+3.1. Module Nameplate and Model
+
+
+
+
+     Taking RMD-X2-P28-7-C as an example, the module product model parameters
+are explained in Table 3-1.
+                         Table 3-1 Product Model Parameter Explanation
+
+Parameter    Explanation
+  RMD        Myactuator’s sub-brand name: Reducer Motor Drive.
+    X2       The base numbers are available in six models: X2, X4, X6, X8, X12 and X15.
+             The gear ratio is rounded to the nearest integer. For the specific gear ratio, please
+   P28
+             refer to the module parameter table.
+    7        Peak Torque, indicating that the peak torque for this model is 7 N.m.
+             Indicates the communication interface type of the module, including ETHERCAT
+    C
+             and CANBUS.
+
+     The specific models of our company's Series X are shown in Table 3-2.
+                      Table 3-2   The specific models of Series X
+
+   Abbreviation                                 Full Name
+                                            RMD-X2-P28-7-C
+     X2-P28
+                                            RMD-X2-P28-7-E
+                                          RMD-X4-P12.5-10-C
+    X4-P12.5
+                                          RMD-X4-P12.5-10-E
+                                           RMD-X4-P36-36-C
+     X4-P36
+                                           RMD-X4-P36-36-E
+                                           RMD-X6-P20-60-C
+     X6-P20
+                                           RMD-X6-P20-60-E
+                                          RMD-X8-P20-120-C
+     X8-P20
+                                          RMD-X8-P20-120-E
+                                          RMD-X8-P33-150-C
+     X8-P33
+                                          RMD-X8-P33-150-E
+                                          RMD-X12-P20-320-C
+     X12-P20
+                                          RMD-X12-P20-320-E
+                                          RMD-X15-P20-450-C
+     X15-P20
+                                          RMD-X15-P20-450-E
+
+3.2. Module Appearance Size
+
+
+
+
+                  Figure 3-1   X2-P28 appearance dimension drawing
+Figure 3-2   X4-P12.5 appearance dimension drawing
+
+
+
+
+Figure 3-3   X4-P36 appearance dimension drawing
+
+
+
+
+Figure 3-4   X6-P20 appearance dimension drawing
+
+
+
+
+Figure 3-5   X8-P20 appearance dimension drawing
+                                  Figure 3-6     X12-P20 appearance dimension drawing
+
+
+
+
+                                  Figure 3-7     X15-P20 appearance dimension drawing
+
+
+            3.3. Module Parameters
+
+                                               Table 3-3 Module parameter list
+
+         参数              X2-P28      X4-P12.5        X4-P36       X6-P20         X8-P20   X8-P33   X12-P20   X15-P20
+        Ratio            28.17          12.6            36        19.612         19.612     33       20       20.25
+   Input Voltage(V)        24            24             24          48             48       48       48        72
+  Peak Speed (RPM)        178           317            111          176           158       90       125       108
+ No-load Current (A)      1.0           1.0            0.9          0.9           1.6      1.5       2.7       3.5
+  Rated Speed (RPM)       142           238             83          153           127       75       100       98
+  Rated Torque (N.m)      2.5           4.0            10.5        20.0           43.0      66       85       145.0
+Rated Output Power (W)     37           100            100          320           574      520       900      1480
+ Rated Current (Arms)     3.0           7.8            6.1          9.5           17.6      15      30.0      25.0
+  Peak Torque (N.m)        7             10             34          60            120      150       320       450
+  Peak Current (Arms)               8.1          19.5       21.5   29.1            43.8            34      100.0   69.2
+
+     Efficiency (%)                 63           69.5       63.1   72.7            79.0            77        75    82.4
+     EMF Constant
+                                    4.3           6.0       6.0    16.0            19.2           19.2     17.9    29.9
+      (Vdc/Krpm)
+Torque Constant (N.m/A)             0.8           0.8       1.9    2.1             2.4            4.4       3.3    5.8
+  Wire Resistance (Ω)              0.61          0.32       0.35   0.41            0.18           0.16     0.12    0.08
+ Wire Inductance (mH)              0.13          0.14       0.17   0.51            0.31           0.33     0.05    0.14
+           Polar                    13            13        13     10              10              10        20    20
+
+     Wiring Method                  Y              Y         Y      Y               Y              Y         Y      Y
+
+   Backlash (Arcmin)                12            10        10     10              10              12        10    10
+
+Output shaft bearing type        Deep groove ball bearing                          cross roller bearing
+
+   Radial Load (KN)                  1            1.2       1.5     2              4.5              6        5      6
+ Axial Load          Tension       0.25           1.2       1.3    1.8              4               6       4.5    5.4
+
+    (KN)           Compression     0.25           1.2       1.3    0.8              1               6       4.5    5.4
+
+ Repeatability (Degree)            0.17          0.25       0.3    0.66            1.5            2.4      12.9    31.6
+
+                                            Dual Encoder                                    Dual Encoder
+     Encoder Type
+                                      ABS-17BIT/ABS-18BIT                                ABS-17BIT/ABS-17B
+
+Control accuracy (Degree)                                                 < 0.01
+
+ Communication Method                                              EtherCAT/CAN
+
+      Weight (Kg)                  0.26          0.26       0.36   0.82            1.4            1.48     2.37    3.5
+
+     Insulation level                                                       F
+3.4. Module Stall Characteristics
+
+     When the module transitions from a stationary state to start-up operation, the
+significant initial static friction force requires a higher torque to initiate movement. This
+can cause the speed to drop to 0 rpm, an increase in current, and a rapid rise in
+temperature. Below are the temperature increase scenarios for the module when it
+exceeds the rated load.
+                                  Table 3-4   Stall Data for X2-P28
+
+ Torque (Nm)      Temperature Rise (℃)          Stall Time (s)         Phase Current (Arms)
+      3.75                   20                       15                       4.3
+        5                    48                       10                       5.7
+      6.25                   31                        8                       7.4
+       7.5                   59                        5                       8.6
+
+                                  Table 3-5   Stall Data for X4-P36
+
+ Torque (Nm)      Temperature Rise (℃)          Stall Time (s)         Phase Current (Arms)
+     17.25                   30                       15                       9.2
+       23                    58                       10                       12.7
+     28.75                   41                        5                       16.3
+      34.5                   50                        3                       21.2
+
+                                  Table 3-6   Stall Data for X6-P20
+
+ Torque (Nm)      Temperature Rise (℃)          Stall Time (s)         Phase Current (Arms)
+       30                    17                       15                       12.7
+       40                    29                       10                       17.7
+       50                    37                        8                       22.6
+       60                    24                        5                       28.3
+
+                                  Table 3-7   Stall Data for X8-P20
+
+ Torque (Nm)      Temperature Rise（℃） Stall Time（s）                   Phase Current（Arms）
+      64.5                    7                       15                       23.3
+       86                    10                       10                       31.1
+     107.5                  26                         8               38.9
+      129                   30                         5               43.8
+
+                                 Table 3-8   Stall Data for X12-P20
+
+ Torque (Nm) Temperature Rise（℃） Stall Time（s） Phase Current（Arms）
+      150                   13                        10               37.5
+      200                    5                         8               49.5
+      250                    7                         7               61.5
+      300                   43                         3               75.3
+
+                                 Table 3-9   Stall Data for X15-P20
+
+ Torque (Nm) Temperature Rise（℃） Stall Time（s） Phase Current（Arms）
+     217.5                  15                        15               31.1
+      290                   15                        10               41
+     362.5                  20                         8               51.6
+      435                   25                         5               67.2
+
+
+4. Mechanical Installation Requirements
+     Please carry out structural design and assembly based on the drawings of each
+model module provided by our company. Please refer to this chapter for details of the
+screw types and techniques required for assembly. During the assembly process, all
+fixed screws must be threaded with thread glue, and the position of thread glue must be
+consistent, and the amount of thread glue must be consistent. Use the diagonal method
+to tighten the screws. The specific tightening steps are as follows:
+     1. Tighten the screw to the end but do not tighten it;
+     2. Slightly tighten the screws in diagonal steps;
+     3. Tighten the screws using a torque wrench in diagonal steps.
+     For screw tightening force, refer to Table 4-1.
+                              Table 4-1 Screw tightening torque table
+
+Screw specifications     Tightening torque      Screw specifications    Tightening torque
+        (mm)                  (kgf.cm)                  (mm)                (kgf.cm)
+      M3 × 0.5                   17                   M14 × 2.0               1840
+      M4 × 0.7                   40                   M16 × 2.0               2870
+      M5 × 0.8                   81                   M18 × 2.5               3950
+      M6 × 1.0                   138                  M20 × 2.5               5600
+     M8 × 1.25                   334                  M22 × 2.5               7620
+    M10 × 1.25                   663                  M24 × 3.0               9680
+     Foreign matter such as metal shavings, dust particles, various types of sealant, etc.
+may be stuck to the installation surface, which will prevent reliable cooperation between
+the installation surfaces and further cause jitter and noise of the module. Therefore,
+please clean the installation surface carefully before installation.
+
+5. Electrical Installation Requirements
+5.1. About the Input Power Supply
+
+     The power supply uses 48VDC or 72VDC power supply, the input voltage
+specifications vary among different models of modules. For details, refer to Table 3.3
+Module Parameters. Modules with an input voltage of 48VDC have a maximum
+withstand voltage of 55VDC at the power interface, while those with an input voltage of
+72VDC have a maximum withstand voltage of 90VDC, exceeding the maximum
+withstand voltage can easily lead to driver failure. When a switch is used to control the
+joint for power, there may be an over voltage at the moment of power-up shock, this
+power supply mode needs to connect an electrolytic capacitor in parallel after the switch
+and before the joint power input (Reference specification:1000uF/100V, the specific
+specification selection should be based on the actual filtering effect), as shown in Figure
+5-1, to suppress overshoot of the input voltage at the moment of power-up phenomenon.
+                  Figure 5-1 Protection circuits in the case of switching power supplies
+
+    There is no need to consider the effect of back EMF when using battery power,
+because the back EMF of the module directly charges the battery. In order to make the
+system more safe and reliable, the over voltage/under voltage protection voltage of the
+module can be modified according to the actual test situation, and the modification
+method is as follows: debugging the host computer - advanced parameters - protection
+parameters - over voltage/under voltage protection voltage, as shown in Figure 5-2.
+
+
+
+
+       Figure 5-2 Schematic diagram of over voltage/under voltage protection voltage modification
+
+
+5.2. Interface Description
+
+    The interface is described as follows.
+            Table 5-1   Interface description for X2-P28/X4-P36
+
+                                         Port                Port description
+
+                                         VCC          The positive pole of the power
+
+                                         GND         The negative pole of the power
+
+                                                               supply
+                                        CAN_L        CAN_L network signal interface
+
+                                        CAN_H        CAN_H network signal interface
+
+                                     EtherCAT_IN          EtherCAT input port
+
+
+                                     EtherCAT_OUT         EtherCAT output port
+
+
+T+   Master sends control commands to the module
+T-   Module sends status feedback to the master
+R+   Master reflects the status data of the module
+R-   Module reflects the control commands of the master
+
+
+
+                Table 5-2   Interface description for X6-P20
+
+                                         Port                Port description
+
+                                         VCC          The positive pole of the power
+
+                                         GND         The negative pole of the power
+
+                                                               supply
+                                        CAN_L        CAN_L network signal interface
+
+                                        CAN_H        CAN_H network signal interface
+
+                                     EtherCAT_IN          EtherCAT input port
+
+
+                                     EtherCAT_OUT         EtherCAT output port
+
+
+R+   Master reflects the status data of the module
+R-   Module reflects the control commands of the master
+T+   Master sends control commands to the module
+T-   Module sends status feedback to the master
+                Table 5-3   Interface description for X8-P20
+
+                                         Port                Port description
+
+                                         VCC          The positive pole of the power
+
+                                         GND         The negative pole of the power
+
+                                                               supply
+                                        CAN_L        CAN_L network signal interface
+
+                                        CAN_H        CAN_H network signal interface
+
+                                     EtherCAT_IN          EtherCAT input port
+
+
+                                     EtherCAT_OUT         EtherCAT output port
+
+
+R+   Master reflects the status data of the module
+R-   Module reflects the control commands of the master
+T+   Master sends control commands to the module
+T-   Module sends status feedback to the master
+
+
+
+          Table 5-4    Interface description for X12-P20/X15-P20
+
+                                         Port                Port description
+
+                                         VCC          The positive pole of the power
+
+                                         GND         The negative pole of the power
+
+                                                               supply
+                                        CAN_L        CAN_L network signal interface
+
+                                        CAN_H        CAN_H network signal interface
+
+                                     EtherCAT_IN          EtherCAT input port
+
+
+                                     EtherCAT_OUT         EtherCAT output port
+
+
+R+   Master reflects the status data of the module
+R-   Module reflects the control commands of the master
+T+   Master sends control commands to the module
+T-   Module sends status feedback to the master
+5.3. Indicator Description
+
+                        Table 5-5 Explanation of the status of the indicator
+
+                  Expression                                           Situation
+
+         The green light is always on                    The motor is operating normally
+        The green light flashes rapidly                There is a level 1 error in the motor
+        The green light flashes slowly                 There is a level 2 error in the motor
+     If there is an error in the operation of the motor, please read the specific error
+information from the host computer or CAN command, and refer to the "Setup Software
+Instruction Manual" and "Servo Motor Control Protocol" for the specific error reason.
+
+6. Cable Connection between Multi-joint Modules
+6.1. Description of the Power Supply Wiring
+
+     There are two power wiring modes for this series of joint modules: single-axis
+direct connection and chain topology connection, as shown in Figure 6-1. When it is
+applied to the collaborative work of multiple modules, the performance of the two
+wiring methods is different, the wiring resistance of single-axis direct connection is
+small, and the line loss voltage drop is small; The chain topology has a bit large wiring
+resistance and a little large line loss voltage drop, so it is recommended to use a
+single-axis direct connection for high-power modules and a chain-type topology
+connection for low-power modules. Note: Do not connect to other electrical devices in
+series, as it may cause unpredictable voltage drops or voltage boosts that may cause
+module failure.
+
+
+
+
+                      (a)Schematic diagram of a single-axis direct connection
+                           (b)Schematic diagram of the chain topology
+
+                   Figure 6-1 Schematic diagram of multi-module power supply
+
+6.2. CAN Communication Wiring Instructions
+
+    The CAN communication line is made of twisted pair cables, which are shielded
+separately, and it is important to ensure that the ID of each module is unique before
+establishing CAN communication. In addition, the CAN communication controller and
+module use the ground connection method for power supply, as shown in Figure 6-2. In
+order to eliminate signal reflections in the communication cables, a 120Ω termination
+resistor is required in parallel at the CAN communication interface of both the
+controller and the end module.
+
+
+
+
+                  Figure 6-2   Schematic diagram of CAN communication wiring
+
+6.3. EtherCAT Communication Wiring Instructions
+
+    The EtherCAT communication cable uses twisted pair cables and is individually
+shielded, as shown in Figure 6-3. If this communication method is used, it is
+recommended to keep the CAN communication line during the connection process and
+set the communication ID for subsequent debugging and troubleshooting.
+                Figure 6-3    Schematic diagram of EtherCAT communication wiring
+
+
+7. Kinetic Energy Recovery
+7.1. Reasons for Kinetic Energy Recovery
+
+     During normal operation of the module, the power supply outputs electrical energy
+to it. When the module is operating in deceleration, the circuit loop engages in the
+process of kinetic energy recovery. Figure 7-1 shows a simplified circuit diagram of the
+module during normal operation and deceleration. The amount of kinetic energy
+recovered is related to torque and rotational speed, and it is directly proportional to the
+product of torque and rotational speed. Therefore, the faster the speed and the greater
+the load, the more kinetic energy is recovered. If the power supply voltage rises above
+the maximum allowable bus voltage set by the drive, the module will report an error for
+excessively high bus voltage.
+
+
+
+
+           (a)Normal operating state                 (b)Deceleration operating state
+
+                             Figure 7-1 Diagram of module operating states
+
+7.2. Handling Methods
+
+     1. Adding a bleeder resistor
+     By paralleling a resistor, when the module is in a deceleration operating state, the
+recovered kinetic energy is consumed through the resistor, thereby preventing the power
+supply voltage from becoming too high due to kinetic energy recovery. As shown in
+Figure 7-2, the disconnection/connection of the resistor can be operated through a logic
+control circuit.
+
+
+
+
+                    (a) The resistor is disconnected when the voltage is normal
+
+
+
+
+                    (b) The resistor is connected when the voltage is too high
+
+           Figure 7-2 Diagram of module operating state with bleeder resistor connected
+
+     2. Adding a super capacitor
+     During normal operation, the switching power supply supplies power to both the
+super capacitor and the module. When the module is in a deceleration operating state,
+the super capacitor rapidly recovers part of the kinetic energy, thereby preventing the
+power supply voltage from becoming too high. As shown in Figure 7-3.
+
+
+
+
+                     (a) Charging the capacitor when the voltage is normal
+                    (b) Capacitor kinetic energy recovery when the voltage is too high
+
+              Figure 7-3 Diagram of module operating state with super capacitor added
+
+     3. Adding a storage battery
+     During normal operation, both the switching power supply and the storage battery
+supply power to the module simultaneously. When the module is in a deceleration state,
+the storage battery recovers the kinetic energy, as shown in Figure 7-4.
+
+
+
+
+                  (a)Storage battery powers the system when the voltage is normal
+
+
+
+
+                 (b)Storage battery recovers kinetic energy when the voltage is too high
+
+             Figure 7-4 Diagram of module operating state with storage battery added
+
+
+8. Encoder Description
+8.1. Resolution and Position Feedback
+
+     The module is controlled by double absolute encoders and achieve full closed-loop
+control. The encoder resolution of different module models may vary slightly. For
+specific values, refer to Section 3.3 Module Parameters. When the encoder resolution is
+17 bits, the number of position counts output by the motor shaft for one complete
+rotation is 217, with a single-turn position range of 0 to 131071, and the conversion
+formula between angle and single turn position is:
+                     single turn position = angle ÷ 360 × 131072
+      For example, a lap angle of 30° corresponds to a lap position of 30 ÷ 360 ×
+131072.
+      When the encoder position jumps at the boundary, it will count the number of turns
+of multiple turns, and when the position of 0 moves in the opposite direction, the
+position change will change from 0 to 131071, and the count of turns will be reduced by
+1; When the 131071 position moves in the positive direction, it will jump from 131071
+to 0, and the lap count will be increased by 1, so the current position of the encoder is
+calculated as follows:
+                 position = lap count × 131072 + single lap position
+      For the module, the current position can be obtained through the CAN bus or setup
+software, the motor operation interface status bar of the setup software will display the
+current motor angle in real time, the detailed setup software function and operation
+process can be found in the company's "Setup Software Instruction Manual", and the
+CAN communication control instructions are detailed in the "Servo Motor Control
+Protocol".
+
+8.2. Instructions for the Use of the Mechanical Zero Calibration
+       Function
+
+      Users can use the mechanical zero point calibration function to flexibly set the
+mechanical zero point value according to the use of the module, and there are two ways
+to set it:
+      1. Connect and debug the setup software, and set the zero point in the basic
+parameter interface, see the "Setup Software Instruction Manual" of the company for
+details;
+     2. CAN command setting, please refer to our company's "Servo Motor Control
+Protocol" for details.
+
+9. Connect and Debug the Setup Software
+     Please download the latest debugging software from the company's official website,
+and the installation and debugging method is detailed in the "Setup Software Instruction
+Manual".
+
+10.Communication Instruction Description
+     The RH series module adopts our company's customized communication
+instructions, and the communication control instructions are detailed in the "Servo
+Motor Control Protocol".
+

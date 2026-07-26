@@ -8,6 +8,9 @@
 //!
 //! # LK Motor V3 on /dev/ttyUSB0 @ 1 Mbps, motor id 1, 1:10 gearbox
 //! misa-actuator-tui --driver lkmotor --interface /dev/ttyUSB0 --motor-id 1 --baud 1000000 --gear-ratio 10.0
+//!
+//! # MyActuator RMD (CAN V3) on can0, motor id 1, Kt 0.83 N·m/A
+//! misa-actuator-tui --driver myactuator --interface can0 --motor-id 1 --kt 0.83
 //! ```
 
 mod app;

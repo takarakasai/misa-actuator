@@ -12,6 +12,7 @@ use misa_actuator::Actuator;
 
 use damiao_driver::{DamiaoMotor, MotorModel as DmModel};
 use lkmotor_driver::{LkMotor, MotorConfig as LkMotorConfig, MotorId as LkMotorId};
+use myactuator_driver::{MotorConfig as MyaMotorConfig, MyActuatorMotor};
 use robstride_driver::{Motor as RsMotor, MotorModel};
 
 /// The shared `--model` default. Robstride-centric for historical reasons; the
@@ -26,6 +27,8 @@ pub enum DriverKind {
     Lkmotor,
     /// DAMIAO CAN / CAN-FD motor on a SocketCAN interface (Linux).
     Damiao,
+    /// MyActuator RMD motor (CAN protocol V3) on a SocketCAN interface (Linux).
+    Myactuator,
 }
 
 /// Physical CAN layer for the DAMIAO driver. Classic CAN and CAN-FD carry the
@@ -53,7 +56,7 @@ pub struct DriverConfig {
     pub baud: u32,
     /// Lkmotor: gear ratio (e.g. 10.0 for 1:10 gearbox). Ignored for robstride.
     pub gear_ratio: f32,
-    /// Lkmotor: torque constant Kt (N·m/A). 0 → use `MotorConfig::current_units`.
+    /// Lkmotor / Myactuator: torque constant Kt (N·m/A). 0 → current-units mode.
     pub kt: f32,
     /// Damiao: physical CAN layer (classic CAN or CAN-FD). Ignored otherwise.
     pub bus_kind: BusKind,
@@ -156,6 +159,26 @@ pub fn build_actuator(cfg: &DriverConfig) -> Result<Box<dyn Actuator + Send>> {
                 }
             };
             Ok(motor)
+        }
+        DriverKind::Myactuator => {
+            // V3 speaks output-shaft units on the wire, so only Kt matters
+            // (reuses the lkmotor `--kt` flag; 0 → current-units mode).
+            let config = if cfg.kt > 0.0 {
+                MyaMotorConfig::new(cfg.kt)
+            } else {
+                MyaMotorConfig::current_units()
+            };
+            let mut motor = MyActuatorMotor::open(&cfg.interface, cfg.motor_id, config)
+                .with_context(|| {
+                    format!(
+                        "failed to open SocketCAN interface {} for motor {}",
+                        cfg.interface, cfg.motor_id
+                    )
+                })?;
+            motor
+                .set_timeout(cfg.timeout)
+                .context("failed to set CAN socket timeout")?;
+            Ok(Box::new(motor))
         }
     }
 }

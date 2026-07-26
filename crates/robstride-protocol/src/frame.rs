@@ -40,6 +40,17 @@ pub fn build_set_zero_frame(host_id: u8, device_id: u8) -> (u32, [u8; DATA_LEN])
     (can_id, data)
 }
 
+/// Build a `SET_CAN_ID` frame: reassigns `device_id`'s address to `new_id`.
+///
+/// The request is addressed to the motor's **current** id (`device_id`); the
+/// new id rides in the 16-bit `extra_data` field. Takes effect immediately
+/// (no restart / explicit flash-save needed) and persists across power
+/// cycles, per the reference implementation.
+pub fn build_set_device_id_frame(device_id: u8, new_id: u8) -> (u32, [u8; DATA_LEN]) {
+    let can_id = build_can_id(CommType::SetDeviceId, new_id as u16, device_id);
+    (can_id, [0u8; DATA_LEN])
+}
+
 /// Build a MIT-mode `OPERATION_CONTROL` frame.
 ///
 /// The torque feedforward rides in the 16-bit `extra_data` field of the CAN
@@ -152,6 +163,14 @@ mod tests {
         let (_id, data) = build_set_zero_frame(0xFD, 0x01);
         assert_eq!(data[0], 1);
         assert_eq!(&data[1..], &[0u8; 7]);
+    }
+
+    #[test]
+    fn set_device_id_layout() {
+        // Addressed to the current id (127); new id (1) rides in extra_data.
+        let (can_id, data) = build_set_device_id_frame(127, 1);
+        assert_eq!(can_id, (CommType::SetDeviceId as u32) << 24 | (1u32 << 8) | 127);
+        assert_eq!(data, [0u8; 8]);
     }
 
     #[test]

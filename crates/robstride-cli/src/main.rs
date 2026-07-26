@@ -14,10 +14,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use robstride_driver::{Motor, MotorModel, ParamIndex, RunMode, dump_bus, scan_bus, DEFAULT_HOST_ID};
+use robstride_driver::{dump_bus, scan_bus, Motor, MotorModel, ParamIndex, RunMode, DEFAULT_HOST_ID};
+
+mod param_commands;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Test CLI for the Robstride CAN servo motor driver")]
@@ -131,6 +133,15 @@ enum Command {
         #[arg(long)]
         duration: Option<f32>,
     },
+    /// Reassign this motor's CAN bus address (addressed at `-m/--motor-id`).
+    ///
+    /// Takes effect immediately and persists across power cycles — do this
+    /// **one motor at a time** on the bus so the address change is
+    /// unambiguous.
+    SetId {
+        /// New CAN id to assign (1..=127).
+        new_id: u8,
+    },
     /// Probe each motor id in the range and print responders.
     Scan {
         #[arg(long, default_value_t = 1)]
@@ -140,6 +151,42 @@ enum Command {
         /// Per-id timeout (ms).
         #[arg(long, default_value_t = 50)]
         timeout: u64,
+    },
+    /// Read firmware version (AppCodeVersion) via RobStride's undocumented
+    /// bulk parameter table (reverse-engineered from motorstudio — see
+    /// robstride_protocol::param_table).
+    Version {
+        /// Overall read timeout (ms).
+        #[arg(long, default_value_t = 500)]
+        timeout_ms: u64,
+    },
+    /// Read one row's raw value by FunctionCode via the cheap single-row
+    /// read (5 frames total — see robstride_protocol::param_table). Accepts
+    /// hex (`0x1003`) or decimal. Use `param-table` first to look up a
+    /// row's FunctionCode/name if you don't already know it.
+    ///
+    /// WARNING: unlike `param-table`, this path gets no name back from the
+    /// motor, so its type is looked up by FunctionCode against the
+    /// RS04/EL05 manual alone — a live capture found at least one firmware
+    /// build repurposes specific FunctionCodes relative to the manual
+    /// (verified names didn't match at 0x2006/0x2007). If the shown type
+    /// looks wrong, cross-check the FunctionCode/name pairing with
+    /// `param-table` first.
+    ReadParam {
+        /// FunctionCode to read, e.g. 0x1003 (AppCodeVersion) or 0x2005
+        /// (MechOffset).
+        #[arg(value_parser = parse_function_code)]
+        function_code: u16,
+        /// Overall read timeout (ms).
+        #[arg(long, default_value_t = 500)]
+        timeout_ms: u64,
+    },
+    /// Dump every row of the undocumented bulk parameter table (name +
+    /// raw value bytes; see robstride_protocol::param_table).
+    ParamTable {
+        /// Overall read timeout (ms).
+        #[arg(long, default_value_t = 500)]
+        timeout_ms: u64,
     },
     /// Passively listen on the bus and print every frame.
     Dump {
@@ -226,6 +273,20 @@ enum Command {
 
 fn parse_model(s: &str) -> Result<MotorModel> {
     MotorModel::from_name(s).with_context(|| format!("unknown motor model: {s}"))
+}
+
+/// Parse a FunctionCode as hex (`0x1003`, `1003h`) or decimal (`4099`).
+fn parse_function_code(s: &str) -> std::result::Result<u16, String> {
+    let s = s.trim();
+    let digits = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .or_else(|| s.strip_suffix('h'))
+        .or_else(|| s.strip_suffix('H'));
+    match digits {
+        Some(hex) => u16::from_str_radix(hex, 16).map_err(|e| e.to_string()),
+        None => s.parse::<u16>().map_err(|e| e.to_string()),
+    }
 }
 
 fn open_motor(cli: &Cli) -> Result<Motor> {
@@ -467,6 +528,27 @@ fn run(cli: Cli) -> Result<()> {
             }
             motor.disable()?;
         }
+        Command::SetId { new_id } => {
+            if *new_id == 0 {
+                bail!("new id must be >= 1");
+            }
+            let mut motor = open_motor(&cli)?;
+            println!(
+                "reassigning motor {} -> {} on {} ...",
+                cli.motor_id, new_id, cli.interface
+            );
+            motor.set_device_id(*new_id)?;
+            println!("done. verifying at new id {new_id} ...");
+            match motor.ping() {
+                Ok(_) => println!("confirmed: motor now responds at id {new_id}."),
+                Err(e) => println!(
+                    "warning: no ping reply at id {new_id} ({e}) — rerun `scan` to confirm."
+                ),
+            }
+            println!(
+                "\nNEXT: use  -m {new_id}  for all further commands on this motor."
+            );
+        }
         Command::Scan { from, to, timeout } => {
             let timeout_per_id = Duration::from_millis(*timeout);
             let mut last_id: u8 = 0;
@@ -498,6 +580,21 @@ fn run(cli: Cli) -> Result<()> {
                     println!();
                 }
             }
+        }
+        Command::Version { timeout_ms } => {
+            let mut motor = open_motor(&cli)?;
+            param_commands::run_version(&mut motor, cli.motor_id, *timeout_ms)?;
+        }
+        Command::ReadParam {
+            function_code,
+            timeout_ms,
+        } => {
+            let mut motor = open_motor(&cli)?;
+            param_commands::run_read_param(&mut motor, *function_code, *timeout_ms)?;
+        }
+        Command::ParamTable { timeout_ms } => {
+            let mut motor = open_motor(&cli)?;
+            param_commands::run_param_table(&mut motor, *timeout_ms)?;
         }
         Command::Dump { duration } => {
             let frames = dump_bus(&cli.interface, Duration::from_secs_f32(*duration))?;

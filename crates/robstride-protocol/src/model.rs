@@ -18,11 +18,25 @@ pub enum MotorModel {
 }
 
 impl MotorModel {
-    /// Parse a model name (case-insensitive). Accepts both `RS-05` style and
-    /// `Edulite05` aliases for the supported variants.
+    /// Parse a model name (case-insensitive). Accepts `RS-05` style,
+    /// `Robstride05` / `Robstride-05` style, and `Edulite05` aliases for the
+    /// supported variants.
     pub fn from_name(s: &str) -> Option<Self> {
         let lower_buf = ascii_lower::<32>(s);
         let lower = lower_buf.as_str();
+        if let Some(rest) = lower.strip_prefix("robstride") {
+            let rest = rest.strip_prefix('-').unwrap_or(rest);
+            return Some(match rest {
+                "00" => Self::Rs00,
+                "01" => Self::Rs01,
+                "02" => Self::Rs02,
+                "03" => Self::Rs03,
+                "04" => Self::Rs04,
+                "05" => Self::Rs05,
+                "06" => Self::Rs06,
+                _ => return None,
+            });
+        }
         Some(match lower {
             "rs-00" | "rs00" => Self::Rs00,
             "rs-01" | "rs01" | "edulite01" => Self::Rs01,
@@ -109,8 +123,8 @@ impl MitScales {
             },
             MotorModel::Rs05 => Self {
                 position: 4.0 * PI,
-                velocity: 33.0,
-                torque: 17.0,
+                velocity: 50.0,
+                torque: 5.5,
                 kp: 500.0,
                 kd: 5.0,
             },
@@ -164,13 +178,18 @@ mod tests {
         assert_eq!(MotorModel::from_name("RS-05"), Some(MotorModel::Rs05));
         assert_eq!(MotorModel::from_name("Edulite05"), Some(MotorModel::Rs05));
         assert_eq!(MotorModel::from_name("rs-04"), Some(MotorModel::Rs04));
+        assert_eq!(MotorModel::from_name("Robstride04"), Some(MotorModel::Rs04));
+        assert_eq!(MotorModel::from_name("robstride-04"), Some(MotorModel::Rs04));
+        assert_eq!(MotorModel::from_name("robstride07"), None);
         assert_eq!(MotorModel::from_name("nope"), None);
     }
 
     #[test]
     fn rs05_scales() {
+        // Confirmed against the official RS05-EN and EL05-EN manuals
+        // (2025-11-12 rev): V_MAX=50.0 rad/s, T_MAX=5.5 N·m.
         let s = MitScales::for_model(MotorModel::Rs05);
-        assert!((s.velocity - 33.0).abs() < f32::EPSILON);
-        assert!((s.torque - 17.0).abs() < f32::EPSILON);
+        assert!((s.velocity - 50.0).abs() < f32::EPSILON);
+        assert!((s.torque - 5.5).abs() < f32::EPSILON);
     }
 }

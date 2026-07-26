@@ -28,16 +28,19 @@ pub mod actuator;
 pub mod bus;
 pub mod driver;
 pub mod error;
+pub mod param_table;
 pub mod scan;
 
 pub use bus::{CanFrame, RobstrideBus, SocketCanBus};
 pub use driver::Motor;
 pub use error::{Error, Result};
+pub use param_table::{ParamTableEntry, TypedValue};
 pub use scan::{ScanProgress, ScanResult, dump_bus, scan_bus, scan_bus_on};
 
 /// Re-export of the protocol crate so consumers can drop down to raw frames.
 pub use robstride_protocol as protocol;
 
 pub use robstride_protocol::{
-    DEFAULT_HOST_ID, MitScales, MotorFeedback, MotorModel, MotorStatusBits, ParamIndex, RunMode,
+    lookup_param_type, DEFAULT_HOST_ID, MitScales, MotorFeedback, MotorModel, MotorStatusBits,
+    ParamIndex, ParamType, RunMode,
 };

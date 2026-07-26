@@ -46,18 +46,27 @@ pub mod frame;
 pub mod mit;
 pub mod model;
 pub mod param;
+pub mod param_table;
+pub mod param_type_table;
 
 pub use can_id::{build_can_id, build_can_id_raw, parse_can_id};
 pub use comm_type::{CommType, RunMode};
 pub use feedback::{MotorFeedback, MotorStatusBits, parse_param_response, parse_status_frame};
 pub use frame::{
     DATA_LEN, build_disable_frame, build_enable_frame, build_mit_frame, build_ping_frame,
-    build_read_param_frame, build_run_mode_frame, build_set_zero_frame, build_write_param_f32_frame,
-    build_write_param_i8_frame,
+    build_read_param_frame, build_run_mode_frame, build_set_device_id_frame, build_set_zero_frame,
+    build_write_param_f32_frame, build_write_param_i8_frame,
 };
 pub use mit::{decode_mit_signed, decode_mit_unsigned, encode_mit_signed, encode_mit_unsigned};
 pub use model::{MitScales, MotorModel};
 pub use param::ParamIndex;
+pub use param_table::{
+    build_read_param_frame_ext, build_read_param_table_frame, parse_param_table_frame,
+    parse_read_param_reply, ParamTableFrame, ReadParamReply, READ_PARAM, READ_PARAM_TABLE,
+};
+pub use param_type_table::{
+    lookup_param_type, lookup_param_type_by_name, ParamType, ParamTypeInfo, PARAM_TYPE_TABLE,
+};
 
 /// Default host CAN ID. Robstride recommends this be greater than every
 /// motor id on the bus for optimal scheduling on the controller side.

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use robstride_protocol::{
     CommType, MitScales, MotorFeedback, MotorModel, ParamIndex, RunMode, build_can_id_raw,
     build_disable_frame, build_enable_frame, build_mit_frame, build_ping_frame,
-    build_read_param_frame, build_run_mode_frame, build_set_zero_frame,
+    build_read_param_frame, build_run_mode_frame, build_set_device_id_frame, build_set_zero_frame,
     build_write_param_f32_frame, parse_can_id, parse_param_response, parse_status_frame,
     DEFAULT_HOST_ID,
 };
@@ -118,9 +118,14 @@ impl<B: RobstrideBus> Motor<B> {
     // Low-level I/O
     // ---------------------------------------------------------------------
 
-    fn send(&mut self, can_id: u32, data: &[u8]) -> Result<()> {
+    pub(crate) fn send(&mut self, can_id: u32, data: &[u8]) -> Result<()> {
         log::debug!("TX id=0x{:08X} data={:02X?}", can_id, data);
         self.bus.send(can_id, data)
+    }
+
+    /// The configured per-request timeout (see [`Self::set_timeout`]).
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// Receive frames until one matches `accept`, dropping unmatched frames.
@@ -219,6 +224,39 @@ impl<B: RobstrideBus> Motor<B> {
         self.send(id, &data)?;
         self.run_mode = mode;
         std::thread::sleep(Duration::from_millis(10));
+        Ok(())
+    }
+
+    /// Reassign this motor's CAN bus address (`SET_CAN_ID`, type 7).
+    ///
+    /// Takes effect immediately and persists across power cycles — no
+    /// restart or separate flash-save step is needed. On success, `self` is
+    /// updated to address the motor at `new_id` for all subsequent calls.
+    ///
+    /// A reply is not guaranteed on every firmware revision, so this waits
+    /// best-effort for one and does not fail the call if none arrives —
+    /// verify with a bus scan at `new_id` afterward if you need certainty.
+    pub fn set_device_id(&mut self, new_id: u8) -> Result<()> {
+        let old_id = self.motor_id;
+        let (id, data) = build_set_device_id_frame(old_id, new_id);
+        self.send(id, &data)?;
+        // Skip our own TX echo (gs_usb/PCAN-style adapters re-emit the sent
+        // frame to the local socket) so it isn't mistaken for the motor's
+        // reply — same pattern as scan_bus_on's ping-echo filter.
+        let echo_comm = CommType::SetDeviceId as u8;
+        match self.recv_filtered(|ct, extra, dev| {
+            !(ct == echo_comm && extra == new_id as u16 && dev == old_id)
+        }) {
+            Ok((comm_type, extra_data, device_id, _)) => log::debug!(
+                "set_device_id: reply comm={comm_type} extra=0x{extra_data:04X} dev={device_id}"
+            ),
+            Err(Error::Timeout { .. }) => {
+                log::debug!("set_device_id: no reply within timeout (some firmware doesn't ack)")
+            }
+            Err(e) => return Err(e),
+        }
+        self.motor_id = new_id;
+        std::thread::sleep(Duration::from_millis(50));
         Ok(())
     }
 
@@ -404,13 +442,5 @@ impl<B: RobstrideBus> Motor<B> {
             temperature: f32::NAN,
             status: robstride_protocol::MotorStatusBits::default(),
         })
-    }
-}
-
-impl<B: RobstrideBus> Drop for Motor<B> {
-    fn drop(&mut self) {
-        if self.enabled {
-            let _ = self.disable();
-        }
     }
 }

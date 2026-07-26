@@ -3,3 +3,5 @@
 *.bak
 # chirp / sysid run outputs
 *.csv
+# scripts/hw_check.sh run logs
+/hw_check_logs/

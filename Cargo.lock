@@ -700,6 +700,7 @@ dependencies = [
  "lkmotor-driver",
  "log",
  "misa-actuator",
+ "myactuator-driver",
  "ratatui",
  "robstride-driver",
  "serde",
@@ -712,6 +713,36 @@ dependencies = [
  "misa-actuator",
  "rustfft",
 ]
+
+[[package]]
+name = "myactuator-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "env_logger",
+ "log",
+ "misa-actuator",
+ "myactuator-driver",
+ "myactuator-protocol",
+]
+
+[[package]]
+name = "myactuator-driver"
+version = "0.1.0"
+dependencies = [
+ "embedded-can",
+ "log",
+ "misa-actuator",
+ "myactuator-protocol",
+ "socketcan",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "myactuator-protocol"
+version = "0.1.0"
 
 [[package]]
 name = "nb"

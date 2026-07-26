@@ -16,6 +16,8 @@ env_logger = "0.11"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
+serde = { workspace = true }
+toml = { workspace = true }
 
 [[bin]]
 name = "myactuator-cli"

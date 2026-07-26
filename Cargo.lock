@@ -726,6 +726,8 @@ dependencies = [
  "misa-actuator",
  "myactuator-driver",
  "myactuator-protocol",
+ "serde",
+ "toml",
 ]
 
 [[package]]

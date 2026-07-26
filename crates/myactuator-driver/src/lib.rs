@@ -232,4 +232,21 @@ mod tests {
         assert_eq!(st.voltage_v, 0.0);
         assert!(!st.error.any());
     }
+
+    #[test]
+    fn read_pid_sends_0x30() {
+        let mut m = motor();
+        m.read_pid().unwrap();
+        assert!(sent_cmds(&mut m).contains(&0x30));
+    }
+
+    #[test]
+    fn read_acceleration_carries_index() {
+        use myactuator_protocol::AccelIndex;
+        let mut m = motor();
+        m.read_acceleration(AccelIndex::SpeedDecel).unwrap();
+        let (_, frame) = m.bus().sent[0];
+        assert_eq!(frame[0], 0x42);
+        assert_eq!(frame[1], AccelIndex::SpeedDecel as u8);
+    }
 }

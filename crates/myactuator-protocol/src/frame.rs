@@ -3,15 +3,33 @@
 //! Every builder returns the 8-byte payload; the caller pairs it with
 //! [`crate::can_id::command_id`]. Replies echo the command byte in `data[0]`.
 
-use crate::feedback::{ErrorState, Status1, Status2};
+use crate::feedback::{ErrorState, PidGains, Status1, Status2};
 
 /// All V3 frames carry exactly 8 data bytes.
 pub const DATA_LEN: usize = 8;
+
+/// Which acceleration/deceleration value `0x42`/`0x43` reads/writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AccelIndex {
+    /// Position planning: acceleration from initial to max velocity.
+    PositionAccel = 0x00,
+    /// Position planning: deceleration from max velocity to standstill.
+    PositionDecel = 0x01,
+    /// Speed planning: acceleration to the target speed.
+    SpeedAccel = 0x02,
+    /// Speed planning: deceleration to the target speed.
+    SpeedDecel = 0x03,
+}
 
 /// Command bytes used by this crate (subset of the V3.9 manual).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Cmd {
+    /// Read current/speed/position-loop PID gains (0-255 normalized units).
+    ReadPid = 0x30,
+    /// Read a position/speed-planning acceleration or deceleration value.
+    ReadAcceleration = 0x42,
     /// Function control (compound; e.g. clear multi-turn value).
     FunctionControl = 0x20,
     /// Write current multi-turn position to ROM as zero (effective after reset).
@@ -62,6 +80,17 @@ pub const fn build_read_status2() -> [u8; DATA_LEN] {
 /// `0x92` — read the multi-turn absolute angle (0.01 °/LSB).
 pub const fn build_read_multi_turn_angle() -> [u8; DATA_LEN] {
     plain(Cmd::ReadMultiTurnAngle)
+}
+
+/// `0x30` — read current/speed/position-loop PID gains (all six at once).
+pub const fn build_read_pid() -> [u8; DATA_LEN] {
+    plain(Cmd::ReadPid)
+}
+
+/// `0x42` — read one acceleration/deceleration value (1 dps/s, range
+/// 50-60000 per the manual).
+pub const fn build_read_acceleration(index: AccelIndex) -> [u8; DATA_LEN] {
+    [Cmd::ReadAcceleration as u8, index as u8, 0, 0, 0, 0, 0, 0]
 }
 
 /// `0xB2` — read the system software version date (YYYYMMDD, e.g. `20211126`).
@@ -190,6 +219,34 @@ pub fn parse_multi_turn_angle(data: &[u8]) -> Option<i32> {
     Some(i32::from_le_bytes([data[4], data[5], data[6], data[7]]))
 }
 
+/// Parse a PID-gains reply (`0x30`).
+pub fn parse_pid_gains(data: &[u8]) -> Option<PidGains> {
+    if data.len() < DATA_LEN || data[0] != Cmd::ReadPid as u8 {
+        return None;
+    }
+    Some(PidGains {
+        current_kp: data[2],
+        current_ki: data[3],
+        speed_kp: data[4],
+        speed_ki: data[5],
+        position_kp: data[6],
+        position_ki: data[7],
+    })
+}
+
+/// Parse an acceleration reply (`0x42`) into 1 dps/s units. `data[1]` echoes
+/// the requested [`AccelIndex`] on real X4-36 firmware (confirmed on
+/// hardware), though the manual's own worked example shows it as always
+/// `0x00` — not checked here either way, so callers issuing concurrent
+/// requests for different indices should verify it matches if they rely on
+/// manual-only firmware.
+pub fn parse_acceleration(data: &[u8]) -> Option<i32> {
+    if data.len() < DATA_LEN || data[0] != Cmd::ReadAcceleration as u8 {
+        return None;
+    }
+    Some(i32::from_le_bytes([data[4], data[5], data[6], data[7]]))
+}
+
 /// Parse a version-date reply (`0xB2`) into a `YYYYMMDD` integer (e.g.
 /// `20211126`).
 pub fn parse_version_date(data: &[u8]) -> Option<u32> {
@@ -230,6 +287,56 @@ mod tests {
             build_speed_control(10_000),
             [0xA2, 0, 0, 0, 0x10, 0x27, 0x00, 0x00]
         );
+    }
+
+    #[test]
+    fn read_pid_frame_is_plain() {
+        assert_eq!(build_read_pid(), [0x30, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn pid_gains_reply_matches_manual_example() {
+        // Manual 2.1.4 Example 1: reply 30 00 55 19 55 19 55 19.
+        let gains = parse_pid_gains(&[0x30, 0x00, 0x55, 0x19, 0x55, 0x19, 0x55, 0x19]).unwrap();
+        assert_eq!(
+            gains,
+            PidGains {
+                current_kp: 0x55,
+                current_ki: 0x19,
+                speed_kp: 0x55,
+                speed_ki: 0x19,
+                position_kp: 0x55,
+                position_ki: 0x19,
+            }
+        );
+    }
+
+    #[test]
+    fn read_acceleration_frame_carries_index() {
+        assert_eq!(
+            build_read_acceleration(AccelIndex::PositionAccel),
+            [0x42, 0x00, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            build_read_acceleration(AccelIndex::PositionDecel),
+            [0x42, 0x01, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            build_read_acceleration(AccelIndex::SpeedAccel),
+            [0x42, 0x02, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            build_read_acceleration(AccelIndex::SpeedDecel),
+            [0x42, 0x03, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn acceleration_reply_matches_manual_example() {
+        // Manual 2.4.5 Example 1: position-accel reply 42 00 00 00 10 27 00 00
+        // → 0x00002710 = 10000 dps/s.
+        let accel = parse_acceleration(&[0x42, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00]).unwrap();
+        assert_eq!(accel, 10_000);
     }
 
     #[test]

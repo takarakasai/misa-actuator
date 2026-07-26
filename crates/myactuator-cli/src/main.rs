@@ -21,6 +21,28 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use myactuator_driver::{scan_bus_on, MotorConfig, MotorFeedback, MyActuatorMotor};
+use myactuator_protocol::AccelIndex;
+
+/// clap-friendly mirror of [`AccelIndex`] (kept in `myactuator-protocol`,
+/// which is `no_std` and doesn't depend on `clap`).
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum AccelArg {
+    PositionAccel,
+    PositionDecel,
+    SpeedAccel,
+    SpeedDecel,
+}
+
+impl From<AccelArg> for AccelIndex {
+    fn from(a: AccelArg) -> Self {
+        match a {
+            AccelArg::PositionAccel => AccelIndex::PositionAccel,
+            AccelArg::PositionDecel => AccelIndex::PositionDecel,
+            AccelArg::SpeedAccel => AccelIndex::SpeedAccel,
+            AccelArg::SpeedDecel => AccelIndex::SpeedDecel,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Test CLI for MyActuator RMD servo motors (CAN V3)")]
@@ -63,6 +85,14 @@ enum Command {
     Angle,
     /// Read firmware version date (0xB2) and motor model name (0xB5).
     Version,
+    /// Read current/speed/position-loop PID gains (0x30), 0-255 normalized units.
+    Pid,
+    /// Read one acceleration/deceleration value (0x42), 1 dps/s.
+    Accel {
+        /// Which value to read.
+        #[arg(value_enum)]
+        index: AccelArg,
+    },
     /// Anchor the soft zero at the current position. --rom persists to
     /// encoder ROM instead (wears flash; needs a reset to take effect).
     Zero {
@@ -211,6 +241,17 @@ fn main() -> Result<()> {
                     date / 10_000, (date / 100) % 100, date % 100
                 ),
             }
+        }
+        Command::Pid => {
+            let g = motor.read_pid()?;
+            println!(
+                "current: kp={} ki={}  speed: kp={} ki={}  position: kp={} ki={}  (0-255 normalized, see manual for the per-model scale)",
+                g.current_kp, g.current_ki, g.speed_kp, g.speed_ki, g.position_kp, g.position_ki
+            );
+        }
+        Command::Accel { index } => {
+            let dps_s = motor.read_acceleration((*index).into())?;
+            println!("{index:?} = {dps_s} dps/s");
         }
         Command::Zero { rom, reset } => {
             if *rom {

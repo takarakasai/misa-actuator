@@ -35,13 +35,14 @@ pub use can_id::{
     command_id, is_valid_motor_id, motion_id, motion_reply_id, reply_id, MAX_MOTOR_ID,
     MULTI_MOTOR_ID,
 };
-pub use feedback::{ErrorState, Status1, Status2};
+pub use feedback::{ErrorState, PidGains, Status1, Status2};
 pub use frame::{
     build_brake_lock, build_brake_release, build_function_control, build_position_control,
-    build_read_motor_model, build_read_multi_turn_angle, build_read_status1, build_read_status2,
-    build_read_version_date, build_set_zero_rom, build_shutdown, build_speed_control, build_stop,
-    build_system_reset, build_torque_control, parse_motor_model, parse_multi_turn_angle,
-    parse_status1, parse_status2, parse_version_date, Cmd, DATA_LEN,
+    build_read_acceleration, build_read_motor_model, build_read_multi_turn_angle, build_read_pid,
+    build_read_status1, build_read_status2, build_read_version_date, build_set_zero_rom,
+    build_shutdown, build_speed_control, build_stop, build_system_reset, build_torque_control,
+    parse_acceleration, parse_motor_model, parse_multi_turn_angle, parse_pid_gains, parse_status1,
+    parse_status2, parse_version_date, AccelIndex, Cmd, DATA_LEN,
 };
 pub use motion::{
     build_motion_control, parse_motion_reply, MotionFeedback, KD_MAX, KP_MAX, P_MAX, T_MAX, V_MAX,

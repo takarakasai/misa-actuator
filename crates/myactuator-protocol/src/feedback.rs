@@ -89,3 +89,17 @@ impl Status2 {
         self.iq_centi_amps as f32 * 0.01
     }
 }
+
+/// Reply to `0x30` — current/speed/position-loop PID gains. Each value is a
+/// `uint8` (0-255) normalized unit, not a physical gain: per the manual, the
+/// firmware maps the model-specific gain range onto 256 equal steps, so the
+/// same raw byte means a different real gain on different motor models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PidGains {
+    pub current_kp: u8,
+    pub current_ki: u8,
+    pub speed_kp: u8,
+    pub speed_ki: u8,
+    pub position_kp: u8,
+    pub position_ki: u8,
+}

@@ -96,9 +96,24 @@ enum Command {
         #[arg(value_enum)]
         index: AccelArg,
     },
-    /// Read every known readable parameter in one pass (0x9A/0x9C/0x92/0x30/
-    /// 0x42×4/0xB2/0xB5) and print it. A read that times out or fails is
-    /// reported and omitted rather than aborting the whole dump.
+    /// Read the multi-turn encoder position (0x60, zero offset applied), pulses.
+    Encoder,
+    /// Read the current run mode (0x70).
+    RunMode,
+    /// Read the motor's instantaneous output power (0x71), watts.
+    Power,
+    /// Read the single-turn encoder position (0x90, direct-drive models).
+    SingleTurnEncoder,
+    /// Read the single-turn angle (0x94), 0-359.99°.
+    SingleTurnAngle,
+    /// Read Status3 (0x9D): temperature + per-phase current.
+    Status3,
+    /// Read system uptime since last reset/reboot (0xB1).
+    Uptime,
+    /// Read every known readable parameter in one pass (0x60/0x61/0x62/0x70/
+    /// 0x71/0x90/0x92/0x94/0x9A/0x9C/0x9D/0x30×7/0x42×4/0xB1/0xB2/0xB5) and
+    /// print it. A read that times out or fails is reported and omitted
+    /// rather than aborting the whole dump.
     Params {
         /// Also emit a TOML dump to stdout (or to --out if given).
         #[arg(long)]
@@ -259,13 +274,51 @@ fn main() -> Result<()> {
         Command::Pid => {
             let g = motor.read_pid()?;
             println!(
-                "current: kp={} ki={}  speed: kp={} ki={}  position: kp={} ki={}  (0-255 normalized, see manual for the per-model scale)",
-                g.current_kp, g.current_ki, g.speed_kp, g.speed_ki, g.position_kp, g.position_ki
+                "current: kp={:.4} ki={:.4}  speed: kp={:.4} ki={:.4}  position: kp={:.4} ki={:.4} kd={:.4}",
+                g.current_kp, g.current_ki, g.speed_kp, g.speed_ki, g.position_kp, g.position_ki,
+                g.position_kd
             );
         }
         Command::Accel { index } => {
             let dps_s = motor.read_acceleration((*index).into())?;
             println!("{index:?} = {dps_s} dps/s");
+        }
+        Command::Encoder => {
+            let encoder = motor.read_multi_turn_encoder()?;
+            let raw = motor.read_multi_turn_encoder_raw()?;
+            let offset = motor.read_multi_turn_zero_offset()?;
+            println!("encoder={encoder} pulses  raw={raw} pulses  zero_offset={offset} pulses");
+        }
+        Command::RunMode => {
+            println!("run mode = {:?}", motor.read_run_mode()?);
+        }
+        Command::Power => {
+            println!("motor power = {:.1} W", motor.read_motor_power()?);
+        }
+        Command::SingleTurnEncoder => {
+            let e = motor.read_single_turn_encoder()?;
+            println!(
+                "encoder={} pulses  raw={} pulses  zero_offset={} pulses",
+                e.encoder, e.encoder_raw, e.encoder_offset
+            );
+        }
+        Command::SingleTurnAngle => {
+            let centideg = motor.read_single_turn_angle()?;
+            println!("single-turn angle = {:.2}°", centideg as f32 / 100.0);
+        }
+        Command::Status3 => {
+            let s = motor.read_status3()?;
+            println!(
+                "temp={} °C  iA={:.2}A  iB={:.2}A  iC={:.2}A",
+                s.temperature_c,
+                s.phase_a_centi_amps as f32 / 100.0,
+                s.phase_b_centi_amps as f32 / 100.0,
+                s.phase_c_centi_amps as f32 / 100.0
+            );
+        }
+        Command::Uptime => {
+            let ms = motor.read_uptime_ms()?;
+            println!("uptime = {ms} ms ({:.2} h)", ms as f64 / 3_600_000.0);
         }
         Command::Params { toml, out } => {
             let params = AllParams::read_all(&mut motor);
@@ -375,14 +428,16 @@ fn main() -> Result<()> {
 
 /// Every readable parameter this crate knows about, gathered in one pass.
 /// Fields are `Option` because a motor model/firmware may lack a command
-/// (e.g. `0x30`/`0x42` on non-motion-mode firmware); a failed read is
-/// reported to stderr and just omitted rather than aborting the whole dump.
+/// (e.g. `0x90` on non-direct-drive models); a failed read is reported to
+/// stderr and just omitted rather than aborting the whole dump.
 #[derive(Serialize)]
 struct AllParams {
     motor_id: u8,
     // Status1 (0x9A)
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature_c: Option<i8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mos_temperature_c: Option<i8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     voltage_v: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -396,22 +451,52 @@ struct AllParams {
     speed_dps: Option<i16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     angle_deg: Option<i16>,
+    // Status3 (0x9D)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase_a_amps: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase_b_amps: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase_c_amps: Option<f32>,
     // Multi-turn absolute angle (0x92)
     #[serde(skip_serializing_if = "Option::is_none")]
     multi_turn_centideg: Option<i32>,
-    // PID gains (0x30)
+    // Multi-turn encoder (0x60/0x61/0x62)
     #[serde(skip_serializing_if = "Option::is_none")]
-    current_kp: Option<u8>,
+    multi_turn_encoder_pulses: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    current_ki: Option<u8>,
+    multi_turn_encoder_raw_pulses: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    speed_kp: Option<u8>,
+    multi_turn_zero_offset_pulses: Option<i32>,
+    // Single-turn encoder/angle (0x90/0x94) — direct-drive models only
     #[serde(skip_serializing_if = "Option::is_none")]
-    speed_ki: Option<u8>,
+    single_turn_encoder_pulses: Option<i16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    position_kp: Option<u8>,
+    single_turn_encoder_raw_pulses: Option<i16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    position_ki: Option<u8>,
+    single_turn_zero_offset_pulses: Option<i16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    single_turn_angle_centideg: Option<u16>,
+    // Run mode / power (0x70/0x71)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    motor_power_w: Option<f32>,
+    // PID gains (0x30 × 7)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_kp: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_ki: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed_kp: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed_ki: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_kp: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_ki: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_kd: Option<f32>,
     // Acceleration/deceleration limits (0x42)
     #[serde(skip_serializing_if = "Option::is_none")]
     position_accel_dps_s: Option<i32>,
@@ -421,7 +506,9 @@ struct AllParams {
     speed_accel_dps_s: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     speed_decel_dps_s: Option<i32>,
-    // Version / model (0xB2 / 0xB5)
+    // Uptime / version / model (0xB1 / 0xB2 / 0xB5)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uptime_ms: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     version_date_raw: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -432,26 +519,53 @@ impl AllParams {
     fn read_all<B: myactuator_driver::MyActuatorBus>(motor: &mut MyActuatorMotor<B>) -> Self {
         let status1 = try_read("Status1 (0x9A)", || motor.read_status1());
         let status2 = try_read("Status2 (0x9C)", || motor.read_status2());
+        let status3 = try_read("Status3 (0x9D)", || motor.read_status3());
         let pid = try_read("PID gains (0x30)", || motor.read_pid());
+        let single_turn = try_read("single-turn encoder (0x90)", || {
+            motor.read_single_turn_encoder()
+        });
+        let run_mode = try_read("run mode (0x70)", || motor.read_run_mode());
 
         Self {
             motor_id: motor.motor_id(),
             temperature_c: status1.map(|s| s.temperature_c),
+            mos_temperature_c: status1.map(|s| s.mos_temperature_c),
             voltage_v: status1.map(|s| s.voltage_v()),
             brake_released: status1.map(|s| s.brake_released),
             error_flags: status1.map(|s| s.error.raw()),
             current_a: status2.map(|s| s.current_a()),
             speed_dps: status2.map(|s| s.speed_dps),
             angle_deg: status2.map(|s| s.angle_deg),
+            phase_a_amps: status3.map(|s| s.phase_a_centi_amps as f32 * 0.01),
+            phase_b_amps: status3.map(|s| s.phase_b_centi_amps as f32 * 0.01),
+            phase_c_amps: status3.map(|s| s.phase_c_centi_amps as f32 * 0.01),
             multi_turn_centideg: try_read("multi-turn angle (0x92)", || {
                 motor.read_multi_turn_centideg()
             }),
+            multi_turn_encoder_pulses: try_read("multi-turn encoder (0x60)", || {
+                motor.read_multi_turn_encoder()
+            }),
+            multi_turn_encoder_raw_pulses: try_read("multi-turn encoder raw (0x61)", || {
+                motor.read_multi_turn_encoder_raw()
+            }),
+            multi_turn_zero_offset_pulses: try_read("multi-turn zero offset (0x62)", || {
+                motor.read_multi_turn_zero_offset()
+            }),
+            single_turn_encoder_pulses: single_turn.map(|e| e.encoder),
+            single_turn_encoder_raw_pulses: single_turn.map(|e| e.encoder_raw),
+            single_turn_zero_offset_pulses: single_turn.map(|e| e.encoder_offset),
+            single_turn_angle_centideg: try_read("single-turn angle (0x94)", || {
+                motor.read_single_turn_angle()
+            }),
+            run_mode: run_mode.map(|m| format!("{m:?}")),
+            motor_power_w: try_read("motor power (0x71)", || motor.read_motor_power()),
             current_kp: pid.map(|g| g.current_kp),
             current_ki: pid.map(|g| g.current_ki),
             speed_kp: pid.map(|g| g.speed_kp),
             speed_ki: pid.map(|g| g.speed_ki),
             position_kp: pid.map(|g| g.position_kp),
             position_ki: pid.map(|g| g.position_ki),
+            position_kd: pid.map(|g| g.position_kd),
             position_accel_dps_s: try_read("position accel (0x42/0x00)", || {
                 motor.read_acceleration(AccelIndex::PositionAccel)
             }),
@@ -464,6 +578,7 @@ impl AllParams {
             speed_decel_dps_s: try_read("speed decel (0x42/0x03)", || {
                 motor.read_acceleration(AccelIndex::SpeedDecel)
             }),
+            uptime_ms: try_read("uptime (0xB1)", || motor.read_uptime_ms()),
             version_date_raw: try_read("version date (0xB2)", || motor.read_version_date()),
             motor_model: try_read("motor model (0xB5)", || motor.read_motor_model()),
         }
@@ -476,11 +591,15 @@ impl AllParams {
         fn fmt_f32(v: Option<f32>) -> String {
             v.map(|v| format!("{v:.2}")).unwrap_or_else(|| "—".to_string())
         }
+        fn fmt_gain(v: Option<f32>) -> String {
+            v.map(|v| format!("{v:.4}")).unwrap_or_else(|| "—".to_string())
+        }
 
         println!("== MyActuator params (motor_id={}) ==", self.motor_id);
         println!(
-            "[Status1]  temp={}°C  voltage={}V  brake_released={}  error=0x{}",
+            "[Status1]  temp={}°C  mos_temp={}°C  voltage={}V  brake_released={}  error=0x{}",
             fmt(self.temperature_c),
+            fmt(self.mos_temperature_c),
             fmt_f32(self.voltage_v),
             fmt(self.brake_released),
             self.error_flags
@@ -494,17 +613,41 @@ impl AllParams {
             fmt(self.angle_deg)
         );
         println!(
-            "[MultiTurn] 0x92 = {} centideg",
-            fmt(self.multi_turn_centideg)
+            "[Status3]  iA={}A  iB={}A  iC={}A",
+            fmt_f32(self.phase_a_amps),
+            fmt_f32(self.phase_b_amps),
+            fmt_f32(self.phase_c_amps)
         );
         println!(
-            "[PID]      current kp={} ki={}  speed kp={} ki={}  position kp={} ki={}",
-            fmt(self.current_kp),
-            fmt(self.current_ki),
-            fmt(self.speed_kp),
-            fmt(self.speed_ki),
-            fmt(self.position_kp),
-            fmt(self.position_ki)
+            "[MultiTurn] angle(0x92)={} centideg  encoder(0x60)={}  raw(0x61)={}  zero_offset(0x62)={} pulses",
+            fmt(self.multi_turn_centideg),
+            fmt(self.multi_turn_encoder_pulses),
+            fmt(self.multi_turn_encoder_raw_pulses),
+            fmt(self.multi_turn_zero_offset_pulses)
+        );
+        println!(
+            "[SingleTurn] encoder(0x90)={}  raw={}  zero_offset={} pulses  angle(0x94)={}°",
+            fmt(self.single_turn_encoder_pulses),
+            fmt(self.single_turn_encoder_raw_pulses),
+            fmt(self.single_turn_zero_offset_pulses),
+            self.single_turn_angle_centideg
+                .map(|v| format!("{:.2}", v as f32 / 100.0))
+                .unwrap_or_else(|| "—".to_string())
+        );
+        println!(
+            "[Mode/Power] run_mode(0x70)={}  power(0x71)={}W",
+            self.run_mode.as_deref().unwrap_or("—"),
+            fmt_f32(self.motor_power_w)
+        );
+        println!(
+            "[PID]      current kp={} ki={}  speed kp={} ki={}  position kp={} ki={} kd={}",
+            fmt_gain(self.current_kp),
+            fmt_gain(self.current_ki),
+            fmt_gain(self.speed_kp),
+            fmt_gain(self.speed_ki),
+            fmt_gain(self.position_kp),
+            fmt_gain(self.position_ki),
+            fmt_gain(self.position_kd)
         );
         println!(
             "[Accel]    pos_accel={}  pos_decel={}  speed_accel={}  speed_decel={}  (dps/s)",
@@ -514,7 +657,8 @@ impl AllParams {
             fmt(self.speed_decel_dps_s)
         );
         println!(
-            "[Version]  raw={}  model={}",
+            "[Version]  uptime={}ms  raw={}  model={}",
+            fmt(self.uptime_ms),
             fmt(self.version_date_raw),
             match self.motor_model.as_deref() {
                 None => "—",

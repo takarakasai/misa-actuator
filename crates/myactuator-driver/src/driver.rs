@@ -23,12 +23,17 @@ use std::time::{Duration, Instant};
 use myactuator_protocol::{
     build_brake_lock, build_brake_release, build_function_control, build_motion_control,
     build_position_control, build_read_acceleration, build_read_motor_model,
-    build_read_multi_turn_angle, build_read_pid, build_read_status1, build_read_status2,
+    build_read_motor_power, build_read_multi_turn_angle, build_read_multi_turn_encoder,
+    build_read_multi_turn_encoder_raw, build_read_multi_turn_zero_offset, build_read_pid,
+    build_read_run_mode, build_read_single_turn_angle, build_read_single_turn_encoder,
+    build_read_status1, build_read_status2, build_read_status3, build_read_uptime,
     build_read_version_date, build_set_zero_rom, build_shutdown, build_speed_control, build_stop,
     build_system_reset, build_torque_control, can_id, parse_acceleration, parse_motion_reply,
-    parse_motor_model, parse_multi_turn_angle, parse_pid_gains, parse_status1, parse_status2,
-    parse_version_date, AccelIndex, ErrorState, MotionFeedback, PidGains, Status1, Status2,
-    DATA_LEN,
+    parse_motor_model, parse_motor_power, parse_multi_turn_angle, parse_multi_turn_encoder,
+    parse_multi_turn_encoder_raw, parse_multi_turn_zero_offset, parse_pid_value, parse_run_mode,
+    parse_single_turn_angle, parse_single_turn_encoder, parse_status1, parse_status2,
+    parse_status3, parse_uptime, parse_version_date, AccelIndex, ErrorState, MotionFeedback,
+    PidGains, PidIndex, RunMode, SingleTurnEncoder, Status1, Status2, Status3, DATA_LEN,
 };
 
 use crate::bus::{MyActuatorBus, SocketCanBus};
@@ -254,19 +259,102 @@ impl<B: MyActuatorBus> MyActuatorMotor<B> {
         Ok(String::from_utf8_lossy(&raw[..end]).trim().to_string())
     }
 
-    /// Read current/speed/position-loop PID gains (`0x30`), all six at once.
-    /// Each value is a 0-255 normalized unit — see [`PidGains`] for how to
-    /// turn it into a physical gain.
-    pub fn read_pid(&mut self) -> Result<PidGains> {
-        let reply = self.transact(build_read_pid())?;
-        parse_pid_gains(&reply).ok_or_else(|| Error::InvalidResponse("bad 0x30 reply".into()))
+    /// Read one PID gain (`0x30`), selected by [`PidIndex`] (V4.2+ indexed
+    /// `Float` protocol — see [`PidGains`]'s doc comment for why this
+    /// supersedes the older six-at-once `uint8` layout).
+    pub fn read_pid_gain(&mut self, index: PidIndex) -> Result<f32> {
+        let reply = self.transact(build_read_pid(index))?;
+        parse_pid_value(&reply).ok_or_else(|| Error::InvalidResponse("bad 0x30 reply".into()))
     }
 
-    /// Read one acceleration/deceleration value (`0x42`) in 1 dps/s
-    /// (manual range 50-60000).
+    /// Read all seven PID gains (`0x30`, one transaction per [`PidIndex`]).
+    pub fn read_pid(&mut self) -> Result<PidGains> {
+        Ok(PidGains {
+            current_kp: self.read_pid_gain(PidIndex::CurrentKp)?,
+            current_ki: self.read_pid_gain(PidIndex::CurrentKi)?,
+            speed_kp: self.read_pid_gain(PidIndex::SpeedKp)?,
+            speed_ki: self.read_pid_gain(PidIndex::SpeedKi)?,
+            position_kp: self.read_pid_gain(PidIndex::PositionKp)?,
+            position_ki: self.read_pid_gain(PidIndex::PositionKi)?,
+            position_kd: self.read_pid_gain(PidIndex::PositionKd)?,
+        })
+    }
+
+    /// Read one acceleration/deceleration value (`0x42`) in 1 dps/s (manual
+    /// range 100-60000 per the X4-36 V4.3 manual; the plain V3.9 manual's own
+    /// text is internally inconsistent, citing 50 in one section and 100 in
+    /// another for the same field).
     pub fn read_acceleration(&mut self, index: AccelIndex) -> Result<i32> {
         let reply = self.transact(build_read_acceleration(index))?;
         parse_acceleration(&reply).ok_or_else(|| Error::InvalidResponse("bad 0x42 reply".into()))
+    }
+
+    /// Read the multi-turn encoder position (`0x60`), pulses, zero offset applied.
+    pub fn read_multi_turn_encoder(&mut self) -> Result<i32> {
+        let reply = self.transact(build_read_multi_turn_encoder())?;
+        parse_multi_turn_encoder(&reply)
+            .ok_or_else(|| Error::InvalidResponse("bad 0x60 reply".into()))
+    }
+
+    /// Read the raw multi-turn encoder position (`0x61`), pulses, no zero offset.
+    pub fn read_multi_turn_encoder_raw(&mut self) -> Result<i32> {
+        let reply = self.transact(build_read_multi_turn_encoder_raw())?;
+        parse_multi_turn_encoder_raw(&reply)
+            .ok_or_else(|| Error::InvalidResponse("bad 0x61 reply".into()))
+    }
+
+    /// Read the multi-turn encoder's zero-offset value (`0x62`), pulses.
+    pub fn read_multi_turn_zero_offset(&mut self) -> Result<i32> {
+        let reply = self.transact(build_read_multi_turn_zero_offset())?;
+        parse_multi_turn_zero_offset(&reply)
+            .ok_or_else(|| Error::InvalidResponse("bad 0x62 reply".into()))
+    }
+
+    /// Read the current run mode (`0x70`).
+    pub fn read_run_mode(&mut self) -> Result<RunMode> {
+        let reply = self.transact(build_read_run_mode())?;
+        parse_run_mode(&reply).ok_or_else(|| Error::InvalidResponse("bad 0x70 reply".into()))
+    }
+
+    /// Read the motor's instantaneous output power (`0x71`) in watts. Documented
+    /// in the plain V3.9 manual but absent from the X4-36 V4.3 manual;
+    /// confirmed on real X4-36 hardware to simply time out (not implemented
+    /// by that firmware).
+    pub fn read_motor_power(&mut self) -> Result<f32> {
+        let reply = self.transact(build_read_motor_power())?;
+        parse_motor_power(&reply).ok_or_else(|| Error::InvalidResponse("bad 0x71 reply".into()))
+    }
+
+    /// Read the single-turn encoder position (`0x90`, direct-drive models).
+    /// Confirmed on real X4-36 (a geared model) hardware to simply time out —
+    /// this command appears to only be meaningful on direct-drive variants.
+    pub fn read_single_turn_encoder(&mut self) -> Result<SingleTurnEncoder> {
+        let reply = self.transact(build_read_single_turn_encoder())?;
+        parse_single_turn_encoder(&reply)
+            .ok_or_else(|| Error::InvalidResponse("bad 0x90 reply".into()))
+    }
+
+    /// Read the single-turn angle (`0x94`) in 0.01°/LSB (0-359.99°). Unlike
+    /// `0x90`, real X4-36 (geared) hardware *does* reply to this one, but
+    /// with an out-of-range `0xFFFF` (655.35°) sentinel rather than a real
+    /// angle — treat any value ≥ 36000 as "not meaningful on this model"
+    /// rather than a real single-turn position.
+    pub fn read_single_turn_angle(&mut self) -> Result<u16> {
+        let reply = self.transact(build_read_single_turn_angle())?;
+        parse_single_turn_angle(&reply)
+            .ok_or_else(|| Error::InvalidResponse("bad 0x94 reply".into()))
+    }
+
+    /// Read Status3 (`0x9D`): temperature + per-phase current.
+    pub fn read_status3(&mut self) -> Result<Status3> {
+        let reply = self.transact(build_read_status3())?;
+        parse_status3(&reply).ok_or_else(|| Error::InvalidResponse("bad 0x9D reply".into()))
+    }
+
+    /// Read system uptime since last reset/reboot (`0xB1`), in ms.
+    pub fn read_uptime_ms(&mut self) -> Result<u32> {
+        let reply = self.transact(build_read_uptime())?;
+        parse_uptime(&reply).ok_or_else(|| Error::InvalidResponse("bad 0xB1 reply".into()))
     }
 
     /// Slow status read for monitoring (voltage / error flags / brake).

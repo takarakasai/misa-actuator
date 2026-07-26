@@ -584,88 +584,92 @@ impl AllParams {
         }
     }
 
-    fn print(&self) {
-        fn fmt<T: std::fmt::Display>(v: Option<T>) -> String {
-            v.map(|v| v.to_string()).unwrap_or_else(|| "—".to_string())
+    /// One table row: the source command byte, field name, formatted value,
+    /// and unit — kept as plain strings so the column widths can be measured
+    /// and the whole thing aligned regardless of terminal width.
+    fn rows(&self) -> Vec<[String; 4]> {
+        fn fmt<T: std::fmt::Display>(v: &Option<T>) -> String {
+            v.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "—".to_string())
         }
-        fn fmt_f32(v: Option<f32>) -> String {
-            v.map(|v| format!("{v:.2}")).unwrap_or_else(|| "—".to_string())
+        fn fmt_f32(v: Option<f32>, prec: usize) -> String {
+            v.map(|v| format!("{v:.prec$}")).unwrap_or_else(|| "—".to_string())
         }
-        fn fmt_gain(v: Option<f32>) -> String {
-            v.map(|v| format!("{v:.4}")).unwrap_or_else(|| "—".to_string())
+        fn row(cmd: &str, field: &str, value: impl Into<String>, unit: &str) -> [String; 4] {
+            [cmd.to_string(), field.to_string(), value.into(), unit.to_string()]
         }
 
+        let model = match self.motor_model.as_deref() {
+            None => "—".to_string(),
+            Some("") => "<none> (empty on this FW)".to_string(),
+            Some(m) => m.to_string(),
+        };
+        let error_hex = self
+            .error_flags
+            .map(|e| format!("0x{e:04X}"))
+            .unwrap_or_else(|| "—".to_string());
+        let single_turn_deg = self
+            .single_turn_angle_centideg
+            .map(|v| format!("{:.2}", v as f32 / 100.0))
+            .unwrap_or_else(|| "—".to_string());
+
+        vec![
+            row("0x9A", "temperature_c", fmt(&self.temperature_c), "°C"),
+            row("0x9A", "mos_temperature_c", fmt(&self.mos_temperature_c), "°C"),
+            row("0x9A", "voltage_v", fmt_f32(self.voltage_v, 2), "V"),
+            row("0x9A", "brake_released", fmt(&self.brake_released), ""),
+            row("0x9A", "error_flags", error_hex, ""),
+            row("0x9C", "current_a", fmt_f32(self.current_a, 2), "A"),
+            row("0x9C", "speed_dps", fmt(&self.speed_dps), "dps"),
+            row("0x9C", "angle_deg", fmt(&self.angle_deg), "°"),
+            row("0x9D", "phase_a_amps", fmt_f32(self.phase_a_amps, 2), "A"),
+            row("0x9D", "phase_b_amps", fmt_f32(self.phase_b_amps, 2), "A"),
+            row("0x9D", "phase_c_amps", fmt_f32(self.phase_c_amps, 2), "A"),
+            row("0x92", "multi_turn_centideg", fmt(&self.multi_turn_centideg), "centideg"),
+            row("0x60", "multi_turn_encoder_pulses", fmt(&self.multi_turn_encoder_pulses), "pulses"),
+            row("0x61", "multi_turn_encoder_raw_pulses", fmt(&self.multi_turn_encoder_raw_pulses), "pulses"),
+            row("0x62", "multi_turn_zero_offset_pulses", fmt(&self.multi_turn_zero_offset_pulses), "pulses"),
+            row("0x90", "single_turn_encoder_pulses", fmt(&self.single_turn_encoder_pulses), "pulses"),
+            row("0x90", "single_turn_encoder_raw_pulses", fmt(&self.single_turn_encoder_raw_pulses), "pulses"),
+            row("0x90", "single_turn_zero_offset_pulses", fmt(&self.single_turn_zero_offset_pulses), "pulses"),
+            row("0x94", "single_turn_angle_deg", single_turn_deg, "°"),
+            row("0x70", "run_mode", self.run_mode.clone().unwrap_or_else(|| "—".to_string()), ""),
+            row("0x71", "motor_power_w", fmt_f32(self.motor_power_w, 1), "W"),
+            row("0x30", "current_kp", fmt_f32(self.current_kp, 4), ""),
+            row("0x30", "current_ki", fmt_f32(self.current_ki, 4), ""),
+            row("0x30", "speed_kp", fmt_f32(self.speed_kp, 4), ""),
+            row("0x30", "speed_ki", fmt_f32(self.speed_ki, 4), ""),
+            row("0x30", "position_kp", fmt_f32(self.position_kp, 4), ""),
+            row("0x30", "position_ki", fmt_f32(self.position_ki, 4), ""),
+            row("0x30", "position_kd", fmt_f32(self.position_kd, 4), ""),
+            row("0x42", "position_accel_dps_s", fmt(&self.position_accel_dps_s), "dps/s"),
+            row("0x42", "position_decel_dps_s", fmt(&self.position_decel_dps_s), "dps/s"),
+            row("0x42", "speed_accel_dps_s", fmt(&self.speed_accel_dps_s), "dps/s"),
+            row("0x42", "speed_decel_dps_s", fmt(&self.speed_decel_dps_s), "dps/s"),
+            row("0xB1", "uptime_ms", fmt(&self.uptime_ms), "ms"),
+            row("0xB2", "version_date_raw", fmt(&self.version_date_raw), ""),
+            row("0xB5", "motor_model", model, ""),
+        ]
+    }
+
+    fn print(&self) {
+        let rows = self.rows();
+        let cmd_w = rows.iter().map(|r| r[0].len()).max().unwrap_or(0).max(3);
+        let field_w = rows.iter().map(|r| r[1].len()).max().unwrap_or(0).max(5);
+        let value_w = rows.iter().map(|r| r[2].len()).max().unwrap_or(0).max(5);
+
         println!("== MyActuator params (motor_id={}) ==", self.motor_id);
-        println!(
-            "[Status1]  temp={}°C  mos_temp={}°C  voltage={}V  brake_released={}  error=0x{}",
-            fmt(self.temperature_c),
-            fmt(self.mos_temperature_c),
-            fmt_f32(self.voltage_v),
-            fmt(self.brake_released),
-            self.error_flags
-                .map(|e| format!("{e:04X}"))
-                .unwrap_or_else(|| "----".to_string())
+        let header = format!(
+            "{:<cmd_w$}  {:<field_w$}  {:<value_w$}  unit",
+            "cmd", "field", "value"
         );
-        println!(
-            "[Status2]  iq={}A  speed={}dps  angle={}°",
-            fmt_f32(self.current_a),
-            fmt(self.speed_dps),
-            fmt(self.angle_deg)
-        );
-        println!(
-            "[Status3]  iA={}A  iB={}A  iC={}A",
-            fmt_f32(self.phase_a_amps),
-            fmt_f32(self.phase_b_amps),
-            fmt_f32(self.phase_c_amps)
-        );
-        println!(
-            "[MultiTurn] angle(0x92)={} centideg  encoder(0x60)={}  raw(0x61)={}  zero_offset(0x62)={} pulses",
-            fmt(self.multi_turn_centideg),
-            fmt(self.multi_turn_encoder_pulses),
-            fmt(self.multi_turn_encoder_raw_pulses),
-            fmt(self.multi_turn_zero_offset_pulses)
-        );
-        println!(
-            "[SingleTurn] encoder(0x90)={}  raw={}  zero_offset={} pulses  angle(0x94)={}°",
-            fmt(self.single_turn_encoder_pulses),
-            fmt(self.single_turn_encoder_raw_pulses),
-            fmt(self.single_turn_zero_offset_pulses),
-            self.single_turn_angle_centideg
-                .map(|v| format!("{:.2}", v as f32 / 100.0))
-                .unwrap_or_else(|| "—".to_string())
-        );
-        println!(
-            "[Mode/Power] run_mode(0x70)={}  power(0x71)={}W",
-            self.run_mode.as_deref().unwrap_or("—"),
-            fmt_f32(self.motor_power_w)
-        );
-        println!(
-            "[PID]      current kp={} ki={}  speed kp={} ki={}  position kp={} ki={} kd={}",
-            fmt_gain(self.current_kp),
-            fmt_gain(self.current_ki),
-            fmt_gain(self.speed_kp),
-            fmt_gain(self.speed_ki),
-            fmt_gain(self.position_kp),
-            fmt_gain(self.position_ki),
-            fmt_gain(self.position_kd)
-        );
-        println!(
-            "[Accel]    pos_accel={}  pos_decel={}  speed_accel={}  speed_decel={}  (dps/s)",
-            fmt(self.position_accel_dps_s),
-            fmt(self.position_decel_dps_s),
-            fmt(self.speed_accel_dps_s),
-            fmt(self.speed_decel_dps_s)
-        );
-        println!(
-            "[Version]  uptime={}ms  raw={}  model={}",
-            fmt(self.uptime_ms),
-            fmt(self.version_date_raw),
-            match self.motor_model.as_deref() {
-                None => "—",
-                Some("") => "<none> (empty on this firmware)",
-                Some(m) => m,
-            }
-        );
+        println!("{header}");
+        println!("{}", "-".repeat(header.chars().count()));
+        for r in &rows {
+            println!(
+                "{:<cmd_w$}  {:<field_w$}  {:<value_w$}  {}",
+                r[0], r[1], r[2], r[3]
+            );
+        }
     }
 }
 

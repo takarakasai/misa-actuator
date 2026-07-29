@@ -270,6 +270,8 @@ dependencies = [
  "log",
  "misa-actuator",
  "misa-sysid",
+ "serde",
+ "toml",
 ]
 
 [[package]]
@@ -601,6 +603,8 @@ dependencies = [
  "log",
  "misa-actuator",
  "misa-sysid",
+ "serde",
+ "toml",
 ]
 
 [[package]]
@@ -704,6 +708,7 @@ dependencies = [
  "ratatui",
  "robstride-driver",
  "serde",
+ "toml",
 ]
 
 [[package]]
@@ -1027,6 +1032,8 @@ dependencies = [
  "misa-sysid",
  "robstride-driver",
  "robstride-protocol",
+ "serde",
+ "toml",
 ]
 
 [[package]]

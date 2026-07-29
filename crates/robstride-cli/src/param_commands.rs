@@ -6,10 +6,13 @@
 //! type-decoding display logic (the manual-authoritative decode, with a
 //! byte-width fallback for FunctionCodes the manual doesn't list).
 
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 
-use anyhow::Result;
-use robstride_driver::{lookup_param_type, Motor, ParamType};
+use anyhow::{Context, Result};
+use robstride_driver::{lookup_param_type, Motor, ParamIndex, ParamType, TypedValue};
+use serde::Serialize;
 
 pub fn run_version(motor: &mut Motor, motor_id: u8, timeout_ms: u64) -> Result<()> {
     let version = motor.read_firmware_version(Duration::from_millis(timeout_ms))?;
@@ -98,6 +101,149 @@ pub fn run_read_param(motor: &mut Motor, function_code: u16, timeout_ms: u64) ->
             raw.get(8..12)
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
         );
+    }
+    Ok(())
+}
+
+/// Named entries from `robstride_protocol::param::ParamIndex` (the
+/// officially documented 0x7xxx-ish "Read/Write a Single Parameter List"
+/// space) worth including in a bulk settings dump. Keep in sync with
+/// `ParamIndex`'s variants.
+const CLASSIC_PARAMS: &[(&str, ParamIndex)] = &[
+    ("mech_offset", ParamIndex::MechOffset),
+    ("measured_position", ParamIndex::MeasuredPosition),
+    ("measured_velocity", ParamIndex::MeasuredVelocity),
+    ("measured_torque", ParamIndex::MeasuredTorque),
+    ("run_mode", ParamIndex::RunMode),
+    ("iq_ref", ParamIndex::IqRef),
+    ("spd_ref", ParamIndex::SpdRef),
+    ("limit_torque", ParamIndex::LimitTorque),
+    ("cur_kp", ParamIndex::CurKp),
+    ("cur_ki", ParamIndex::CurKi),
+    ("cur_filt_gain", ParamIndex::CurFiltGain),
+    ("loc_ref", ParamIndex::LocRef),
+    ("limit_spd", ParamIndex::LimitSpd),
+    ("limit_cur", ParamIndex::LimitCur),
+    ("mech_pos", ParamIndex::MechPos),
+    ("iq_filt", ParamIndex::IqFilt),
+    ("mech_vel", ParamIndex::MechVel),
+    ("vbus", ParamIndex::Vbus),
+    ("loc_kp", ParamIndex::LocKp),
+    ("spd_kp", ParamIndex::SpdKp),
+    ("spd_ki", ParamIndex::SpdKi),
+    ("spd_filt_gain", ParamIndex::SpdFiltGain),
+    ("acc_rad", ParamIndex::AccRad),
+    ("vel_max", ParamIndex::VelMax),
+    ("acc_set", ParamIndex::AccSet),
+    ("can_timeout", ParamIndex::CanTimeout),
+    ("zero_state", ParamIndex::ZeroState),
+];
+
+#[derive(Debug, Serialize)]
+struct ParamsDump {
+    motor_id: u8,
+    /// Officially documented 0x7xxx `ParamIndex` space (comm_type 17).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    classic_params: BTreeMap<String, f32>,
+    /// RobStride's undocumented bulk parameter table (comm_type 19).
+    ///
+    /// **Not necessarily the same backing store as `classic_params`** — a
+    /// live capture found at least one address (`MechOffset` / `0x2005`)
+    /// read back different values through the two paths on real hardware.
+    /// Kept as a separate section rather than merged so this ambiguity
+    /// stays visible in the dump instead of being silently resolved.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    extended_params: Vec<ExtendedParamDump>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExtendedParamDump {
+    function_code: String,
+    name: String,
+    value: toml::Value,
+}
+
+fn typed_to_toml(v: &TypedValue) -> toml::Value {
+    match v {
+        TypedValue::String(s) => toml::Value::String(s.clone()),
+        TypedValue::U8(x) => toml::Value::Integer(*x as i64),
+        TypedValue::U16(x) => toml::Value::Integer(*x as i64),
+        TypedValue::I16(x) => toml::Value::Integer(*x as i64),
+        TypedValue::U32(x) => toml::Value::Integer(*x as i64),
+        TypedValue::I32(x) => toml::Value::Integer(*x as i64),
+        TypedValue::F32(x) => toml::Value::Float(*x as f64),
+    }
+}
+
+/// Read every known motor-resident setting in one pass: the documented
+/// classic `ParamIndex` space (one read per entry, comm_type 17 — a failed
+/// read is reported and skipped rather than aborting the dump) plus the
+/// undocumented bulk parameter table (comm_type 19, `param-table`'s data
+/// source). Optionally serialize the result to TOML, matching
+/// `myactuator-cli params --toml --out`'s behavior.
+#[allow(clippy::too_many_arguments)]
+pub fn run_params(
+    motor: &mut Motor,
+    motor_id: u8,
+    table_timeout_ms: u64,
+    want_toml: bool,
+    out: Option<&Path>,
+) -> Result<()> {
+    println!("== classic ParamIndex (0x7xxx, comm_type 17) — motor {motor_id} ==");
+    let mut classic_params = BTreeMap::new();
+    for &(label, param) in CLASSIC_PARAMS {
+        match motor.read_param(param) {
+            Ok(v) => {
+                println!("  {label:<16} = {v}");
+                classic_params.insert(label.to_string(), v);
+            }
+            Err(e) => println!("  {label:<16} = <no reply: {e}>"),
+        }
+    }
+
+    println!("\n== extended parameter table (comm_type 19) — motor {motor_id} ==");
+    let table = motor.read_param_table(Duration::from_millis(table_timeout_ms))?;
+    let mut extended_params = Vec::with_capacity(table.len());
+    for e in &table {
+        let value = match e.value_current_typed() {
+            Some(typed) => {
+                println!("  0x{:04X}  {:<20} = {}", e.function_code, e.name, typed);
+                typed_to_toml(&typed)
+            }
+            None => {
+                let raw = format!("{:02X?}", e.value_raw);
+                println!(
+                    "  0x{:04X}  {:<20} = <unknown type, raw={raw}>",
+                    e.function_code, e.name
+                );
+                toml::Value::String(format!("raw:{raw}"))
+            }
+        };
+        extended_params.push(ExtendedParamDump {
+            function_code: format!("0x{:04X}", e.function_code),
+            name: e.name.clone(),
+            value,
+        });
+    }
+
+    if want_toml || out.is_some() {
+        let dump = ParamsDump {
+            motor_id,
+            classic_params,
+            extended_params,
+        };
+        let text = toml::to_string_pretty(&dump).context("failed to serialize TOML dump")?;
+        match out {
+            Some(path) => {
+                std::fs::write(path, &text)
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+                println!("\nwrote TOML dump to {}", path.display());
+            }
+            None => {
+                println!("\n--- TOML ---");
+                print!("{text}");
+            }
+        }
     }
     Ok(())
 }

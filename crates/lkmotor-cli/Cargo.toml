@@ -8,6 +8,8 @@ repository.workspace = true
 description = "Command-line test app for LKMTech V3 servo motors (MG4005 / MG / MS / RMD-X) over RS485"
 
 [dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
 lkmotor-driver = { workspace = true }
 misa-actuator = { workspace = true }
 misa-sysid = { workspace = true }

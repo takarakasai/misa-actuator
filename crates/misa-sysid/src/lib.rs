@@ -34,12 +34,28 @@
 //! is ~500 Hz–1 kHz and the usable identification band is ~50–100 Hz. Check
 //! [`ChirpLog::achieved_rate_hz`] against your target.
 
+#[cfg(feature = "cli")]
+pub mod cli;
 pub mod chirp;
 pub mod frf;
+pub mod limits;
+pub mod quasistatic;
+pub mod report;
 pub mod runner;
 
 pub use chirp::{Chirp, Sweep};
 pub use frf::{estimate_frf, FreqResponse, FrfOptions};
+pub use limits::{AbortReason, Guard, SafetyLimits};
+#[cfg(feature = "cli")]
+pub use cli::{run_characterize, CharacterizeCmd};
+pub use report::{
+    run_breakaway_to_csv, run_kt_to_csv, run_load_map_to_csv, run_thermal_to_csv, BreakawayReport,
+    KtReport, LoadMapReport, ThermalReport,
+};
+pub use quasistatic::{
+    run_breakaway, run_kt, run_load_map, run_thermal, Breakaway, BreakawaySpec, Direction, KtSpec,
+    KtSweep, LoadMap, LoadMapSpec, Point, Thermal, ThermalSpec, write_points_csv,
+};
 pub use runner::{run_chirp, run_chirp_to_csv, ChirpLog, Excitation, RunReport, Sample};
 
 #[cfg(test)]

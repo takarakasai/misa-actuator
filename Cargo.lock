@@ -715,6 +715,8 @@ dependencies = [
 name = "misa-sysid"
 version = "0.1.0"
 dependencies = [
+ "clap",
+ "ctrlc",
  "misa-actuator",
  "rustfft",
 ]

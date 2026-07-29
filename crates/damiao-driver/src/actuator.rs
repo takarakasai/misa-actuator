@@ -35,13 +35,23 @@ use crate::bus::DamiaoBus;
 use crate::driver::DamiaoMotor;
 use crate::scan::scan_bus_on;
 
-fn dm_to_misa_feedback(fb: Feedback) -> MisaFeedback {
+/// `kt_nm_per_a` is the torque constant, when known.
+///
+/// The DAMIAO feedback frame reports torque but has no current field, so
+/// current is derived as `torque / Kt` — the same shape as the MyActuator
+/// driver, except the figure comes from the motor's own `KT_Value` register
+/// (see `DamiaoMotor::refresh_torque_constant`) rather than from the operator.
+/// Without it, current stays `NaN`; reporting a fabricated zero would be worse
+/// than admitting the driver cannot measure it.
+fn dm_to_misa_feedback(fb: Feedback, kt_nm_per_a: Option<f32>) -> MisaFeedback {
     MisaFeedback {
         position_rad: fb.position,
         velocity_rad_per_s: fb.velocity,
         torque_nm: fb.torque,
-        // DAMIAO does not report motor-frame iq current in its feedback frame.
-        current_a: f32::NAN,
+        current_a: match kt_nm_per_a {
+            Some(kt) => fb.torque / kt,
+            None => f32::NAN,
+        },
         // Rotor/coil temperature is the closest to "motor temperature".
         temperature_c: fb.t_rotor,
     }
@@ -111,7 +121,10 @@ impl<B: DamiaoBus> Actuator for DamiaoMotor<B> {
 
     fn enable(&mut self) -> MisaResult<MisaFeedback> {
         let fb = DamiaoMotor::enable(self)?;
-        Ok(fb.map(dm_to_misa_feedback).unwrap_or(MisaFeedback::zero()))
+        let kt = self.torque_constant();
+        Ok(fb
+            .map(|f| dm_to_misa_feedback(f, kt))
+            .unwrap_or(MisaFeedback::zero()))
     }
 
     fn disable(&mut self) -> MisaResult<()> {
@@ -140,24 +153,30 @@ impl<B: DamiaoBus> Actuator for DamiaoMotor<B> {
 
     fn set_position(&mut self, pos_rad: f32, max_speed_rad_s: f32) -> MisaResult<MisaFeedback> {
         require_mode(self, ControlMode::PosVel, "set_position")?;
-        Ok(dm_to_misa_feedback(DamiaoMotor::set_pos_vel(
-            self,
-            pos_rad,
-            max_speed_rad_s,
-        )?))
+        let kt = self.torque_constant();
+        Ok(dm_to_misa_feedback(
+            DamiaoMotor::set_pos_vel(self, pos_rad, max_speed_rad_s)?,
+            kt,
+        ))
     }
 
     fn set_velocity(&mut self, vel_rad_s: f32) -> MisaResult<MisaFeedback> {
         require_mode(self, ControlMode::Vel, "set_velocity")?;
-        Ok(dm_to_misa_feedback(DamiaoMotor::set_vel(self, vel_rad_s)?))
+        let kt = self.torque_constant();
+        Ok(dm_to_misa_feedback(
+            DamiaoMotor::set_vel(self, vel_rad_s)?,
+            kt,
+        ))
     }
 
     fn set_torque(&mut self, torque_nm: f32) -> MisaResult<MisaFeedback> {
         // DAMIAO torque control = MIT with zero gains and torque feed-forward.
         require_mode(self, ControlMode::Mit, "set_torque")?;
-        Ok(dm_to_misa_feedback(DamiaoMotor::mit_control(
-            self, 0.0, 0.0, 0.0, 0.0, torque_nm,
-        )?))
+        let kt = self.torque_constant();
+        Ok(dm_to_misa_feedback(
+            DamiaoMotor::mit_control(self, 0.0, 0.0, 0.0, 0.0, torque_nm)?,
+            kt,
+        ))
     }
 
     fn mit_control(
@@ -169,18 +188,23 @@ impl<B: DamiaoBus> Actuator for DamiaoMotor<B> {
         torque_ff_nm: f32,
     ) -> MisaResult<MisaFeedback> {
         require_mode(self, ControlMode::Mit, "mit_control")?;
-        Ok(dm_to_misa_feedback(DamiaoMotor::mit_control(
-            self,
-            pos_rad,
-            vel_rad_s,
-            kp_nm_per_rad,
-            kd_nm_per_rad_s,
-            torque_ff_nm,
-        )?))
+        let kt = self.torque_constant();
+        Ok(dm_to_misa_feedback(
+            DamiaoMotor::mit_control(
+                self,
+                pos_rad,
+                vel_rad_s,
+                kp_nm_per_rad,
+                kd_nm_per_rad_s,
+                torque_ff_nm,
+            )?,
+            kt,
+        ))
     }
 
     fn measure(&mut self) -> MisaResult<MisaFeedback> {
-        Ok(dm_to_misa_feedback(DamiaoMotor::measure(self)?))
+        let kt = self.torque_constant();
+        Ok(dm_to_misa_feedback(DamiaoMotor::measure(self)?, kt))
     }
 
     fn read_status(&mut self) -> MisaResult<MotorStatus> {

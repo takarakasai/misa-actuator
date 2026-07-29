@@ -7,6 +7,15 @@ authors.workspace = true
 repository.workspace = true
 description = "Chirp-excitation system identification (frequency response) for any misa-actuator Actuator"
 
+[features]
+default = []
+# Ready-made clap subcommand + runner for the quasi-static characterizations,
+# so each vendor CLI wires them up in a few lines instead of carrying its own
+# copy of the argument parsing and reporting.
+cli = ["dep:clap", "dep:ctrlc"]
+
 [dependencies]
 misa-actuator = { workspace = true }
 rustfft = { workspace = true }
+clap = { workspace = true, optional = true }
+ctrlc = { workspace = true, optional = true }

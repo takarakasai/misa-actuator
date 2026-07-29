@@ -24,7 +24,7 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 use myactuator_driver::{scan_bus_on, MotorConfig, MotorFeedback, MyActuatorMotor};
-use myactuator_protocol::AccelIndex;
+use myactuator_protocol::{AccelIndex, ParamIndex};
 
 /// clap-friendly mirror of [`AccelIndex`] (kept in `myactuator-protocol`,
 /// which is `no_std` and doesn't depend on `clap`).
@@ -111,7 +111,10 @@ enum Command {
     /// Read system uptime since last reset/reboot (0xB1).
     Uptime,
     /// Read every known readable parameter in one pass (0x60/0x61/0x62/0x70/
-    /// 0x71/0x90/0x92/0x94/0x9A/0x9C/0x9D/0x30×7/0x42×4/0xB1/0xB2/0xB5) and
+    /// 0x71/0x90/0x92/0x94/0x9A/0x9C/0x9D/0x30×7/0x42×4/0xB1/0xB2/0xB5, plus
+    /// the undocumented 0xC0 indexed space — Protect/Plan/Motor Parameters
+    /// and a second PID gain set, see
+    /// myactuator-protocol/doc/setup-software-c0-param-protocol.md) and
     /// print it. A read that times out or fails is reported and omitted
     /// rather than aborting the whole dump.
     Params {
@@ -513,6 +516,154 @@ struct AllParams {
     version_date_raw: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     motor_model: Option<String>,
+
+    // -- The following are all read via the undocumented `0xC0` generic
+    // indexed parameter space (reverse-engineered from Setup Software V4.0
+    // traffic against a real X4-36 — see
+    // myactuator-protocol/doc/setup-software-c0-param-protocol.md). Distinct
+    // wire command from the `0x30`-based PID fields above.
+
+    // Motor Information (0xC0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    motor_number: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    factory_time: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reduction_ratio: Option<f32>,
+
+    // PID Parameters, second gain set: Kd/R(Slope)/T(Filter) per loop (0xC0).
+    // No independent D-Axis Current indices exist on the wire — the GUI
+    // mirrors Q-Axis Current onto the D-Axis display (doc §1.2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    c0_position_kp: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    c0_position_ki: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    c0_position_kd: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    c0_position_t_filter: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    c0_speed_kp: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    c0_speed_ki: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    c0_speed_kd: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    c0_speed_t_filter: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    c0_qaxis_current_kp: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    c0_qaxis_current_ki: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    c0_qaxis_current_kd: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    c0_qaxis_current_r_slope: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    c0_qaxis_current_t_filter: Option<f32>,
+
+    // Encoder / calibration misc (0xC0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled_powerdown_save_multiturn: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pole_pairs: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    single_resolution_pulses: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    calibrate_current_a: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    change_motor_direction: Option<f32>,
+    /// Uncertain pairing with `encoder_calibrate_value` — see doc §1.4.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exchange_phase: Option<f32>,
+    /// Uncertain pairing with `exchange_phase` — see doc §1.4.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoder_calibrate_value: Option<f32>,
+
+    // Protect Parameters panel (0xC0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    over_voltage_v: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    low_voltage_v: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stall_time_limit_s: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ebrake_start_duty_cycle_pct: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_sample_res_mohm: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ebrake_hold_duty_cycle_pct: Option<f32>,
+    /// enum: `0.0` = E-Brake, `1.0` = Resistor (doc §1.6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    brake_mode: Option<f32>,
+
+    // Plan Parameters panel (0xC0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_positive_position_deg: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_negative_position_deg: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_plan_max_acc_dps_s: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_plan_max_dec_dps_s: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_plan_max_speed_rpm: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed_plan_max_acc_dps_s: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed_plan_max_dec_dps_s: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    motor_position_zero: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kt_out: Option<f32>,
+
+    // Motor Parameters panel (0xC0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rated_current_a: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_current_a: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stall_current_a: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shutdown_temp_c: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume_temp_c: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_speed_rpm: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nominal_speed_rpm: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_ethercat: Option<f32>,
+    /// Read-only mirror — the actual write path is `function_control(2, _)`,
+    /// not `0xC0` (doc §1.5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_can_filter: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_2nd_encoder: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    select_thermistor: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoder2_abnormal_value: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoder2_abnormal_speed: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    automatic_error_recovery: Option<f32>,
+
+    // Output-encoder mapping (0xC0) — names confirmed via
+    // `memo_myactuator_001.xlsx` export, exact per-field semantics unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    out_encoder: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    out_encoder_1: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    out_encoder_2: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    out_encoder_3: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    out_encoder2_1: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    out_encoder2_2: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    out_encoder2_3: Option<f32>,
 }
 
 impl AllParams {
@@ -581,6 +732,150 @@ impl AllParams {
             uptime_ms: try_read("uptime (0xB1)", || motor.read_uptime_ms()),
             version_date_raw: try_read("version date (0xB2)", || motor.read_version_date()),
             motor_model: try_read("motor model (0xB5)", || motor.read_motor_model()),
+
+            // -- 0xC0 generic indexed parameter space --
+            motor_number: rp(motor, "motor number", ParamIndex::MotorNumber),
+            factory_time: rp(motor, "factory time", ParamIndex::FactoryTime),
+            reduction_ratio: rp(motor, "reduction ratio", ParamIndex::ReductionRatio),
+
+            c0_position_kp: rp(motor, "position Kp", ParamIndex::PositionLoopKp),
+            c0_position_ki: rp(motor, "position Ki", ParamIndex::PositionLoopKi),
+            c0_position_kd: rp(motor, "position Kd", ParamIndex::PositionLoopKd),
+            c0_position_t_filter: rp(motor, "position T(Filter)", ParamIndex::PositionLoopTFilter),
+            c0_speed_kp: rp(motor, "speed Kp", ParamIndex::SpeedLoopKp),
+            c0_speed_ki: rp(motor, "speed Ki", ParamIndex::SpeedLoopKi),
+            c0_speed_kd: rp(motor, "speed Kd", ParamIndex::SpeedLoopKd),
+            c0_speed_t_filter: rp(motor, "speed T(Filter)", ParamIndex::SpeedLoopTFilter),
+            c0_qaxis_current_kp: rp(motor, "Q-axis current Kp", ParamIndex::QAxisCurrentKp),
+            c0_qaxis_current_ki: rp(motor, "Q-axis current Ki", ParamIndex::QAxisCurrentKi),
+            c0_qaxis_current_kd: rp(motor, "Q-axis current Kd", ParamIndex::QAxisCurrentKd),
+            c0_qaxis_current_r_slope: rp(
+                motor,
+                "Q-axis current R(Slope)",
+                ParamIndex::QAxisCurrentRSlope,
+            ),
+            c0_qaxis_current_t_filter: rp(
+                motor,
+                "Q-axis current T(Filter)",
+                ParamIndex::QAxisCurrentTFilter,
+            ),
+
+            enabled_powerdown_save_multiturn: rp(
+                motor,
+                "powerdown save multiturn",
+                ParamIndex::EnabledPowerdownSaveMultiTurn,
+            ),
+            pole_pairs: rp(motor, "pole pairs", ParamIndex::PolePairs),
+            single_resolution_pulses: rp(
+                motor,
+                "single-resolution pulses",
+                ParamIndex::SingleResolutionPulses,
+            ),
+            calibrate_current_a: rp(motor, "calibrate current", ParamIndex::CalibrateCurrent),
+            change_motor_direction: rp(
+                motor,
+                "change motor direction",
+                ParamIndex::ChangeMotorDirection,
+            ),
+            exchange_phase: rp(motor, "exchange phase", ParamIndex::ExchangePhase),
+            encoder_calibrate_value: rp(
+                motor,
+                "encoder calibrate value",
+                ParamIndex::EncoderCalibrateValue,
+            ),
+
+            over_voltage_v: rp(motor, "over voltage", ParamIndex::OverVoltage),
+            low_voltage_v: rp(motor, "low voltage", ParamIndex::LowVoltage),
+            stall_time_limit_s: rp(motor, "stall time limit", ParamIndex::StallTimeLimit),
+            ebrake_start_duty_cycle_pct: rp(
+                motor,
+                "E-Brake start duty cycle",
+                ParamIndex::EBrakeStartDutyCycle,
+            ),
+            current_sample_res_mohm: rp(
+                motor,
+                "current sample res",
+                ParamIndex::CurrentSampleRes,
+            ),
+            ebrake_hold_duty_cycle_pct: rp(
+                motor,
+                "E-Brake hold duty cycle",
+                ParamIndex::EBrakeHoldDutyCycle,
+            ),
+            brake_mode: rp(motor, "brake mode", ParamIndex::BrakeMode),
+
+            max_positive_position_deg: rp(
+                motor,
+                "max positive position",
+                ParamIndex::MaxPositivePosition,
+            ),
+            min_negative_position_deg: rp(
+                motor,
+                "min negative position",
+                ParamIndex::MinNegativePosition,
+            ),
+            position_plan_max_acc_dps_s: rp(
+                motor,
+                "position plan max acc",
+                ParamIndex::PositionPlanMaxAcc,
+            ),
+            position_plan_max_dec_dps_s: rp(
+                motor,
+                "position plan max dec",
+                ParamIndex::PositionPlanMaxDec,
+            ),
+            position_plan_max_speed_rpm: rp(
+                motor,
+                "position plan max speed",
+                ParamIndex::PositionPlanMaxSpeed,
+            ),
+            speed_plan_max_acc_dps_s: rp(
+                motor,
+                "speed plan max acc",
+                ParamIndex::SpeedPlanMaxAcc,
+            ),
+            speed_plan_max_dec_dps_s: rp(
+                motor,
+                "speed plan max dec",
+                ParamIndex::SpeedPlanMaxDec,
+            ),
+            motor_position_zero: rp(motor, "motor position zero", ParamIndex::MotorPositionZero),
+            kt_out: rp(motor, "KT_OUT", ParamIndex::KtOut),
+
+            rated_current_a: rp(motor, "rated current", ParamIndex::RatedCurrent),
+            max_current_a: rp(motor, "max current", ParamIndex::MaxCurrent),
+            stall_current_a: rp(motor, "stall current", ParamIndex::StallCurrent),
+            shutdown_temp_c: rp(motor, "shutdown temp", ParamIndex::ShutdownTemp),
+            resume_temp_c: rp(motor, "resume temp", ParamIndex::ResumeTemp),
+            max_speed_rpm: rp(motor, "max speed", ParamIndex::MaxSpeed),
+            nominal_speed_rpm: rp(motor, "nominal speed", ParamIndex::NominalSpeed),
+            enable_ethercat: rp(motor, "enable EtherCAT", ParamIndex::EnableEtherCat),
+            enable_can_filter: rp(motor, "enable CAN filter", ParamIndex::EnableCanFilter),
+            enable_2nd_encoder: rp(motor, "enable 2nd encoder", ParamIndex::Enable2ndEncoder),
+            select_thermistor: rp(motor, "select thermistor", ParamIndex::SelectThermistor),
+            encoder2_abnormal_value: rp(
+                motor,
+                "encoder2 abnormal value",
+                ParamIndex::Encoder2AbnormalValue,
+            ),
+            encoder2_abnormal_speed: rp(
+                motor,
+                "encoder2 abnormal speed",
+                ParamIndex::Encoder2AbnormalSpeed,
+            ),
+            automatic_error_recovery: rp(
+                motor,
+                "automatic error recovery",
+                ParamIndex::AutomaticErrorRecovery,
+            ),
+
+            out_encoder: rp(motor, "OUTENCODER", ParamIndex::OutEncoder),
+            out_encoder_1: rp(motor, "OUTENCODER_1", ParamIndex::OutEncoder1),
+            out_encoder_2: rp(motor, "OUTENCODER_2", ParamIndex::OutEncoder2),
+            out_encoder_3: rp(motor, "OUTENCODER_3", ParamIndex::OutEncoder3),
+            out_encoder2_1: rp(motor, "OUTENCODER2_1", ParamIndex::OutEncoder2_1),
+            out_encoder2_2: rp(motor, "OUTENCODER2_2", ParamIndex::OutEncoder2_2),
+            out_encoder2_3: rp(motor, "OUTENCODER2_3", ParamIndex::OutEncoder2_3),
         }
     }
 
@@ -648,6 +943,167 @@ impl AllParams {
             row("0xB1", "uptime_ms", fmt(&self.uptime_ms), "ms"),
             row("0xB2", "version_date_raw", fmt(&self.version_date_raw), ""),
             row("0xB5", "motor_model", model, ""),
+            // -- 0xC0 generic indexed parameter space --
+            row("0xC0", "motor_number", fmt_f32(self.motor_number, 0), ""),
+            row("0xC0", "factory_time", fmt_f32(self.factory_time, 0), ""),
+            row("0xC0", "reduction_ratio", fmt_f32(self.reduction_ratio, 2), ""),
+            row("0xC0", "c0_position_kp", fmt_f32(self.c0_position_kp, 4), ""),
+            row("0xC0", "c0_position_ki", fmt_f32(self.c0_position_ki, 4), ""),
+            row("0xC0", "c0_position_kd", fmt_f32(self.c0_position_kd, 4), ""),
+            row("0xC0", "c0_position_t_filter", fmt_f32(self.c0_position_t_filter, 4), ""),
+            row("0xC0", "c0_speed_kp", fmt_f32(self.c0_speed_kp, 4), ""),
+            row("0xC0", "c0_speed_ki", fmt_f32(self.c0_speed_ki, 4), ""),
+            row("0xC0", "c0_speed_kd", fmt_f32(self.c0_speed_kd, 4), ""),
+            row("0xC0", "c0_speed_t_filter", fmt_f32(self.c0_speed_t_filter, 4), ""),
+            row("0xC0", "c0_qaxis_current_kp", fmt_f32(self.c0_qaxis_current_kp, 4), ""),
+            row("0xC0", "c0_qaxis_current_ki", fmt_f32(self.c0_qaxis_current_ki, 4), ""),
+            row("0xC0", "c0_qaxis_current_kd", fmt_f32(self.c0_qaxis_current_kd, 4), ""),
+            row(
+                "0xC0",
+                "c0_qaxis_current_r_slope",
+                fmt_f32(self.c0_qaxis_current_r_slope, 4),
+                "",
+            ),
+            row(
+                "0xC0",
+                "c0_qaxis_current_t_filter",
+                fmt_f32(self.c0_qaxis_current_t_filter, 4),
+                "",
+            ),
+            row(
+                "0xC0",
+                "enabled_powerdown_save_multiturn",
+                fmt_f32(self.enabled_powerdown_save_multiturn, 0),
+                "",
+            ),
+            row("0xC0", "pole_pairs", fmt_f32(self.pole_pairs, 0), ""),
+            row(
+                "0xC0",
+                "single_resolution_pulses",
+                fmt_f32(self.single_resolution_pulses, 0),
+                "pulses",
+            ),
+            row("0xC0", "calibrate_current_a", fmt_f32(self.calibrate_current_a, 2), "A"),
+            row(
+                "0xC0",
+                "change_motor_direction",
+                fmt_f32(self.change_motor_direction, 0),
+                "",
+            ),
+            row("0xC0", "exchange_phase", fmt_f32(self.exchange_phase, 0), ""),
+            row(
+                "0xC0",
+                "encoder_calibrate_value",
+                fmt_f32(self.encoder_calibrate_value, 0),
+                "",
+            ),
+            row("0xC0", "over_voltage_v", fmt_f32(self.over_voltage_v, 2), "V"),
+            row("0xC0", "low_voltage_v", fmt_f32(self.low_voltage_v, 2), "V"),
+            row("0xC0", "stall_time_limit_s", fmt_f32(self.stall_time_limit_s, 2), "s"),
+            row(
+                "0xC0",
+                "ebrake_start_duty_cycle_pct",
+                fmt_f32(self.ebrake_start_duty_cycle_pct, 1),
+                "%",
+            ),
+            row(
+                "0xC0",
+                "current_sample_res_mohm",
+                fmt_f32(self.current_sample_res_mohm, 2),
+                "mΩ",
+            ),
+            row(
+                "0xC0",
+                "ebrake_hold_duty_cycle_pct",
+                fmt_f32(self.ebrake_hold_duty_cycle_pct, 1),
+                "%",
+            ),
+            row("0xC0", "brake_mode", fmt_f32(self.brake_mode, 0), ""),
+            row(
+                "0xC0",
+                "max_positive_position_deg",
+                fmt_f32(self.max_positive_position_deg, 1),
+                "°",
+            ),
+            row(
+                "0xC0",
+                "min_negative_position_deg",
+                fmt_f32(self.min_negative_position_deg, 1),
+                "°",
+            ),
+            row(
+                "0xC0",
+                "position_plan_max_acc_dps_s",
+                fmt_f32(self.position_plan_max_acc_dps_s, 1),
+                "dps/s",
+            ),
+            row(
+                "0xC0",
+                "position_plan_max_dec_dps_s",
+                fmt_f32(self.position_plan_max_dec_dps_s, 1),
+                "dps/s",
+            ),
+            row(
+                "0xC0",
+                "position_plan_max_speed_rpm",
+                fmt_f32(self.position_plan_max_speed_rpm, 1),
+                "rpm",
+            ),
+            row(
+                "0xC0",
+                "speed_plan_max_acc_dps_s",
+                fmt_f32(self.speed_plan_max_acc_dps_s, 1),
+                "dps/s",
+            ),
+            row(
+                "0xC0",
+                "speed_plan_max_dec_dps_s",
+                fmt_f32(self.speed_plan_max_dec_dps_s, 1),
+                "dps/s",
+            ),
+            row(
+                "0xC0",
+                "motor_position_zero",
+                fmt_f32(self.motor_position_zero, 1),
+                "",
+            ),
+            row("0xC0", "kt_out", fmt_f32(self.kt_out, 4), "N·m/A"),
+            row("0xC0", "rated_current_a", fmt_f32(self.rated_current_a, 3), "A"),
+            row("0xC0", "max_current_a", fmt_f32(self.max_current_a, 2), "A"),
+            row("0xC0", "stall_current_a", fmt_f32(self.stall_current_a, 2), "A"),
+            row("0xC0", "shutdown_temp_c", fmt_f32(self.shutdown_temp_c, 1), "°C"),
+            row("0xC0", "resume_temp_c", fmt_f32(self.resume_temp_c, 1), "°C"),
+            row("0xC0", "max_speed_rpm", fmt_f32(self.max_speed_rpm, 1), "rpm"),
+            row("0xC0", "nominal_speed_rpm", fmt_f32(self.nominal_speed_rpm, 1), "rpm"),
+            row("0xC0", "enable_ethercat", fmt_f32(self.enable_ethercat, 0), ""),
+            row("0xC0", "enable_can_filter", fmt_f32(self.enable_can_filter, 0), ""),
+            row("0xC0", "enable_2nd_encoder", fmt_f32(self.enable_2nd_encoder, 0), ""),
+            row("0xC0", "select_thermistor", fmt_f32(self.select_thermistor, 0), ""),
+            row(
+                "0xC0",
+                "encoder2_abnormal_value",
+                fmt_f32(self.encoder2_abnormal_value, 1),
+                "",
+            ),
+            row(
+                "0xC0",
+                "encoder2_abnormal_speed",
+                fmt_f32(self.encoder2_abnormal_speed, 2),
+                "",
+            ),
+            row(
+                "0xC0",
+                "automatic_error_recovery",
+                fmt_f32(self.automatic_error_recovery, 0),
+                "",
+            ),
+            row("0xC0", "out_encoder", fmt_f32(self.out_encoder, 0), ""),
+            row("0xC0", "out_encoder_1", fmt_f32(self.out_encoder_1, 0), ""),
+            row("0xC0", "out_encoder_2", fmt_f32(self.out_encoder_2, 0), ""),
+            row("0xC0", "out_encoder_3", fmt_f32(self.out_encoder_3, 0), ""),
+            row("0xC0", "out_encoder2_1", fmt_f32(self.out_encoder2_1, 0), ""),
+            row("0xC0", "out_encoder2_2", fmt_f32(self.out_encoder2_2, 0), ""),
+            row("0xC0", "out_encoder2_3", fmt_f32(self.out_encoder2_3, 0), ""),
         ]
     }
 
@@ -684,6 +1140,18 @@ fn try_read<T>(label: &str, f: impl FnOnce() -> myactuator_driver::Result<T>) ->
             None
         }
     }
+}
+
+/// [`try_read`] specialized for the `0xC0` generic indexed parameter space —
+/// formats the warning label as `"{label} (0xC0/0x{index:02X})"`.
+fn rp<B: myactuator_driver::MyActuatorBus>(
+    motor: &mut MyActuatorMotor<B>,
+    label: &str,
+    index: ParamIndex,
+) -> Option<f32> {
+    try_read(&format!("{label} (0xC0/0x{:02X})", index as u8), || {
+        motor.read_param(index)
+    })
 }
 
 fn control_loop<F>(duration: Option<f32>, mut tick: F) -> Result<()>

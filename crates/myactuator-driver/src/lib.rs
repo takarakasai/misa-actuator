@@ -29,7 +29,7 @@ pub mod scan;
 pub use bus::{CanFrame, MyActuatorBus, SocketCanBus};
 pub use driver::{MotorConfig, MotorFeedback, MotorStatus, MyActuatorMotor};
 pub use error::{Error, Result};
-pub use myactuator_protocol::{ErrorState, MotionFeedback, Status1, Status2};
+pub use myactuator_protocol::{ErrorState, MotionFeedback, ParamIndex, Status1, Status2};
 pub use scan::{probe_one, scan_bus_on};
 
 #[cfg(test)]
@@ -283,5 +283,36 @@ mod tests {
         let mut m = motor();
         m.read_uptime_ms().unwrap();
         assert!(sent_cmds(&mut m).contains(&0xB1));
+    }
+
+    #[test]
+    fn read_param_sends_0xc0_with_index_and_read_flag() {
+        use myactuator_protocol::ParamIndex;
+        let mut m = motor();
+        m.read_param(ParamIndex::OverVoltage).unwrap();
+        let (_, frame) = m.bus().sent[0];
+        assert_eq!(frame[0], 0xC0);
+        assert_eq!(frame[2], ParamIndex::OverVoltage as u8);
+        assert_eq!(frame[3], 0x01);
+    }
+
+    #[test]
+    fn write_param_sends_0xc0_with_write_flag_and_value() {
+        use myactuator_protocol::ParamIndex;
+        let mut m = motor();
+        m.write_param(ParamIndex::BrakeMode, 1.0).unwrap();
+        let (_, frame) = m.bus().sent[0];
+        assert_eq!(frame[0], 0xC0);
+        assert_eq!(frame[2], ParamIndex::BrakeMode as u8);
+        assert_eq!(frame[3], 0x00);
+        let v = f32::from_le_bytes(frame[4..8].try_into().unwrap());
+        assert_eq!(v, 1.0);
+    }
+
+    #[test]
+    fn commit_params_sends_0xc1() {
+        let mut m = motor();
+        m.commit_params().unwrap();
+        assert!(sent_cmds(&mut m).contains(&0xC1));
     }
 }

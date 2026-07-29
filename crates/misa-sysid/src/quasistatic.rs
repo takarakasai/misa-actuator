@@ -199,8 +199,16 @@ impl LoadMapSpec {
 /// Holding torque as a function of position.
 #[derive(Debug, Clone)]
 pub struct LoadMap {
-    /// One point per visited position, in visit order.
+    /// One point per visited position, in visit order. Each is the **mean** of
+    /// its dwell, not a single sample — see [`Self::dwell_torque_spreads_nm`].
     pub points: Vec<Point>,
+    /// Peak-to-peak torque seen during each point's dwell (N·m), parallel to
+    /// [`Self::points`].
+    ///
+    /// Large relative to the torque itself means the shaft was hunting rather
+    /// than holding, so that point averages a limit cycle instead of measuring
+    /// a steady load. [`Self::worst_dwell_spread_nm`] summarises it.
+    pub dwell_torque_spreads_nm: Vec<f32>,
     /// Position at enable, which every `cmd` is relative to (rad).
     pub start_position_rad: f32,
     pub spec: LoadMapSpec,
@@ -330,6 +338,21 @@ impl LoadMap {
             .map(|p| p.position_rad)
     }
 
+    /// Largest peak-to-peak torque swing seen inside any single dwell (N·m).
+    ///
+    /// Compare against [`Self::peak_holding_torque_nm`]: a spread of the same
+    /// order or larger means the shaft was hunting, so the load figures average
+    /// a limit cycle and should not be read as a steady-state load. Seen on an
+    /// RS04, whose 0.054 N·m of friction damps almost nothing against a
+    /// `loc_kp` of 80.
+    pub fn worst_dwell_spread_nm(&self) -> Option<f32> {
+        self.dwell_torque_spreads_nm
+            .iter()
+            .copied()
+            .filter(|s| s.is_finite())
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal))
+    }
+
     /// Largest |holding torque| seen, i.e. what the rig costs at its worst.
     pub fn peak_holding_torque_nm(&self) -> Option<f32> {
         self.points
@@ -368,6 +391,7 @@ pub fn run_load_map(
     let mut guard = Guard::new(limits, start);
 
     let mut points = Vec::with_capacity(spec.offsets().len());
+    let mut spreads = Vec::with_capacity(spec.offsets().len());
     let mut stop = None;
     let t0 = Instant::now();
 
@@ -405,22 +429,31 @@ pub fn run_load_map(
             break;
         }
 
-        // Phase 2: settle, so the torque reading is steady-state.
+        // Phase 2: settle, averaging the dwell rather than taking its last
+        // sample. A stiff position loop against a low-friction load hunts
+        // instead of settling — on an RS04 the current alternated sign every
+        // sample at ~0.45 A, so a single sample recorded the phase of a limit
+        // cycle and called it a holding torque. The mean cancels the cycle; the
+        // spread records that it was there.
         let settle = Duration::from_secs_f32(spec.settle_s.max(0.0));
         let dwell_start = Instant::now();
+        let mut acc = DwellAccumulator::default();
+        acc.push(&fb);
         while dwell_start.elapsed() < settle {
             if abort.load(Ordering::Relaxed) {
                 stop = Some(AbortReason::Cancelled);
                 break;
             }
             fb = act.set_position(target, spec.max_speed_rad_s)?;
+            acc.push(&fb);
             if let Some(r) = guard.check(t0.elapsed().as_secs_f32(), &fb) {
                 stop = Some(r);
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        points.push(Point::from(t0.elapsed().as_secs_f32(), target, &fb));
+        spreads.push(acc.torque_spread());
+        points.push(acc.into_point(t0.elapsed().as_secs_f32(), target));
         if stop.is_some() {
             break;
         }
@@ -432,10 +465,67 @@ pub fn run_load_map(
 
     Ok(LoadMap {
         points,
+        dwell_torque_spreads_nm: spreads,
         start_position_rad: start,
         spec: *spec,
         abort: stop,
     })
+}
+
+/// Accumulates one dwell so the recorded point is its mean, and the spread it
+/// hid is still reportable.
+#[derive(Default)]
+struct DwellAccumulator {
+    n: u32,
+    position: f32,
+    velocity: f32,
+    torque: f32,
+    current: f32,
+    temperature: f32,
+    torque_min: f32,
+    torque_max: f32,
+}
+
+impl DwellAccumulator {
+    fn push(&mut self, fb: &MotorFeedback) {
+        // Only finite readings contribute, so a driver that does not report a
+        // channel yields NaN for it rather than poisoning the others.
+        self.n += 1;
+        self.position += fb.position_rad;
+        self.velocity += fb.velocity_rad_per_s;
+        self.torque += fb.torque_nm;
+        self.current += fb.current_a;
+        self.temperature += fb.temperature_c;
+        if fb.torque_nm.is_finite() {
+            if self.torque_min.is_nan() || self.n == 1 {
+                self.torque_min = fb.torque_nm;
+                self.torque_max = fb.torque_nm;
+            } else {
+                self.torque_min = self.torque_min.min(fb.torque_nm);
+                self.torque_max = self.torque_max.max(fb.torque_nm);
+            }
+        }
+    }
+
+    fn torque_spread(&self) -> f32 {
+        if self.n == 0 || !self.torque_min.is_finite() {
+            return f32::NAN;
+        }
+        self.torque_max - self.torque_min
+    }
+
+    fn into_point(self, t_s: f32, cmd: f32) -> Point {
+        let n = self.n.max(1) as f32;
+        Point {
+            t_s,
+            cmd,
+            position_rad: self.position / n,
+            velocity_rad_per_s: self.velocity / n,
+            torque_nm: self.torque / n,
+            current_a: self.current / n,
+            temperature_c: self.temperature / n,
+        }
+    }
 }
 
 // --------------------------------------------------------------- breakaway

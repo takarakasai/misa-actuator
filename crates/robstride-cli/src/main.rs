@@ -49,6 +49,21 @@ struct Cli {
     #[arg(long)]
     report_current: bool,
 
+    /// Torque constant (N·m/A), so torque can be synthesized from current when
+    /// the motor does not report it. Implies --report-current.
+    ///
+    /// Some firmware returns a constant 0 for `MeasuredTorque`, which is what
+    /// Position- and Torque-mode feedback is built from — measured on an RS04
+    /// (0.4.1.32). That makes `characterize load-map` unable to measure
+    /// anything, and leaves the safety envelope's torque limit with nothing to
+    /// check. `IqFilt` works there, so `torque = current * Kt` recovers it.
+    ///
+    /// Get the value from `characterize kt` (an RS04 measured 1.5093) or the
+    /// datasheet. A real non-zero torque reading is always preferred over the
+    /// derived one, so passing this on healthy firmware changes nothing.
+    #[arg(long)]
+    kt: Option<f32>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -347,7 +362,15 @@ fn open_motor(cli: &Cli) -> Result<Motor> {
     let model = parse_model(&cli.model)?;
     let mut motor = Motor::open_with_host(&cli.interface, cli.motor_id, cli.host_id, model)
         .with_context(|| format!("failed to open {} for motor {}", cli.interface, cli.motor_id))?;
-    motor.set_report_current(cli.report_current);
+    // Deriving torque needs a current reading, so --kt implies --report-current
+    // rather than silently doing nothing.
+    motor.set_report_current(cli.report_current || cli.kt.is_some());
+    if let Some(kt) = cli.kt {
+        motor.set_torque_constant(kt);
+        if motor.torque_constant().is_none() {
+            bail!("--kt must be finite and positive, got {kt}");
+        }
+    }
     Ok(motor)
 }
 

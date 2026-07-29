@@ -273,6 +273,27 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
     }
 
     /// Disable closed-loop control (`FF*7 FD`). The motor coasts.
+    ///
+    /// **This is not a latching safe state.** Verified on a DM-J4310: sending
+    /// a MIT frame with `kp = 5` immediately after `disable()` produced
+    /// 1.013 N·m — the control frame re-energizes the motor. So `disable()`
+    /// de-energizes only until the next control frame arrives; it does not
+    /// make the motor ignore commands.
+    ///
+    /// Consequences worth knowing:
+    /// - Any later `mit`/`move_to`/`set_velocity` call silently re-energizes,
+    ///   even if nothing called `enable()` in between.
+    /// - [`Self::measure`] and anything else that re-issues a control frame
+    ///   (including a zero-gain MIT frame) counts as such a command. Those
+    ///   produce no torque at zero gains, but the motor reports
+    ///   [`ErrorCode::Enabled`](damiao_protocol::ErrorCode::Enabled) again.
+    /// - The bench unit also reported `Enabled` from power-on, before any
+    ///   `enable()` was ever sent, so do not treat a fresh connection as
+    ///   de-energized either.
+    ///
+    /// For a state the motor will actually hold, cut power. To stop motion
+    /// while keeping the link up, keep issuing zero-gain/zero-torque commands
+    /// rather than relying on `disable()` alone.
     pub fn disable(&mut self) -> Result<()> {
         let (id, data) = build_disable_frame(self.can_id);
         self.send(id, &data)?;

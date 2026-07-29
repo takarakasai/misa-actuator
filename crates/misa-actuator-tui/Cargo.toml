@@ -20,7 +20,12 @@ clap = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 serde = { workspace = true }
+toml = { workspace = true }
 confy = { workspace = true }
+
+[lib]
+name = "misa_actuator_tui"
+path = "src/lib.rs"
 
 [[bin]]
 name = "misa-actuator-tui"

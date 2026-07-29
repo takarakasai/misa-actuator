@@ -9,8 +9,9 @@ use misa_actuator::{Actuator, MotorFeedback, MotorStatus};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
+use misa_actuator_tui::factory::{DriverConfig, build_actuator};
+
 use crate::commands::{Command, ParamField, dispatch, params_for};
-use crate::factory::{DriverConfig, build_actuator};
 
 const LOG_MAX: usize = 256;
 

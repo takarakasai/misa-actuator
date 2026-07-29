@@ -15,7 +15,6 @@
 
 mod app;
 mod commands;
-mod factory;
 
 use std::io;
 use std::time::Duration;
@@ -30,8 +29,9 @@ use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
+use misa_actuator_tui::factory::{BusKind, DriverConfig, DriverKind, build_actuator, validate_driver_args};
+
 use crate::app::App;
-use crate::factory::{BusKind, DriverConfig, DriverKind, build_actuator, validate_driver_args};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Driver-agnostic debug TUI for misa-actuator-compatible motors")]

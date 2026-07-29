@@ -741,16 +741,19 @@ struct AllRegs {
     damp: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     inertia: Option<f32>,
-    /// Confirmed against the official DM-J4310-2EC/DM-J3507-2EC manuals'
-    /// Register Map — labeled "Reserved" there despite the name.
+    /// Labeled "Reserved" in the official manuals despite the name, and a
+    /// DM-J4310 does read back 0, so the label is accurate.
     #[serde(skip_serializing_if = "Option::is_none")]
     hw_ver: Option<i32>,
     /// The actual firmware version (confirmed against the official manuals —
     /// this is what the vendor's own "Read Version" tool reads, not `sub_ver`).
+    /// Rendered as a string because the register holds ASCII: a DM-J4310
+    /// returns `0x39313035` = `"5019"`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    sw_ver: Option<i32>,
-    /// Confirmed against the official manuals — labeled "Reserved" there
-    /// despite the `SN` name.
+    sw_ver: Option<String>,
+    /// Labeled "Reserved" in the official manuals except DM-J10422P's, which
+    /// calls it a serial number. A DM-J4310 reads back 0, matching its own
+    /// manual's "Reserved".
     #[serde(skip_serializing_if = "Option::is_none")]
     sn: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -793,67 +796,72 @@ struct AllRegs {
     vl_c1: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     can_br: Option<i32>,
+    /// ASCII like `sw_ver` — a DM-J4310 returns `0x35` = `"5"`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    sub_ver: Option<i32>,
-    /// DM-J4310-2EC only — a DM-J3507-2EC does not document RID `0x25`.
+    sub_ver: Option<String>,
+    /// Only on models whose map documents RID `0x25` (see
+    /// `MotorModel::has_boot_ver`). Byte-packed rather than ASCII: a DM-J4310
+    /// returns `0x06000203`, so this is rendered as hex.
     #[serde(skip_serializing_if = "Option::is_none")]
-    boot_ver: Option<i32>,
+    boot_ver: Option<String>,
 }
 
 impl AllRegs {
     fn print(&self) {
         println!("== DAMIAO registers (motor_id={}) ==", self.motor_id);
-        fn fmt<T: std::fmt::Display>(label: &str, v: Option<T>) {
+        // Takes the option by reference so `String`-valued fields (the version
+        // registers) don't need cloning at every call site.
+        fn fmt<T: std::fmt::Display>(label: &str, v: &Option<T>) {
             match v {
                 Some(v) => println!("  {label:<10} = {v}"),
                 None => println!("  {label:<10} = <no reply>"),
             }
         }
         println!("-- protection thresholds --");
-        fmt("uv_value", self.uv_value);
-        fmt("ov_value", self.ov_value);
-        fmt("ot_value", self.ot_value);
-        fmt("oc_value", self.oc_value);
+        fmt("uv_value", &self.uv_value);
+        fmt("ov_value", &self.ov_value);
+        fmt("ot_value", &self.ot_value);
+        fmt("oc_value", &self.oc_value);
         println!("-- motion profile --");
-        fmt("acc", self.acc);
-        fmt("dec", self.dec);
-        fmt("max_spd", self.max_spd);
+        fmt("acc", &self.acc);
+        fmt("dec", &self.dec);
+        fmt("max_spd", &self.max_spd);
         println!("-- addressing / comms --");
-        fmt("mst_id", self.mst_id);
-        fmt("esc_id", self.esc_id);
-        fmt("can_br", self.can_br);
-        fmt("timeout", self.timeout);
-        fmt("ctrl_mode", self.ctrl_mode);
+        fmt("mst_id", &self.mst_id);
+        fmt("esc_id", &self.esc_id);
+        fmt("can_br", &self.can_br);
+        fmt("timeout", &self.timeout);
+        fmt("ctrl_mode", &self.ctrl_mode);
         println!("-- MIT mapping ranges --");
-        fmt("pmax", self.pmax);
-        fmt("vmax", self.vmax);
-        fmt("tmax", self.tmax);
+        fmt("pmax", &self.pmax);
+        fmt("vmax", &self.vmax);
+        fmt("tmax", &self.tmax);
         println!("-- control loop gains --");
-        fmt("i_bw", self.i_bw);
-        fmt("iq_c1", self.iq_c1);
-        fmt("kp_asr", self.kp_asr);
-        fmt("ki_asr", self.ki_asr);
-        fmt("deta", self.deta);
-        fmt("v_bw", self.v_bw);
-        fmt("vl_c1", self.vl_c1);
-        fmt("kp_apr", self.kp_apr);
-        fmt("ki_apr", self.ki_apr);
+        fmt("i_bw", &self.i_bw);
+        fmt("iq_c1", &self.iq_c1);
+        fmt("kp_asr", &self.kp_asr);
+        fmt("ki_asr", &self.ki_asr);
+        fmt("deta", &self.deta);
+        fmt("v_bw", &self.v_bw);
+        fmt("vl_c1", &self.vl_c1);
+        fmt("kp_apr", &self.kp_apr);
+        fmt("ki_apr", &self.ki_apr);
         println!("-- identified motor constants (read-only) --");
-        fmt("kt_value", self.kt_value);
-        fmt("rs", self.rs);
-        fmt("ls", self.ls);
-        fmt("flux", self.flux);
-        fmt("damp", self.damp);
-        fmt("inertia", self.inertia);
-        fmt("npp", self.npp);
-        fmt("gr", self.gr);
-        fmt("gref", self.gref);
+        fmt("kt_value", &self.kt_value);
+        fmt("rs", &self.rs);
+        fmt("ls", &self.ls);
+        fmt("flux", &self.flux);
+        fmt("damp", &self.damp);
+        fmt("inertia", &self.inertia);
+        fmt("npp", &self.npp);
+        fmt("gr", &self.gr);
+        fmt("gref", &self.gref);
         println!("-- identity / version (read-only) --");
-        fmt("sw_ver", self.sw_ver);
-        fmt("sub_ver", self.sub_ver);
-        fmt("boot_ver", self.boot_ver);
-        fmt("hw_ver", self.hw_ver);
-        fmt("sn", self.sn);
+        fmt("sw_ver", &self.sw_ver);
+        fmt("sub_ver", &self.sub_ver);
+        fmt("boot_ver", &self.boot_ver);
+        fmt("hw_ver", &self.hw_ver);
+        fmt("sn", &self.sn);
     }
 }
 
@@ -867,6 +875,20 @@ fn read_all_regs<B: DamiaoBus>(motor: &mut DamiaoMotor<B>, motor_id: u8) -> AllR
     };
     let i32_reg = |motor: &mut DamiaoMotor<B>, rid: u8, label: &str| match motor.read_register(rid) {
         Ok(r) => Some(r.as_i32()),
+        Err(e) => {
+            eprintln!("  {label} (RID {rid}): <no reply: {e}>");
+            None
+        }
+    };
+    // Version registers hold ASCII on this family (sw_ver -> "5019",
+    // sub_ver -> "5"); boot_ver is byte-packed, so it falls back to hex.
+    // Either way the decimal u32 is meaningless to a reader.
+    let ver_reg = |motor: &mut DamiaoMotor<B>, rid: u8, label: &str| match motor.read_register(rid) {
+        Ok(r) => Some(
+            r.as_ascii_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("0x{:08X}", r.as_i32())),
+        ),
         Err(e) => {
             eprintln!("  {label} (RID {rid}): <no reply: {e}>");
             None
@@ -889,7 +911,7 @@ fn read_all_regs<B: DamiaoBus>(motor: &mut DamiaoMotor<B>, motor_id: u8) -> AllR
         damp: f32_reg(motor, Rid::DAMP, "damp"),
         inertia: f32_reg(motor, Rid::INERTIA, "inertia"),
         hw_ver: i32_reg(motor, Rid::HW_VER, "hw_ver"),
-        sw_ver: i32_reg(motor, Rid::SW_VER, "sw_ver"),
+        sw_ver: ver_reg(motor, Rid::SW_VER, "sw_ver"),
         sn: i32_reg(motor, Rid::SN, "sn"),
         npp: i32_reg(motor, Rid::NPP, "npp"),
         rs: f32_reg(motor, Rid::RS, "rs"),
@@ -911,12 +933,12 @@ fn read_all_regs<B: DamiaoBus>(motor: &mut DamiaoMotor<B>, motor_id: u8) -> AllR
         iq_c1: f32_reg(motor, Rid::IQ_C1, "iq_c1"),
         vl_c1: f32_reg(motor, Rid::VL_C1, "vl_c1"),
         can_br: i32_reg(motor, Rid::CAN_BR, "can_br"),
-        sub_ver: i32_reg(motor, Rid::SUB_VER, "sub_ver"),
+        sub_ver: ver_reg(motor, Rid::SUB_VER, "sub_ver"),
         // The one non-universal register in this block: models on the J3507
         // layout do not document 0x25, so skip it rather than poll an
         // undocumented address and report a spurious timeout.
         boot_ver: if motor.model().has_boot_ver() {
-            i32_reg(motor, Rid::BOOT_VER, "boot_ver")
+            ver_reg(motor, Rid::BOOT_VER, "boot_ver")
         } else {
             None
         },

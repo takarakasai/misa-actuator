@@ -204,11 +204,22 @@ pub enum ModelReg {
     /// `x_off` — output-shaft angle offset. **DM-J10422P only** (`0x36`).
     /// That address carries `m_off` under the J3507 layout instead.
     OutputShaftAngleOffset,
-    /// `p_m` — motor-side position, in rad. Same RID (`0x50`) on every model.
-    /// Computed from the rotor position rather than measured directly.
+    /// `p_m` — **output-shaft** position in rad, *calculated from the rotor
+    /// position*. Same RID (`0x50`) on every model.
+    ///
+    /// Despite the register's name, this is not a motor-side (pre-gearbox)
+    /// angle: the manuals' own note reads "Motor output shaft position is
+    /// calculated from the rotor position". Confirmed on DM-J4310 hardware
+    /// (gear ratio 10:1), where `p_m` = 0.0516 rad against
+    /// [`Self::OutputShaftPosition`]'s 0.0495 rad — near-equal rather than
+    /// differing by the 10× a motor-side reading would show.
     MotorPosition,
-    /// `xout` — output-shaft position, in rad, measured directly by the
+    /// `xout` — output-shaft position in rad, *measured directly* by the
     /// output-shaft encoder. Same RID (`0x51`) on every model.
+    ///
+    /// Same quantity as [`Self::MotorPosition`] but from a different source,
+    /// so comparing the two shows the calculated-vs-measured discrepancy
+    /// (backlash / calibration): 0.0516 vs 0.0495 rad on the bench unit.
     OutputShaftPosition,
 
     /// `Imax` — driver current *limit*. J4310 layout only (`0x3B`).
@@ -369,8 +380,8 @@ impl ModelReg {
             ModelReg::Direction => "direction",
             ModelReg::AngleOffset => "motor-side angle offset",
             ModelReg::OutputShaftAngleOffset => "output shaft angle offset",
-            ModelReg::MotorPosition => "motor position (rad)",
-            ModelReg::OutputShaftPosition => "output shaft position (rad)",
+            ModelReg::MotorPosition => "output shaft position, calculated (rad)",
+            ModelReg::OutputShaftPosition => "output shaft position, measured (rad)",
             ModelReg::DriverCurrentLimit => "driver current limit",
             ModelReg::PhaseCurrentBase => "phase current base peak value",
             ModelReg::BusVoltage => "bus voltage",
@@ -451,6 +462,37 @@ impl RegReply {
     pub fn as_i32(&self) -> i32 {
         i32::from_le_bytes(self.value)
     }
+
+    /// The value bytes as an ASCII string, if every non-padding byte is
+    /// printable ASCII.
+    ///
+    /// The version registers do not carry numbers. Verified against DM-J4310
+    /// hardware: `sw_ver` (RID `0x0E`) read back `0x39313035`, whose bytes are
+    /// `"5019"` in little-endian order, and `sub_ver` (RID `0x24`) read back
+    /// `0x35` = `"5"`. Rendering those as the integers 959524917 and 53 is
+    /// useless to a human, which is what motivated this accessor.
+    ///
+    /// Trailing NUL padding is trimmed (as in `sub_ver`'s single digit).
+    /// Returns `None` when the bytes are not an ASCII string — `boot_ver`
+    /// (RID `0x25`) read back `0x06000203`, which is byte-packed rather than
+    /// ASCII, so it falls through to the numeric accessors.
+    pub fn as_ascii_str(&self) -> Option<&str> {
+        let end = self
+            .value
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.value.len());
+        let bytes = &self.value[..end];
+        if bytes.is_empty() || !bytes.iter().all(|b| b.is_ascii_graphic()) {
+            return None;
+        }
+        // Any byte past the first NUL must also be NUL, otherwise this is not
+        // a NUL-padded string and reading it as one would silently drop data.
+        if self.value[end..].iter().any(|&b| b != 0) {
+            return None;
+        }
+        core::str::from_utf8(bytes).ok()
+    }
 }
 
 /// Parse a register reply payload.
@@ -517,6 +559,34 @@ mod tests {
     fn non_reg_frame_rejected() {
         // A motion-feedback-shaped frame (D2 not a reg cmd) must not parse.
         assert!(parse_reg_reply(&[0x11, 0x00, 0x00, 0x00, 0, 0, 0, 0]).is_none());
+    }
+
+    /// Values captured from DM-J4310 hardware; see `RegReply::as_ascii_str`.
+    #[test]
+    fn version_registers_render_as_ascii_where_the_hardware_uses_it() {
+        let reply = |v: u32| RegReply {
+            can_id: 16,
+            rid: 0,
+            value: v.to_le_bytes(),
+        };
+        // sw_ver = 0x39313035 -> "5019"
+        assert_eq!(reply(0x3931_3035).as_ascii_str(), Some("5019"));
+        // sub_ver = 0x35 -> "5", NUL-padded
+        assert_eq!(reply(0x0000_0035).as_ascii_str(), Some("5"));
+        // boot_ver = 0x06000203 is byte-packed, not ASCII.
+        assert_eq!(reply(0x0600_0203).as_ascii_str(), None);
+        // All-zero carries no string (hw_ver / sn on the bench unit).
+        assert_eq!(reply(0).as_ascii_str(), None);
+        // A NUL in the middle with data after it is not a padded string.
+        assert_eq!(
+            RegReply {
+                can_id: 16,
+                rid: 0,
+                value: [b'1', 0, b'2', 0],
+            }
+            .as_ascii_str(),
+            None
+        );
     }
 
     #[test]

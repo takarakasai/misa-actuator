@@ -61,11 +61,30 @@ fn optional_current<B: RobstrideBus>(motor: &mut Motor<B>) -> f32 {
     }
 }
 
-fn rs_to_misa_feedback(fb: RsFeedback, current_a: f32) -> MisaFeedback {
+/// Torque to report, substituting `current * Kt` when the motor's own reading is
+/// unusable.
+///
+/// Substitution is deliberately narrow: only when a torque constant was
+/// supplied, a current reading exists, and the reported torque is either
+/// non-finite or **exactly** zero. Firmware whose `MeasuredTorque` is broken
+/// returns a hard 0 (see `Motor::set_torque_constant`), while a genuine reading
+/// essentially never lands on 0.0 with current flowing — and when it does, the
+/// substituted value is also ~0, so the swap is harmless. A real non-zero
+/// reading is always preferred over the derived one.
+fn effective_torque(reported_nm: f32, current_a: f32, kt_nm_per_a: Option<f32>) -> f32 {
+    match kt_nm_per_a {
+        Some(kt) if current_a.is_finite() && (!reported_nm.is_finite() || reported_nm == 0.0) => {
+            current_a * kt
+        }
+        _ => reported_nm,
+    }
+}
+
+fn rs_to_misa_feedback(fb: RsFeedback, current_a: f32, kt: Option<f32>) -> MisaFeedback {
     MisaFeedback {
         position_rad: fb.position,
         velocity_rad_per_s: fb.velocity,
-        torque_nm: fb.torque,
+        torque_nm: effective_torque(fb.torque, current_a, kt),
         current_a,
         temperature_c: fb.temperature,
     }
@@ -144,7 +163,7 @@ impl<B: RobstrideBus> Actuator for Motor<B> {
             }
         }
 
-        Ok(rs_to_misa_feedback(fb, f32::NAN))
+        Ok(rs_to_misa_feedback(fb, f32::NAN, None))
     }
 
     fn disable(&mut self) -> MisaResult<()> {
@@ -179,7 +198,8 @@ impl<B: RobstrideBus> Actuator for Motor<B> {
         Motor::set_position_with_speed(self, pos_rad, max_speed_rad_s)?;
         let fb = Motor::measure_safe(self)?;
         let current = optional_current(self);
-        Ok(rs_to_misa_feedback(fb, current))
+        let kt = self.torque_constant();
+        Ok(rs_to_misa_feedback(fb, current, kt))
     }
 
     fn set_velocity(&mut self, vel_rad_s: f32) -> MisaResult<MisaFeedback> {
@@ -187,7 +207,8 @@ impl<B: RobstrideBus> Actuator for Motor<B> {
         Motor::set_velocity(self, vel_rad_s)?;
         let fb = Motor::measure_safe(self)?;
         let current = optional_current(self);
-        Ok(rs_to_misa_feedback(fb, current))
+        let kt = self.torque_constant();
+        Ok(rs_to_misa_feedback(fb, current, kt))
     }
 
     fn set_torque(&mut self, torque_nm: f32) -> MisaResult<MisaFeedback> {
@@ -198,7 +219,8 @@ impl<B: RobstrideBus> Actuator for Motor<B> {
         Motor::set_torque(self, torque_nm)?;
         let fb = Motor::measure_safe(self)?;
         let current = optional_current(self);
-        Ok(rs_to_misa_feedback(fb, current))
+        let kt = self.torque_constant();
+        Ok(rs_to_misa_feedback(fb, current, kt))
     }
 
     fn mit_control(
@@ -218,13 +240,15 @@ impl<B: RobstrideBus> Actuator for Motor<B> {
         let fb =
             Motor::mit_control(self, pos_rad, vel_rad_s, kp_nm_per_rad, kd_nm_per_rad_s, torque_ff_nm)?;
         let current = optional_current(self);
-        Ok(rs_to_misa_feedback(fb, current))
+        let kt = self.torque_constant();
+        Ok(rs_to_misa_feedback(fb, current, kt))
     }
 
     fn measure(&mut self) -> MisaResult<MisaFeedback> {
         let fb = Motor::measure_safe(self)?;
         let current = optional_current(self);
-        Ok(rs_to_misa_feedback(fb, current))
+        let kt = self.torque_constant();
+        Ok(rs_to_misa_feedback(fb, current, kt))
     }
 
     fn read_status(&mut self) -> MisaResult<MotorStatus> {
@@ -273,5 +297,60 @@ impl<B: RobstrideBus> Actuator for Motor<B> {
         let results =
             scan_bus_on(self.bus(), host_id, motor_id..=motor_id, timeout, None)?;
         Ok(results.iter().any(|r| r.motor_id == motor_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_torque;
+
+    /// A real non-zero reading always wins: passing a Kt on healthy firmware
+    /// must not change anything.
+    #[test]
+    fn a_real_torque_reading_is_never_overridden() {
+        assert_eq!(effective_torque(0.86, 0.57, Some(1.5093)), 0.86);
+        assert_eq!(effective_torque(-0.31, -0.21, Some(1.5093)), -0.31);
+    }
+
+    /// The broken-firmware case: a hard 0 with current flowing is replaced by
+    /// `current * Kt`. Numbers from an RS04 Position-mode sample.
+    #[test]
+    fn a_hard_zero_with_current_is_replaced() {
+        let t = effective_torque(0.0, 0.446717, Some(1.5093));
+        assert!((t - 0.446717 * 1.5093).abs() < 1e-6, "got {t}");
+        // Sign is carried through, which is what makes the friction hysteresis
+        // visible at all.
+        assert!(effective_torque(0.0, -0.085677, Some(1.5093)) < 0.0);
+    }
+
+    /// Without a Kt there is nothing to scale by, so the reading stands as-is —
+    /// including a zero.
+    #[test]
+    fn without_a_torque_constant_nothing_is_substituted() {
+        assert_eq!(effective_torque(0.0, 0.45, None), 0.0);
+        assert!(effective_torque(f32::NAN, 0.45, None).is_nan());
+    }
+
+    /// Without a current reading there is nothing to derive from. `--kt` implies
+    /// `--report-current` for this reason, but the guard belongs here too.
+    #[test]
+    fn without_a_current_reading_nothing_is_substituted() {
+        assert_eq!(effective_torque(0.0, f32::NAN, Some(1.5093)), 0.0);
+    }
+
+    /// A non-finite reading is replaced when it can be: NaN torque is worse than
+    /// a derived one.
+    #[test]
+    fn a_non_finite_reading_is_replaced_when_possible() {
+        let t = effective_torque(f32::NAN, 0.2, Some(2.0));
+        assert!((t - 0.4).abs() < 1e-6, "got {t}");
+    }
+
+    /// At genuine rest both sources agree on ~0, so the substitution is harmless
+    /// in the ambiguous case that motivates the "exactly 0.0" trigger.
+    #[test]
+    fn at_rest_the_substitution_is_harmless() {
+        let t = effective_torque(0.0, 0.014557, Some(1.5093));
+        assert!(t.abs() < 0.03, "should stay near zero, got {t}");
     }
 }

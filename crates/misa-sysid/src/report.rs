@@ -40,6 +40,10 @@ pub struct LoadMapReport {
     /// Largest outbound-vs-return torque gap (N·m); about twice the Coulomb
     /// friction. `None` unless a return sweep ran.
     pub peak_hysteresis_nm: Option<f32>,
+    /// Largest peak-to-peak torque swing inside a single dwell (N·m). Of the
+    /// same order as the load figures means the shaft was hunting, so they
+    /// average a limit cycle rather than measuring a steady load.
+    pub worst_dwell_spread_nm: Option<f32>,
     pub abort: Option<AbortReason>,
 }
 
@@ -62,6 +66,7 @@ pub fn run_load_map_to_csv(
         peak_static_load_nm: map.peak_static_load_nm(),
         peak_holding_torque_nm: map.peak_holding_torque_nm(),
         peak_hysteresis_nm: map.peak_hysteresis_nm(),
+        worst_dwell_spread_nm: map.worst_dwell_spread_nm(),
         abort: map.abort,
     })
 }

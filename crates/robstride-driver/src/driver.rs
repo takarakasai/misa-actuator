@@ -39,6 +39,10 @@ pub struct Motor<B: RobstrideBus = SocketCanBus> {
     /// Whether feedback should also carry current, at the cost of one extra
     /// parameter read per sample. See [`Self::set_report_current`].
     report_current: bool,
+    /// Torque constant (N·m/A) used to synthesize torque from current when the
+    /// motor's own `MeasuredTorque` is unusable. See
+    /// [`Self::set_torque_constant`].
+    torque_constant: Option<f32>,
 }
 
 impl Motor<SocketCanBus> {
@@ -80,6 +84,7 @@ impl<B: RobstrideBus> Motor<B> {
             timeout: DEFAULT_TIMEOUT,
             cached_speed_limit: None,
             report_current: false,
+            torque_constant: None,
         }
     }
 
@@ -424,6 +429,42 @@ impl<B: RobstrideBus> Motor<B> {
     /// reporting `NaN`.
     pub fn set_report_current(&mut self, on: bool) {
         self.report_current = on;
+    }
+
+    /// The torque constant in effect (N·m/A), or `None`.
+    pub fn torque_constant(&self) -> Option<f32> {
+        self.torque_constant
+    }
+
+    /// Supply a torque constant (N·m/A) so torque can be synthesized from
+    /// current when the motor does not report it.
+    ///
+    /// Needed because `MeasuredTorque` (`0x302C`) reads a constant 0 on some
+    /// firmware. Measured on an RS04 (AppCodeVersion 0.4.1.32): across three
+    /// runs and 72 samples in Position and Torque mode, feedback torque was 0
+    /// every time, while the MIT path reported real values in 109 of 109. The
+    /// difference is which source the feedback comes from — `measure_safe`
+    /// deliberately avoids sending a MIT frame (it would disturb the active
+    /// control mode) and reads parameters instead, and on that firmware the
+    /// torque parameter is the one that does not work. Suspected to be another
+    /// instance of the parameter-table shift documented in
+    /// `robstride-protocol/doc/param-table-firmware-divergence.md`, though
+    /// `0x302C` sits outside the range that was dumped, so that is unconfirmed.
+    ///
+    /// `IqFilt` (`0x701A`) *does* work on that firmware, including in Position
+    /// mode, so `torque = current * Kt` recovers it. This is the mirror image of
+    /// the DAMIAO driver, which has torque and derives current.
+    ///
+    /// Requires [`Self::set_report_current`] — without a current reading there
+    /// is nothing to scale. Values that are not finite and positive are
+    /// rejected, leaving the constant unset rather than poisoning every reading.
+    ///
+    /// Get the figure from a `characterize kt` sweep (an RS04 measured
+    /// 1.5093 N·m/A) or the datasheet. Kt sags under magnetic saturation and
+    /// drifts with magnet temperature, so it holds within the rated range.
+    pub fn set_torque_constant(&mut self, kt_nm_per_a: f32) {
+        self.torque_constant =
+            (kt_nm_per_a.is_finite() && kt_nm_per_a > 0.0).then_some(kt_nm_per_a);
     }
 
     pub fn read_vbus(&mut self) -> Result<f32> {

@@ -185,6 +185,19 @@ pub fn run_characterize(
             );
             print_opt("mean friction", r.mean_friction_nm, "N·m");
             print_opt("peak static load", r.peak_static_load_nm, "N·m");
+            print_opt("worst dwell spread", r.worst_dwell_spread_nm, "N·m");
+            // A dwell that swings as much as the load itself was not holding
+            // still; the point is the mean of a limit cycle.
+            if let (Some(spread), Some(peak)) = (r.worst_dwell_spread_nm, r.peak_holding_torque_nm) {
+                if peak > 0.0 && spread >= peak {
+                    println!(
+                        "  note: a dwell swung {spread:.4} N·m against a peak holding torque of \
+                         {peak:.4} — the shaft was hunting, not settling, so treat the load \
+                         figures as averages of that oscillation (try a lower position gain or a \
+                         longer --settle)"
+                    );
+                }
+            }
             if let (Some(load), Some(fric)) = (r.peak_static_load_nm, r.mean_friction_nm) {
                 if load < fric {
                     println!(

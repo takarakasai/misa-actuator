@@ -117,7 +117,15 @@ fn damiao_details<B: DamiaoBus>(mut motor: DamiaoMotor<B>, timeout: Duration) ->
     let _ = motor.set_timeout(timeout);
     Details {
         model: None,
-        fw_version: motor.read_register(DmRid::SW_VER).ok().map(|r| r.as_i32().to_string()),
+        // `sw_ver` holds ASCII, not a number — a DM-J4310 returns 0x39313035,
+        // i.e. "5019". Printing the u32 (959524917) tells a human nothing,
+        // which is the whole point of this tool, so prefer the string form and
+        // fall back to hex only if the bytes are not ASCII.
+        fw_version: motor.read_register(DmRid::SW_VER).ok().map(|r| {
+            r.as_ascii_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("0x{:08X}", r.as_i32()))
+        }),
     }
 }
 

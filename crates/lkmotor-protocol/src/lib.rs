@@ -28,12 +28,17 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+pub mod broadcast;
 pub mod command;
 pub mod frame;
 pub mod request;
 pub mod response;
 
-pub use command::{Command, ControlParamId};
+pub use broadcast::{
+    BROADCAST_FRAME_LEN, BROADCAST_HEAD, BroadcastCommand, encode_broadcast_hybrid,
+    encode_broadcast_values,
+};
+pub use command::{Command, ControlParamId, SettingParamId};
 pub use frame::{
     DecodeError, EncodeError, Frame, HEADER, HEADER_SIZE, MAX_DATA, MAX_FRAME, encode,
     encoded_size, try_decode,

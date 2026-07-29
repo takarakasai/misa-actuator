@@ -62,11 +62,33 @@ pub enum Command {
     PositionClosedLoop3 = 0xA5,
     /// Closed-loop position control 4 (single-turn with direction and speed limit).
     PositionClosedLoop4 = 0xA6,
+    /// Incremental position control 1 (relative move, direction from sign).
+    IncrementalPosition1 = 0xA7,
+    /// Incremental position control 2 (relative move with speed limit).
+    IncrementalPosition2 = 0xA8,
 
     /// Read a control parameter (PID / limit / ramp). Param ID in `DATA[0]`.
     ReadControlParam = 0xC0,
     /// Write a control parameter to RAM (lost on power cycle).
     WriteControlParamRam = 0xC1,
+
+    /// Read a setting parameter — a *different* parameter space from
+    /// `ReadControlParam` (see [`SettingParamId`]'s doc comment for why the
+    /// two must not be confused despite overlapping numeric sub-IDs).
+    ReadSettingParam = 0x40,
+    /// Write a setting parameter to RAM. Must be followed by
+    /// [`Command::SaveSettingParam`] for the change to survive a power
+    /// cycle (per the manual: "the Save setting parameters command must be
+    /// sent before the data is written into ROM").
+    WriteSettingParam = 0x42,
+    /// Commit all `WriteSettingParam` RAM writes to ROM. Takes effect after
+    /// a restart ([`Command::MotorRestart`]) or power cycle.
+    SaveSettingParam = 0x44,
+    /// Restart the motor (equivalent to a power cycle). No reply is sent.
+    MotorRestart = 0x07,
+
+    /// Engage/release the brake, or read its current state.
+    BrakeControl = 0x8C,
 }
 
 /// `DATA[0]` selector for `ReadControlParam` (`0xC0`) / `WriteControlParamRam` (`0xC1`).
@@ -95,6 +117,60 @@ pub enum ControlParamId {
 }
 
 impl ControlParamId {
+    /// Wire byte for this parameter selector.
+    #[inline]
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+}
+
+/// `DATA[1]` selector for `ReadSettingParam` (`0x40`) / `WriteSettingParam`
+/// (`0x42`) — the "One Parameter Command" sub-format ("Setting Parameter
+/// Table" in the manual). Every request/reply for this sub-format carries a
+/// **fixed marker byte `0x05` at `DATA[0]`** before this selector — see
+/// [`crate::request::encode_read_setting_param`].
+///
+/// **Do not confuse this with [`ControlParamId`]**: several numeric values
+/// coincide (`0x0A`/`0x0B`/`0x0C` mean Driver ID/Bus Type/RS485 Baudrate
+/// here, but Position/Speed/Current-loop PID under `ReadControlParam`) — the
+/// two are disambiguated only by which command byte wraps them
+/// (`0x40`/`0x42` vs `0xC0`/`0xC1`). This is a genuine quirk of the official
+/// manual (`ref/can_protocol_en.md`/`rs485_protocol_en.md`), not a
+/// transcription error.
+///
+/// The manual's "Multiple Parameter Command" sub-format (Position/Speed/
+/// Current Loop PID persisted via this same Setting/ROM path, sub-IDs
+/// `0xA0`/`0xA4`/`0xA8`) is **not implemented** — those gains are already
+/// readable via [`ControlParamId`]; only the ROM-persistence path for them
+/// is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SettingParamId {
+    /// Driver ID (`u8`, 0..=32).
+    DriverId = 0x0A,
+    /// Bus type (`u8`): `0`=None, `1`=RS485, `2`=CAN.
+    BusType = 0x0B,
+    /// RS485 baud rate code (`u8`, 0..=10 — see the manual's baud-rate table).
+    Rs485Baudrate = 0x0C,
+    /// CAN baud rate code (`u8`, 0..=4 — see the manual's baud-rate table).
+    CanBaudrate = 0x0D,
+    /// Max power (`i16`). Range 0..=850 (MS) or 0..=2000 (MF/MHF/MG).
+    MaxPower = 0xE0,
+    /// Max speed (`i32`, 0.01 deg/s units, 0..=600000).
+    MaxSpeed = 0xE2,
+    /// Max angle (`i32`, 0.01 deg units).
+    MaxAngle = 0xE4,
+    /// Current ramp (`i16`, 0..=30000). **Note**: the manual declares this
+    /// `int16` here but `int32` under the same name/range in
+    /// [`ControlParamId::CurrentRamp`] — a discrepancy in the source
+    /// document itself (see `doc/can-rs485-manual-analysis.md`), kept as
+    /// printed rather than silently reconciled.
+    CurrentRamp = 0xEA,
+    /// Speed ramp (`i32`, 1 dps/s units, 0..=600000).
+    SpeedRamp = 0xEC,
+}
+
+impl SettingParamId {
     /// Wire byte for this parameter selector.
     #[inline]
     pub const fn code(self) -> u8 {

@@ -372,6 +372,11 @@ mod tests {
                 data: vec![0u8; len],
             })
         }
+        fn send_only(&mut self, command: u8, motor_id: MotorId, data: &[u8]) -> LkResult<()> {
+            self.sent.push((command, motor_id.get(), data.to_vec()));
+            Ok(())
+        }
+
         fn flush_rx(&mut self) -> LkResult<()> {
             Ok(())
         }

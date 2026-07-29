@@ -5,7 +5,7 @@
 //! Verify scaling against your firmware manual before relying on the SI
 //! conversions — they follow the widely published V3 protocol.
 
-use crate::command::{Command, ControlParamId};
+use crate::command::{Command, ControlParamId, SettingParamId};
 
 /// Errors returned from the response parsers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +16,9 @@ pub enum ParseError {
     CommandMismatch { expected: u8, found: u8 },
     /// Response `paramID` does not match the one we asked for.
     ParamIdMismatch { expected: u8, found: u8 },
+    /// A field held a value outside its documented set (e.g. a brake-state
+    /// byte that is neither `0x00` nor `0x01`).
+    UnexpectedValue { field: &'static str, found: u8 },
 }
 
 /// Decoded payload of a `0x9A` "motor state 1" response.
@@ -194,6 +197,102 @@ pub fn parse_control_param(
     })
 }
 
+/// Parsed value of a `ReadSettingParam`/`WriteSettingParam` (`0x40`/`0x42`)
+/// response. Variant is selected by the [`SettingParamId`] echoed in
+/// `DATA[1]` (after the fixed `0x05` marker in `DATA[0]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingParamValue {
+    /// [`SettingParamId::DriverId`] (`u8`, 0..=32).
+    DriverId(u8),
+    /// [`SettingParamId::BusType`] (`u8`: 0=None, 1=RS485, 2=CAN).
+    BusType(u8),
+    /// [`SettingParamId::Rs485Baudrate`] (`u8` code, see the manual's table).
+    Rs485Baudrate(u8),
+    /// [`SettingParamId::CanBaudrate`] (`u8` code, see the manual's table).
+    CanBaudrate(u8),
+    /// [`SettingParamId::MaxPower`].
+    MaxPower(i16),
+    /// [`SettingParamId::MaxSpeed`], 0.01 deg/s units.
+    MaxSpeed(i32),
+    /// [`SettingParamId::MaxAngle`], 0.01 deg units.
+    MaxAngle(i32),
+    /// [`SettingParamId::CurrentRamp`].
+    CurrentRamp(i16),
+    /// [`SettingParamId::SpeedRamp`], 1 dps/s units.
+    SpeedRamp(i32),
+}
+
+/// Parse the payload of a `ReadSettingParam`/`WriteSettingParam` reply
+/// (`0x40`/`0x42` — both share the identical reply layout, so `command`
+/// must be one or the other).
+///
+/// `expected` is the param ID we asked for — used to validate the echoed
+/// selector and to pick the correct decoding for `data[2..7]`.
+pub fn parse_setting_param(
+    command: u8,
+    data: &[u8],
+    expected: SettingParamId,
+) -> Result<SettingParamValue, ParseError> {
+    if command != Command::ReadSettingParam.code() && command != Command::WriteSettingParam.code()
+    {
+        return Err(ParseError::CommandMismatch {
+            expected: Command::ReadSettingParam.code(),
+            found: command,
+        });
+    }
+    expect_len(data, 7)?;
+    if data[0] != 0x05 {
+        return Err(ParseError::ParamIdMismatch {
+            expected: 0x05,
+            found: data[0],
+        });
+    }
+    if data[1] != expected.code() {
+        return Err(ParseError::ParamIdMismatch {
+            expected: expected.code(),
+            found: data[1],
+        });
+    }
+    let v = &data[2..7];
+    Ok(match expected {
+        SettingParamId::DriverId => SettingParamValue::DriverId(v[0]),
+        SettingParamId::BusType => SettingParamValue::BusType(v[0]),
+        SettingParamId::Rs485Baudrate => SettingParamValue::Rs485Baudrate(v[0]),
+        SettingParamId::CanBaudrate => SettingParamValue::CanBaudrate(v[0]),
+        SettingParamId::MaxPower => SettingParamValue::MaxPower(i16::from_le_bytes([v[0], v[1]])),
+        SettingParamId::MaxSpeed => {
+            SettingParamValue::MaxSpeed(i32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+        }
+        SettingParamId::MaxAngle => {
+            SettingParamValue::MaxAngle(i32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+        }
+        SettingParamId::CurrentRamp => {
+            SettingParamValue::CurrentRamp(i16::from_le_bytes([v[0], v[1]]))
+        }
+        SettingParamId::SpeedRamp => {
+            SettingParamValue::SpeedRamp(i32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+        }
+    })
+}
+
+/// Parse the payload of a `BrakeControl` (`0x8C`) reply. Returns `true` if
+/// the brake is released (free), `false` if engaged (holding).
+///
+/// Only accepts the reply's two documented states (`0x00`/`0x01`) — the
+/// request-only read-marker byte (`0x10`) is not a valid reply value.
+pub fn parse_brake_state(command: u8, data: &[u8]) -> Result<bool, ParseError> {
+    expect_cmd(Command::BrakeControl, command)?;
+    expect_len(data, 7)?;
+    match data[0] {
+        0x00 => Ok(false),
+        0x01 => Ok(true),
+        found => Err(ParseError::UnexpectedValue {
+            field: "brake_state",
+            found,
+        }),
+    }
+}
+
 #[inline]
 fn expect_cmd(expected: Command, found: u8) -> Result<(), ParseError> {
     if expected.code() == found {
@@ -307,5 +406,91 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ParseError::ParamIdMismatch { .. }));
+    }
+
+    #[test]
+    fn setting_param_driver_id_parses() {
+        // 0x05 marker, 0x0A=DriverId, value=7
+        let payload = [0x05, 0x0A, 7, 0, 0, 0, 0];
+        let v = parse_setting_param(
+            Command::ReadSettingParam.code(),
+            &payload,
+            SettingParamId::DriverId,
+        )
+        .unwrap();
+        assert_eq!(v, SettingParamValue::DriverId(7));
+    }
+
+    #[test]
+    fn setting_param_max_speed_parses_and_accepts_write_reply_command() {
+        // 0x05 marker, 0xE2=MaxSpeed, value=360000
+        let mut payload = [0x05u8, 0xE2, 0, 0, 0, 0, 0];
+        payload[2..6].copy_from_slice(&360_000i32.to_le_bytes());
+        let v = parse_setting_param(
+            Command::WriteSettingParam.code(),
+            &payload,
+            SettingParamId::MaxSpeed,
+        )
+        .unwrap();
+        assert_eq!(v, SettingParamValue::MaxSpeed(360_000));
+    }
+
+    #[test]
+    fn setting_param_rejects_wrong_marker_byte() {
+        let payload = [0x00, 0x0A, 7, 0, 0, 0, 0];
+        let err = parse_setting_param(
+            Command::ReadSettingParam.code(),
+            &payload,
+            SettingParamId::DriverId,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ParseError::ParamIdMismatch { .. }));
+    }
+
+    #[test]
+    fn setting_param_rejects_id_mismatch() {
+        let payload = [0x05, 0x0B, 0, 0, 0, 0, 0];
+        let err = parse_setting_param(
+            Command::ReadSettingParam.code(),
+            &payload,
+            SettingParamId::DriverId,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ParseError::ParamIdMismatch { .. }));
+    }
+
+    #[test]
+    fn setting_param_rejects_unrelated_command() {
+        let payload = [0x05, 0x0A, 7, 0, 0, 0, 0];
+        let err = parse_setting_param(
+            Command::ReadControlParam.code(),
+            &payload,
+            SettingParamId::DriverId,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ParseError::CommandMismatch { .. }));
+    }
+
+    #[test]
+    fn brake_state_parses_released_and_engaged() {
+        let released = parse_brake_state(Command::BrakeControl.code(), &[0x01, 0, 0, 0, 0, 0, 0])
+            .unwrap();
+        assert!(released);
+        let engaged = parse_brake_state(Command::BrakeControl.code(), &[0x00, 0, 0, 0, 0, 0, 0])
+            .unwrap();
+        assert!(!engaged);
+    }
+
+    #[test]
+    fn brake_state_rejects_read_marker_in_reply() {
+        let err = parse_brake_state(Command::BrakeControl.code(), &[0x10, 0, 0, 0, 0, 0, 0])
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ParseError::UnexpectedValue {
+                field: "brake_state",
+                found: 0x10
+            }
+        );
     }
 }

@@ -9,6 +9,9 @@
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
+use lkmotor_protocol::broadcast::{
+    BROADCAST_FRAME_LEN, BroadcastCommand, encode_broadcast_hybrid, encode_broadcast_values,
+};
 use lkmotor_protocol::frame::{DecodeError, MAX_FRAME, try_decode};
 
 use crate::bus::{LkBus, Response};
@@ -192,11 +195,142 @@ impl Rs485Driver {
         }
         Ok(())
     }
+
+    /// Send an already-encoded broadcast frame (see
+    /// [`lkmotor_protocol::broadcast`]) raw on the wire, back-to-back with
+    /// no gaps, as broadcast mode requires (the motor uses bus-idle time to
+    /// find frame boundaries).
+    fn send_broadcast_raw(&mut self, frame: &[u8]) -> Result<()> {
+        self.port.write_all(frame)?;
+        self.port.flush()?;
+        log::debug!("lkmotor broadcast TX: {} bytes", frame.len());
+        Ok(())
+    }
+
+    /// Collect up to `max_replies` broadcast-mode replies — ordinary
+    /// single-motor frames, arriving one per responding motor in ascending
+    /// ID order. Each reply gets its own `response_timeout` window; the
+    /// method returns early with whatever was collected once a window
+    /// elapses with nothing new, since a broadcast group need not have all
+    /// 4 IDs populated.
+    fn recv_broadcast_replies(&mut self, max_replies: usize) -> Result<Vec<Response>> {
+        let mut replies = Vec::with_capacity(max_replies);
+        let mut scratch = [0u8; 64];
+        while replies.len() < max_replies {
+            let deadline = Instant::now() + self.response_timeout;
+            let mut got_one = false;
+            loop {
+                match try_decode(&self.rx_buf) {
+                    Ok((frame, used)) => {
+                        let resp = Response {
+                            command: frame.command,
+                            motor_id: frame.motor_id,
+                            data: frame.data.to_vec(),
+                        };
+                        self.rx_buf.drain(..used);
+                        replies.push(resp);
+                        got_one = true;
+                        break;
+                    }
+                    Err(DecodeError::NeedMore { .. }) => {}
+                    Err(_) => {
+                        if !self.rx_buf.is_empty() {
+                            self.rx_buf.remove(0);
+                        }
+                        continue;
+                    }
+                }
+
+                if Instant::now() >= deadline {
+                    break;
+                }
+
+                match self.port.read(&mut scratch) {
+                    Ok(0) => {}
+                    Ok(n) => self.rx_buf.extend_from_slice(&scratch[..n]),
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::TimedOut
+                            || e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if !got_one {
+                break;
+            }
+        }
+        Ok(replies)
+    }
+
+    /// Send a frame and collect its broadcast-mode replies in one call.
+    fn broadcast_transact(&mut self, frame: &[u8], max_replies: usize) -> Result<Vec<Response>> {
+        self.send_broadcast_raw(frame)?;
+        self.recv_broadcast_replies(max_replies)
+    }
+
+    /// Broadcast torque/open-loop control to up to 4 motors in one frame
+    /// (`0x80`). `torque_raw[i]` is the signed raw torque-current value for
+    /// motor `i+1` (range -2000..=2000 MF/MG, -850..=850 MS) — `0` for a
+    /// motor that should not be commanded (broadcast mode always drives
+    /// every listed slot; there is no "leave unchanged" value).
+    /// `max_replies` bounds how many single-motor replies to wait for.
+    pub fn broadcast_torque(
+        &mut self,
+        torque_raw: [i16; 4],
+        max_replies: usize,
+    ) -> Result<Vec<Response>> {
+        let mut buf = [0u8; BROADCAST_FRAME_LEN];
+        let n = encode_broadcast_values(BroadcastCommand::Torque, torque_raw, &mut buf)?;
+        self.broadcast_transact(&buf[..n], max_replies)
+    }
+
+    /// Broadcast speed control to up to 4 motors in one frame (`0x81`).
+    /// `speed_dps[i]` is dps for motor `i+1`; `0` to leave a slot uncommanded
+    /// away from zero (see [`Self::broadcast_torque`]'s caveat).
+    pub fn broadcast_speed(
+        &mut self,
+        speed_dps: [i16; 4],
+        max_replies: usize,
+    ) -> Result<Vec<Response>> {
+        let mut buf = [0u8; BROADCAST_FRAME_LEN];
+        let n = encode_broadcast_values(BroadcastCommand::Speed, speed_dps, &mut buf)?;
+        self.broadcast_transact(&buf[..n], max_replies)
+    }
+
+    /// Broadcast absolute position control to up to 4 motors in one frame
+    /// (`0x82`). `angle_centideg[i]` is `0.01 deg/LSB` for motor `i+1`,
+    /// clamped to the wire field's `i16` range (`±327.67°`).
+    pub fn broadcast_position(
+        &mut self,
+        angle_centideg: [i16; 4],
+        max_replies: usize,
+    ) -> Result<Vec<Response>> {
+        let mut buf = [0u8; BROADCAST_FRAME_LEN];
+        let n = encode_broadcast_values(BroadcastCommand::Position, angle_centideg, &mut buf)?;
+        self.broadcast_transact(&buf[..n], max_replies)
+    }
+
+    /// Broadcast a distinct single-motor command byte per motor slot
+    /// (`0x88`) — e.g. read state1/state2, on/off/stop (see
+    /// [`lkmotor_protocol::broadcast::BroadcastCommand::Hybrid`]'s doc for
+    /// the supported `motorCmd` bytes). `0x00` for an unused slot.
+    pub fn broadcast_hybrid(
+        &mut self,
+        motor_cmds: [u8; 4],
+        max_replies: usize,
+    ) -> Result<Vec<Response>> {
+        let mut buf = [0u8; BROADCAST_FRAME_LEN];
+        let n = encode_broadcast_hybrid(motor_cmds, &mut buf)?;
+        self.broadcast_transact(&buf[..n], max_replies)
+    }
 }
 
 impl LkBus for Rs485Driver {
     fn transact(&mut self, command: u8, motor_id: MotorId, data: &[u8]) -> Result<Response> {
         Rs485Driver::transact(self, command, motor_id, data)
+    }
+
+    fn send_only(&mut self, command: u8, motor_id: MotorId, data: &[u8]) -> Result<()> {
+        Rs485Driver::send_raw(self, command, motor_id, data)
     }
 
     fn flush_rx(&mut self) -> Result<()> {

@@ -32,6 +32,7 @@ pub mod motor;
 pub mod motor_id;
 
 pub use bus::{LkBus, LkCommands, Response, parse_state2_from_response};
+pub use lkmotor_protocol::SettingParamId;
 pub use driver::Rs485Driver;
 pub use error::{Error, Result};
 pub use lk_motor::{LkMotor, PositionAnchor};

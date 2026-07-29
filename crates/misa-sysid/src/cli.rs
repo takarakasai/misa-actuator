@@ -171,7 +171,7 @@ pub fn run_characterize(
                 ..LoadMapSpec::symmetric(*span, *steps)
             };
             println!("load map: ±{span} rad, {steps} steps/pass, {settle}s dwell ...");
-            let r = run_load_map_to_csv(act, &spec, limits, &abort, &mut csv)?;
+            let r = run_load_map_to_csv(act, &spec, limits, &abort, &mut csv, true)?;
             println!("  points measured        : {}", r.n_points);
             print_opt("peak holding torque", r.peak_holding_torque_nm, "N·m");
             // The raw and friction-compensated views answer different
@@ -215,7 +215,7 @@ pub fn run_characterize(
                 vec![first]
             };
             let mut results = Vec::new();
-            for d in dirs {
+            for (i, d) in dirs.into_iter().enumerate() {
                 let spec = BreakawaySpec {
                     ramp_nm_per_s: *ramp,
                     max_torque_nm: *ceiling,
@@ -225,7 +225,7 @@ pub fn run_characterize(
                     ..BreakawaySpec::slow(*ceiling, d)
                 };
                 println!("breakaway {d:?}: ramping at {ramp} N·m/s up to {ceiling} N·m ...");
-                let r = run_breakaway_to_csv(act, &spec, limits, &abort, &mut csv)?;
+                let r = run_breakaway_to_csv(act, &spec, limits, &abort, &mut csv, i == 0)?;
                 match r.breakaway_torque_nm {
                     Some(t) => println!("  breakaway torque       : {t:+.4} N·m"),
                     None => println!(
@@ -281,19 +281,38 @@ pub fn run_characterize(
                      must be mechanically restrained ..."
                 );
             }
-            let r = run_thermal_to_csv(act, &spec, limits, &abort, &mut csv)?;
+            let r = run_thermal_to_csv(act, &spec, limits, &abort, &mut csv, true)?;
             println!("  samples                : {}", r.n_points);
             print_opt("mean torque delivered", r.mean_torque_nm, "N·m");
             match r.rise_rate_c_per_s {
                 Some(rate) => println!("  temperature rise rate  : {rate:+.3} °C/s"),
                 None => println!("  temperature rise rate  : <not reported by this driver>"),
             }
-            match r.seconds_to_limit {
-                Some(s) => println!(
+            // A leash-cancelled hold produces almost no torque, so any thermal
+            // conclusion drawn from it would be about a torque the motor never
+            // delivered. Say so instead of implying a rating.
+            let delivered_ok = r.delivered_fraction.is_none_or(|f| f >= 0.5);
+            print_opt("delivered fraction", r.delivered_fraction, "of command");
+            match (r.seconds_to_limit, delivered_ok) {
+                (_, false) => println!(
+                    "  time to limit          : not computed — the motor delivered only {:.0}% of \
+                     the commanded torque, so this run says nothing about its thermal limit",
+                    r.delivered_fraction.unwrap_or(0.0) * 100.0
+                ),
+                (Some(s), true) => println!(
                     "  time to {:.0} °C          : {s:.1} s at this torque",
                     limits.max_temperature_c
                 ),
-                None => println!("  time to limit          : not warming — sustainable"),
+                (None, true) => {
+                    println!("  time to limit          : not warming at this torque")
+                }
+            }
+            if !delivered_ok {
+                eprintln!(
+                    "  WARNING: the shaft was free enough that the leash cancelled the \
+                     feed-forward. A fixed-torque thermal test needs the output shaft \
+                     mechanically restrained."
+                );
             }
             report_abort(r.abort);
         }
@@ -313,7 +332,7 @@ pub fn run_characterize(
                 ..KtSpec::bipolar(*amplitude)
             };
             println!("Kt sweep: ±{amplitude} N·m in {steps} levels, {settle}s dwell ...");
-            let r = run_kt_to_csv(act, &spec, limits, &abort, &mut csv)?;
+            let r = run_kt_to_csv(act, &spec, limits, &abort, &mut csv, true)?;
             println!("  levels measured        : {}", r.n_points);
             match r.kt_nm_per_a {
                 Some(kt) => {

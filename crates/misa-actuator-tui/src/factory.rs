@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use misa_actuator::Actuator;
+use serde::Deserialize;
 
 use damiao_driver::{DamiaoMotor, MotorModel as DmModel};
 use lkmotor_driver::{LkMotor, MotorConfig as LkMotorConfig, MotorId as LkMotorId};
@@ -19,7 +20,8 @@ use robstride_driver::{Motor as RsMotor, MotorModel};
 /// DAMIAO driver treats this sentinel as "use the DAMIAO default model".
 const DEFAULT_ROBSTRIDE_MODEL: &str = "Edulite05";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DriverKind {
     /// Robstride CAN motor on a SocketCAN interface (Linux).
     Robstride,
@@ -33,7 +35,8 @@ pub enum DriverKind {
 
 /// Physical CAN layer for the DAMIAO driver. Classic CAN and CAN-FD carry the
 /// identical DAMIAO payload; this only selects the socket type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum BusKind {
     /// Classic CAN (1 Mbps).
     Can,
@@ -124,10 +127,14 @@ pub fn build_actuator(cfg: &DriverConfig) -> Result<Box<dyn Actuator + Send>> {
             let model = match DmModel::from_name(&cfg.model) {
                 Some(m) => m,
                 None if cfg.model == DEFAULT_ROBSTRIDE_MODEL => DmModel::Dm4310,
-                None => bail!(
-                    "unknown DAMIAO motor model: {} (try --model DM4310)",
-                    cfg.model
-                ),
+                None => {
+                    let known: Vec<&str> = DmModel::ALL.iter().map(|m| m.name()).collect();
+                    bail!(
+                        "unknown DAMIAO motor model: {} (known: {})",
+                        cfg.model,
+                        known.join(", ")
+                    )
+                }
             };
             // Classic CAN and CAN-FD share the DAMIAO protocol; only the socket
             // type differs. Both yield a `DamiaoMotor<B>` that implements

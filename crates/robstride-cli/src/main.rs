@@ -10,6 +10,7 @@
 //! robstride-cli -i can0 -m 1 mit --pos 0.0 --vel 0.0 --kp 50 --kd 1.0
 //! ```
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -187,6 +188,20 @@ enum Command {
         /// Overall read timeout (ms).
         #[arg(long, default_value_t = 500)]
         timeout_ms: u64,
+    },
+    /// Read every known motor-resident setting in one pass: the documented
+    /// classic ParamIndex space (0x7xxx) plus the undocumented bulk
+    /// parameter table (comm_type 19, same data as `param-table`).
+    Params {
+        /// Overall read timeout for the bulk table (ms).
+        #[arg(long, default_value_t = 500)]
+        timeout_ms: u64,
+        /// Also emit a TOML dump to stdout (or to --out if given).
+        #[arg(long)]
+        toml: bool,
+        /// Write the TOML dump to this file (implies --toml).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Passively listen on the bus and print every frame.
     Dump {
@@ -595,6 +610,20 @@ fn run(cli: Cli) -> Result<()> {
         Command::ParamTable { timeout_ms } => {
             let mut motor = open_motor(&cli)?;
             param_commands::run_param_table(&mut motor, *timeout_ms)?;
+        }
+        Command::Params {
+            timeout_ms,
+            toml,
+            out,
+        } => {
+            let mut motor = open_motor(&cli)?;
+            param_commands::run_params(
+                &mut motor,
+                cli.motor_id,
+                *timeout_ms,
+                *toml,
+                out.as_deref(),
+            )?;
         }
         Command::Dump { duration } => {
             let frames = dump_bus(&cli.interface, Duration::from_secs_f32(*duration))?;

@@ -91,7 +91,13 @@ enum Command {
     },
     /// Enable the motor (required before motion).
     Enable,
-    /// Disable the motor (coast).
+    /// De-energize the motor (coast) — not a latching safe state
+    ///
+    /// The next control frame re-energizes the motor, so this does not make it
+    /// ignore commands: verified on a DM-J4310, a `mit --kp 5` right after
+    /// `disable` produced 1.013 N·m. `status` also sends a zero-gain MIT frame,
+    /// which is why it still reports `err=Enabled` afterwards (at zero gains it
+    /// produces no torque). Cut power for a state the motor will hold.
     Disable,
     /// Zero the current position. By default an in-memory *soft* zero (briefly
     /// enables the motor to read position); pass --nvm to persist to flash.
@@ -102,7 +108,12 @@ enum Command {
     },
     /// Clear a latched error (or just toggle disable→enable).
     ClearError,
-    /// One status read (re-issues the last command / a zero MIT frame).
+    /// One status read (re-issues the last command / a zero MIT frame)
+    ///
+    /// Note this sends a control frame, so it re-energizes a motor that was
+    /// just disabled and will report `err=Enabled`. Harmless — the frame
+    /// carries zero gains and zero torque — but it means `status` is not a
+    /// passive observer. See `disable`.
     Status,
     /// MIT impedance control. Holds for `--duration` seconds (Ctrl-C to stop).
     Mit {

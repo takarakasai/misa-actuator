@@ -752,6 +752,16 @@ pub struct KtSpec {
     pub settle_s: f32,
     /// Command rate while dwelling (Hz).
     pub rate_hz: f32,
+    /// Position "leash" stiffness (N·m/rad) holding the shaft near where it
+    /// started. `0.0` commands open-loop torque.
+    ///
+    /// Same requirement as [`ThermalSpec::leash_kp`], for the same reason: a
+    /// free shaft cannot be held at a torque level long enough to read a
+    /// steady-state current. On an RS04 an open-loop -1.5 N·m level left the
+    /// +/-0.2 rad window after a single sample.
+    pub leash_kp: f32,
+    /// Leash damping (N·m·s/rad). Pairs with [`Self::leash_kp`].
+    pub leash_kd: f32,
 }
 
 impl KtSpec {
@@ -762,6 +772,8 @@ impl KtSpec {
             steps: 9,
             settle_s: 0.4,
             rate_hz: 100.0,
+            leash_kp: 8.0,
+            leash_kd: 0.5,
         }
     }
 
@@ -849,7 +861,12 @@ pub fn run_kt(
     limits: SafetyLimits,
     abort: &AtomicBool,
 ) -> Result<KtSweep> {
-    act.set_run_mode(RunMode::Torque)?;
+    let leashed = spec.leash_kp > 0.0 || spec.leash_kd > 0.0;
+    act.set_run_mode(if leashed {
+        RunMode::Mit
+    } else {
+        RunMode::Torque
+    })?;
     let start = act.enable()?.position_rad;
     let mut guard = Guard::new(limits, start);
 
@@ -857,6 +874,15 @@ pub fn run_kt(
     let mut points = Vec::new();
     let mut stop = None;
     let t0 = Instant::now();
+    // Hold near `start` while each level is applied; an unleashed shaft simply
+    // accelerates away and no level ever reaches steady state.
+    let drive = |act: &mut dyn Actuator, level: f32| -> Result<MotorFeedback> {
+        if leashed {
+            act.mit_control(start, 0.0, spec.leash_kp, spec.leash_kd, level)
+        } else {
+            act.set_torque(level)
+        }
+    };
 
     for level in spec.levels() {
         if abort.load(Ordering::Relaxed) {
@@ -865,13 +891,13 @@ pub fn run_kt(
         }
         let dwell_start = Instant::now();
         let settle = Duration::from_secs_f32(spec.settle_s.max(0.0));
-        let mut fb = act.set_torque(level)?;
+        let mut fb = drive(act, level)?;
         while dwell_start.elapsed() < settle {
             if abort.load(Ordering::Relaxed) {
                 stop = Some(AbortReason::Cancelled);
                 break;
             }
-            fb = act.set_torque(level)?;
+            fb = drive(act, level)?;
             if let Some(r) = guard.check(t0.elapsed().as_secs_f32(), &fb) {
                 stop = Some(r);
                 break;

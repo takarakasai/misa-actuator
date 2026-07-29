@@ -50,6 +50,17 @@ use crate::scan::scan_bus_on;
 /// that a freshly-enabled motor doesn't run away at maximum speed.
 const POSITION_DEFAULT_LIMIT_SPD: f32 = 5.0;
 
+/// Fetch current only when the caller opted in, since it costs an extra bus
+/// round-trip. `NaN` otherwise — RobStride's feedback frame has no current
+/// field, so reporting a zero would be a fabrication.
+fn optional_current<B: RobstrideBus>(motor: &mut Motor<B>) -> f32 {
+    if motor.reports_current() {
+        Motor::read_current(motor).unwrap_or(f32::NAN)
+    } else {
+        f32::NAN
+    }
+}
+
 fn rs_to_misa_feedback(fb: RsFeedback, current_a: f32) -> MisaFeedback {
     MisaFeedback {
         position_rad: fb.position,
@@ -166,13 +177,17 @@ impl<B: RobstrideBus> Actuator for Motor<B> {
     fn set_position(&mut self, pos_rad: f32, max_speed_rad_s: f32) -> MisaResult<MisaFeedback> {
         require_mode(self, RunMode::Position, "set_position")?;
         Motor::set_position_with_speed(self, pos_rad, max_speed_rad_s)?;
-        Ok(rs_to_misa_feedback(Motor::measure_safe(self)?, f32::NAN))
+        let fb = Motor::measure_safe(self)?;
+        let current = optional_current(self);
+        Ok(rs_to_misa_feedback(fb, current))
     }
 
     fn set_velocity(&mut self, vel_rad_s: f32) -> MisaResult<MisaFeedback> {
         require_mode(self, RunMode::Velocity, "set_velocity")?;
         Motor::set_velocity(self, vel_rad_s)?;
-        Ok(rs_to_misa_feedback(Motor::measure_safe(self)?, f32::NAN))
+        let fb = Motor::measure_safe(self)?;
+        let current = optional_current(self);
+        Ok(rs_to_misa_feedback(fb, current))
     }
 
     fn set_torque(&mut self, torque_nm: f32) -> MisaResult<MisaFeedback> {
@@ -181,7 +196,9 @@ impl<B: RobstrideBus> Actuator for Motor<B> {
         // Without a Kt-aware mapping this is approximate; for accurate Nm
         // command use `set_run_mode(Mit)` + `mit_control` with `torque_ff`.
         Motor::set_torque(self, torque_nm)?;
-        Ok(rs_to_misa_feedback(Motor::measure_safe(self)?, f32::NAN))
+        let fb = Motor::measure_safe(self)?;
+        let current = optional_current(self);
+        Ok(rs_to_misa_feedback(fb, current))
     }
 
     fn mit_control(
@@ -194,15 +211,20 @@ impl<B: RobstrideBus> Actuator for Motor<B> {
     ) -> MisaResult<MisaFeedback> {
         require_mode(self, RunMode::Mit, "mit_control")?;
         // mit_control is itself a MIT frame, so the firmware reply IS the
-        // status frame — no extra read needed and no mode disturbance.
-        Ok(rs_to_misa_feedback(
-            Motor::mit_control(self, pos_rad, vel_rad_s, kp_nm_per_rad, kd_nm_per_rad_s, torque_ff_nm)?,
-            f32::NAN,
-        ))
+        // status frame — no extra read needed and no mode disturbance. Current
+        // is still absent from that frame, so it needs the opt-in read like
+        // every other path; without this the leashed quasi-static runs, which
+        // drive MIT, report no current at all.
+        let fb =
+            Motor::mit_control(self, pos_rad, vel_rad_s, kp_nm_per_rad, kd_nm_per_rad_s, torque_ff_nm)?;
+        let current = optional_current(self);
+        Ok(rs_to_misa_feedback(fb, current))
     }
 
     fn measure(&mut self) -> MisaResult<MisaFeedback> {
-        Ok(rs_to_misa_feedback(Motor::measure_safe(self)?, f32::NAN))
+        let fb = Motor::measure_safe(self)?;
+        let current = optional_current(self);
+        Ok(rs_to_misa_feedback(fb, current))
     }
 
     fn read_status(&mut self) -> MisaResult<MotorStatus> {

@@ -35,11 +35,11 @@ pub use frame::{
     build_clear_error_frame, build_disable_frame, build_enable_frame, build_mit_frame,
     build_pos_vel_frame, build_set_zero_frame, build_vel_frame, parse_feedback, DATA_LEN,
 };
-pub use limits::{Limits, MotorModel};
+pub use limits::{Limits, LimitsSource, MotorModel, RegisterLayout};
 pub use pack::{float_to_uint, uint_to_float};
 pub use register::{
     build_read_reg, build_save_all, build_write_reg_f32, build_write_reg_int, parse_reg_reply,
-    ControlMode, RegReply, Rid,
+    ControlMode, ModelReg, RegReply, Rid,
 };
 
 /// Default Master ID (feedback CAN id) for a factory-fresh DAMIAO motor.

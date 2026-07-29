@@ -19,14 +19,19 @@
 //! On a multi-motor bus give each motor a unique Master ID first
 //! (`reg-write 7 <id> --int`, then power-cycle).
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 
-use damiao_driver::{scan_bus_on, ControlMode, DamiaoBus, DamiaoMotor, Feedback, MotorModel, Rid};
+use damiao_driver::{
+    scan_bus_on, ControlMode, DamiaoBus, DamiaoMotor, Feedback, LimitsSource, ModelReg, MotorModel,
+    Rid,
+};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Test CLI for DAMIAO CAN/CAN-FD servo motors")]
@@ -45,9 +50,21 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     master_id: u16,
 
-    /// Motor model: DM4310 (DM-J4310-2EC) or DM3507 (DM-J3507-2EC).
+    /// Motor model. One of DM4310, DM4310P, DM4340, DM4340P, DM3507, DM6248P,
+    /// DM8009, DM8009P, DM10422P (full part numbers like `DM-J4340P-2EC` also
+    /// work). Selects the MIT quantization ranges and the register layout.
     #[arg(long, default_value = "DM4310")]
     model: String,
+
+    /// Read the motor's PMAX/VMAX/TMAX registers and use those as the MIT
+    /// quantization ranges, instead of this model's compiled-in defaults.
+    ///
+    /// The defaults are only defaults: no official manual states concrete
+    /// mapping ranges, and the vendor SDK's table disagrees with itself. Pass
+    /// this before relying on `mit` scaling — a mismatch silently mis-scales
+    /// commands and feedback rather than erroring.
+    #[arg(long)]
+    refresh_limits: bool,
 
     /// Use a CAN-FD bus (interface must be `fd on`). Default is classic CAN.
     #[arg(long)]
@@ -140,6 +157,42 @@ enum Command {
         #[arg(long)]
         no_save: bool,
     },
+    /// Read all 38 registers of the manuals' `0x00`-`0x25` block in one pass
+    ///
+    /// Covers protection thresholds, motion profile, addressing, MIT mapping
+    /// ranges, all control-loop gains, identified motor constants and version
+    /// fields. A register that doesn't reply is reported and omitted rather
+    /// than aborting the whole dump — expected for `boot_ver` on a
+    /// DM-J3507-2EC, which does not document RID `0x25`. Model-specific
+    /// registers above `0x25` are excluded: their addresses differ between
+    /// DM4310 and DM3507, so a flat dump would read the wrong register on one
+    /// of the two models.
+    Params {
+        /// Also emit a TOML dump to stdout (or to --out if given).
+        #[arg(long)]
+        toml: bool,
+        /// Write the TOML dump to this file (implies --toml).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Read the model-specific diagnostic registers above `0x25`
+    ///
+    /// These live where the DM4310 and DM3507 register maps diverge, so each
+    /// one is resolved against `--model` rather than a fixed RID (`m_off`
+    /// alone sits at `0x38` on DM4310 but `0x36` on DM3507). Registers this
+    /// model's map does not document are listed as `<not on this model>` and
+    /// are never read, so no undocumented address is ever polled.
+    ///
+    /// On DM4310 this includes bus voltage and PCB/motor temperatures, which
+    /// the CAN feedback frame does not carry.
+    Diag {
+        /// Also emit a TOML dump to stdout (or to --out if given).
+        #[arg(long)]
+        toml: bool,
+        /// Write the TOML dump to this file (implies --toml).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Read a register (RID).
     RegRead {
         rid: u8,
@@ -228,6 +281,34 @@ fn configure<B: DamiaoBus>(
     motor.set_timeout(timeout)?;
     // Match feedback on the requested Master ID (default 0).
     motor.set_master_id(cli.master_id);
+
+    let model = motor.model();
+    if cli.refresh_limits {
+        let l = motor
+            .refresh_limits_from_registers()
+            .context("failed to read PMAX/VMAX/TMAX from the motor")?;
+        println!(
+            "MIT ranges from motor registers: PMAX={} VMAX={} TMAX={}",
+            l.p_max, l.v_max, l.t_max
+        );
+    } else if !matches!(model.limits_source(), LimitsSource::Sdk) {
+        // Only warn where the defaults are not even SDK-backed; staying quiet
+        // on every invocation would bury the models that actually need it.
+        let why = match model.limits_source() {
+            LimitsSource::SdkSiblingIdenticalSpecs => {
+                "inherited from its non-P sibling (identical published specs)"
+            }
+            LimitsSource::ManualSpecsFloor => {
+                "a floor derived from the manual's spec table, most likely not the firmware's value"
+            }
+            LimitsSource::Sdk => unreachable!(),
+        };
+        eprintln!(
+            "warning: {}'s MIT ranges are {why}. Pass --refresh-limits to read \
+             PMAX/VMAX/TMAX from the motor before trusting `mit` scaling.",
+            model.name()
+        );
+    }
     Ok(())
 }
 
@@ -328,13 +409,33 @@ fn run<B: DamiaoBus>(motor: &mut DamiaoMotor<B>, cli: &Cli) -> Result<()> {
                 ("VMAX", Rid::VMAX, false),
                 ("TMAX", Rid::TMAX, false),
             ];
+            let model = motor.model();
             println!("motor config (addressed at CAN_ID {}):", cli.motor_id);
+            println!(
+                "  {:<16}          = {} (register layout {:?})",
+                "model",
+                model.name(),
+                model.register_layout()
+            );
             for &(label, rid, is_int) in regs {
                 match motor.read_register(rid) {
                     Ok(r) if is_int => println!("  {label:<16} (RID {rid:>2}) = {}", r.as_i32()),
                     Ok(r) => println!("  {label:<16} (RID {rid:>2}) = {}", r.as_f32()),
                     Err(e) => println!("  {label:<16} (RID {rid:>2}) = <no reply: {e}>"),
                 }
+            }
+            // PMAX/VMAX/TMAX above are the motor's own values; contrast them
+            // with the compiled-in defaults MIT scaling uses by default, so a
+            // mismatch is visible rather than silent.
+            let l = motor.limits();
+            println!(
+                "  MIT ranges in effect: PMAX={} VMAX={} TMAX={}  (source: {:?})",
+                l.p_max, l.v_max, l.t_max, model.limits_source()
+            );
+            if !cli.refresh_limits {
+                println!(
+                    "  note: pass --refresh-limits to adopt the register values above for MIT scaling."
+                );
             }
         }
         Command::SetId {
@@ -369,6 +470,44 @@ fn run<B: DamiaoBus>(motor: &mut DamiaoMotor<B>, cli: &Cli) -> Result<()> {
                 target_can, master
             );
             println!("verify with:  damiao-cli -i {} -m {} info", cli.interface, target_can);
+        }
+        Command::Params { toml, out } => {
+            let regs = read_all_regs(motor, cli.motor_id);
+            regs.print();
+            if *toml || out.is_some() {
+                let text =
+                    toml::to_string_pretty(&regs).context("failed to serialize TOML dump")?;
+                match out {
+                    Some(path) => {
+                        std::fs::write(path, &text)
+                            .with_context(|| format!("failed to write {}", path.display()))?;
+                        println!("\nwrote TOML dump to {}", path.display());
+                    }
+                    None => {
+                        println!("\n--- TOML ---");
+                        print!("{text}");
+                    }
+                }
+            }
+        }
+        Command::Diag { toml, out } => {
+            let diag = read_model_regs(motor, cli.motor_id);
+            diag.print();
+            if *toml || out.is_some() {
+                let text = toml::to_string_pretty(&diag.to_toml())
+                    .context("failed to serialize TOML dump")?;
+                match out {
+                    Some(path) => {
+                        std::fs::write(path, &text)
+                            .with_context(|| format!("failed to write {}", path.display()))?;
+                        println!("\nwrote TOML dump to {}", path.display());
+                    }
+                    None => {
+                        println!("\n--- TOML ---");
+                        print!("{text}");
+                    }
+                }
+            }
         }
         Command::RegRead { rid } => {
             let reply = motor.read_register(*rid)?;
@@ -563,9 +702,433 @@ where
     Ok(())
 }
 
+/// Every register in the official manuals' documented `0x00`-`0x25` block
+/// (`damiao_protocol::Rid`), dumped in one pass and ordered by RID. A
+/// register that fails to reply is left as `None` rather than aborting the
+/// whole read. `boot_ver` (`0x25`) is skipped entirely on models whose
+/// register map does not document it (see `MotorModel::has_boot_ver`).
+///
+/// Model-specific registers above `0x25` are deliberately excluded: their
+/// addresses vary by register layout, so a flat dump would read the wrong
+/// register on some models. Use `diag` for those.
+#[derive(Debug, Serialize)]
+struct AllRegs {
+    motor_id: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uv_value: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kt_value: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ot_value: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oc_value: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acc: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dec: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_spd: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mst_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    esc_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ctrl_mode: Option<i32>,
+    /// Identified during calibration (read-only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    damp: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inertia: Option<f32>,
+    /// Confirmed against the official DM-J4310-2EC/DM-J3507-2EC manuals'
+    /// Register Map — labeled "Reserved" there despite the name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hw_ver: Option<i32>,
+    /// The actual firmware version (confirmed against the official manuals —
+    /// this is what the vendor's own "Read Version" tool reads, not `sub_ver`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sw_ver: Option<i32>,
+    /// Confirmed against the official manuals — labeled "Reserved" there
+    /// despite the `SN` name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sn: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    npp: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rs: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ls: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flux: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gr: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pmax: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vmax: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tmax: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    i_bw: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kp_asr: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ki_asr: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kp_apr: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ki_apr: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ov_value: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gref: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deta: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    v_bw: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iq_c1: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vl_c1: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    can_br: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sub_ver: Option<i32>,
+    /// DM-J4310-2EC only — a DM-J3507-2EC does not document RID `0x25`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    boot_ver: Option<i32>,
+}
+
+impl AllRegs {
+    fn print(&self) {
+        println!("== DAMIAO registers (motor_id={}) ==", self.motor_id);
+        fn fmt<T: std::fmt::Display>(label: &str, v: Option<T>) {
+            match v {
+                Some(v) => println!("  {label:<10} = {v}"),
+                None => println!("  {label:<10} = <no reply>"),
+            }
+        }
+        println!("-- protection thresholds --");
+        fmt("uv_value", self.uv_value);
+        fmt("ov_value", self.ov_value);
+        fmt("ot_value", self.ot_value);
+        fmt("oc_value", self.oc_value);
+        println!("-- motion profile --");
+        fmt("acc", self.acc);
+        fmt("dec", self.dec);
+        fmt("max_spd", self.max_spd);
+        println!("-- addressing / comms --");
+        fmt("mst_id", self.mst_id);
+        fmt("esc_id", self.esc_id);
+        fmt("can_br", self.can_br);
+        fmt("timeout", self.timeout);
+        fmt("ctrl_mode", self.ctrl_mode);
+        println!("-- MIT mapping ranges --");
+        fmt("pmax", self.pmax);
+        fmt("vmax", self.vmax);
+        fmt("tmax", self.tmax);
+        println!("-- control loop gains --");
+        fmt("i_bw", self.i_bw);
+        fmt("iq_c1", self.iq_c1);
+        fmt("kp_asr", self.kp_asr);
+        fmt("ki_asr", self.ki_asr);
+        fmt("deta", self.deta);
+        fmt("v_bw", self.v_bw);
+        fmt("vl_c1", self.vl_c1);
+        fmt("kp_apr", self.kp_apr);
+        fmt("ki_apr", self.ki_apr);
+        println!("-- identified motor constants (read-only) --");
+        fmt("kt_value", self.kt_value);
+        fmt("rs", self.rs);
+        fmt("ls", self.ls);
+        fmt("flux", self.flux);
+        fmt("damp", self.damp);
+        fmt("inertia", self.inertia);
+        fmt("npp", self.npp);
+        fmt("gr", self.gr);
+        fmt("gref", self.gref);
+        println!("-- identity / version (read-only) --");
+        fmt("sw_ver", self.sw_ver);
+        fmt("sub_ver", self.sub_ver);
+        fmt("boot_ver", self.boot_ver);
+        fmt("hw_ver", self.hw_ver);
+        fmt("sn", self.sn);
+    }
+}
+
+fn read_all_regs<B: DamiaoBus>(motor: &mut DamiaoMotor<B>, motor_id: u8) -> AllRegs {
+    let f32_reg = |motor: &mut DamiaoMotor<B>, rid: u8, label: &str| match motor.read_register(rid) {
+        Ok(r) => Some(r.as_f32()),
+        Err(e) => {
+            eprintln!("  {label} (RID {rid}): <no reply: {e}>");
+            None
+        }
+    };
+    let i32_reg = |motor: &mut DamiaoMotor<B>, rid: u8, label: &str| match motor.read_register(rid) {
+        Ok(r) => Some(r.as_i32()),
+        Err(e) => {
+            eprintln!("  {label} (RID {rid}): <no reply: {e}>");
+            None
+        }
+    };
+    // Ordered by RID so the read sequence mirrors the manuals' Register Map.
+    AllRegs {
+        motor_id,
+        uv_value: f32_reg(motor, Rid::UV_VALUE, "uv_value"),
+        kt_value: f32_reg(motor, Rid::KT_VALUE, "kt_value"),
+        ot_value: f32_reg(motor, Rid::OT_VALUE, "ot_value"),
+        oc_value: f32_reg(motor, Rid::OC_VALUE, "oc_value"),
+        acc: f32_reg(motor, Rid::ACC, "acc"),
+        dec: f32_reg(motor, Rid::DEC, "dec"),
+        max_spd: f32_reg(motor, Rid::MAX_SPD, "max_spd"),
+        mst_id: i32_reg(motor, Rid::MST_ID, "mst_id"),
+        esc_id: i32_reg(motor, Rid::ESC_ID, "esc_id"),
+        timeout: i32_reg(motor, Rid::TIMEOUT, "timeout"),
+        ctrl_mode: i32_reg(motor, Rid::CTRL_MODE, "ctrl_mode"),
+        damp: f32_reg(motor, Rid::DAMP, "damp"),
+        inertia: f32_reg(motor, Rid::INERTIA, "inertia"),
+        hw_ver: i32_reg(motor, Rid::HW_VER, "hw_ver"),
+        sw_ver: i32_reg(motor, Rid::SW_VER, "sw_ver"),
+        sn: i32_reg(motor, Rid::SN, "sn"),
+        npp: i32_reg(motor, Rid::NPP, "npp"),
+        rs: f32_reg(motor, Rid::RS, "rs"),
+        ls: f32_reg(motor, Rid::LS, "ls"),
+        flux: f32_reg(motor, Rid::FLUX, "flux"),
+        gr: f32_reg(motor, Rid::GR, "gr"),
+        pmax: f32_reg(motor, Rid::PMAX, "pmax"),
+        vmax: f32_reg(motor, Rid::VMAX, "vmax"),
+        tmax: f32_reg(motor, Rid::TMAX, "tmax"),
+        i_bw: f32_reg(motor, Rid::I_BW, "i_bw"),
+        kp_asr: f32_reg(motor, Rid::KP_ASR, "kp_asr"),
+        ki_asr: f32_reg(motor, Rid::KI_ASR, "ki_asr"),
+        kp_apr: f32_reg(motor, Rid::KP_APR, "kp_apr"),
+        ki_apr: f32_reg(motor, Rid::KI_APR, "ki_apr"),
+        ov_value: f32_reg(motor, Rid::OV_VALUE, "ov_value"),
+        gref: f32_reg(motor, Rid::GREF, "gref"),
+        deta: f32_reg(motor, Rid::DETA, "deta"),
+        v_bw: f32_reg(motor, Rid::V_BW, "v_bw"),
+        iq_c1: f32_reg(motor, Rid::IQ_C1, "iq_c1"),
+        vl_c1: f32_reg(motor, Rid::VL_C1, "vl_c1"),
+        can_br: i32_reg(motor, Rid::CAN_BR, "can_br"),
+        sub_ver: i32_reg(motor, Rid::SUB_VER, "sub_ver"),
+        // The one non-universal register in this block: models on the J3507
+        // layout do not document 0x25, so skip it rather than poll an
+        // undocumented address and report a spurious timeout.
+        boot_ver: if motor.model().has_boot_ver() {
+            i32_reg(motor, Rid::BOOT_VER, "boot_ver")
+        } else {
+            None
+        },
+    }
+}
+
+/// One model-specific register's dump result.
+struct DiagEntry {
+    reg: ModelReg,
+    /// `None` when this model's register map does not document `reg` — the
+    /// register is then never read.
+    rid: Option<u8>,
+    /// `None` when unavailable on this model, or when the read got no reply.
+    value: Option<f32>,
+}
+
+/// The model-specific registers above `0x25`, read via `ModelReg` so each RID
+/// is resolved against the configured model rather than assumed.
+struct ModelRegs {
+    motor_id: u8,
+    model: &'static str,
+    /// In [`ModelReg::ALL`] order.
+    entries: Vec<DiagEntry>,
+}
+
+/// Serializable view of [`ModelRegs`]. Scalars and arrays are declared before
+/// `values` because TOML requires plain values to precede tables.
+#[derive(Debug, Serialize)]
+struct ModelRegsToml {
+    motor_id: u8,
+    model: &'static str,
+    /// Registers absent from this model's register map (never polled).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    not_on_this_model: Vec<&'static str>,
+    /// Registers this model documents but which did not reply.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    no_reply: Vec<&'static str>,
+    values: std::collections::BTreeMap<&'static str, f32>,
+}
+
+impl ModelRegs {
+    fn to_toml(&self) -> ModelRegsToml {
+        ModelRegsToml {
+            motor_id: self.motor_id,
+            model: self.model,
+            not_on_this_model: self
+                .entries
+                .iter()
+                .filter(|e| e.rid.is_none())
+                .map(|e| e.reg.name())
+                .collect(),
+            no_reply: self
+                .entries
+                .iter()
+                .filter(|e| e.rid.is_some() && e.value.is_none())
+                .map(|e| e.reg.name())
+                .collect(),
+            values: self
+                .entries
+                .iter()
+                .filter_map(|e| e.value.map(|v| (e.reg.name(), v)))
+                .collect(),
+        }
+    }
+
+    fn print(&self) {
+        println!(
+            "== DAMIAO model-specific registers (motor_id={}, model={}) ==",
+            self.motor_id, self.model
+        );
+        for e in &self.entries {
+            let name = e.reg.name();
+            match (e.rid, e.value) {
+                (None, _) => println!("  {name:<8} = <not on this model>  ({})", e.reg.description()),
+                (Some(rid), Some(v)) => {
+                    println!("  {name:<8} = {v}  (RID {rid:#04X}, {})", e.reg.description())
+                }
+                (Some(rid), None) => {
+                    println!("  {name:<8} = <no reply>  (RID {rid:#04X}, {})", e.reg.description())
+                }
+            }
+        }
+    }
+}
+
+fn read_model_regs<B: DamiaoBus>(motor: &mut DamiaoMotor<B>, motor_id: u8) -> ModelRegs {
+    let model = motor.model();
+    let entries = ModelReg::ALL
+        .iter()
+        .map(|&reg| {
+            let rid = reg.rid(model);
+            // Only registers this model documents are polled at all; the rest
+            // are reported as absent without touching the bus.
+            let value = rid.and_then(|rid| match motor.read_model_register(reg) {
+                Ok(r) => Some(r.as_f32()),
+                Err(e) => {
+                    eprintln!("  {} (RID {rid:#04X}): <no reply: {e}>", reg.name());
+                    None
+                }
+            });
+            DiagEntry { reg, rid, value }
+        })
+        .collect();
+    ModelRegs {
+        motor_id,
+        model: model.name(),
+        entries,
+    }
+}
+
 fn fmt_fb(fb: Feedback) -> String {
     format!(
         "id={} pos={:+.3} rad  vel={:+.3} rad/s  tau={:+.3} Nm  T_mos={:.0}°C  T_rotor={:.0}°C  err={:?}",
         fb.motor_id, fb.position, fb.velocity, fb.torque, fb.t_mos, fb.t_rotor, fb.err
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build the dump shape a real read would produce, without a bus.
+    fn diag_for(model: MotorModel) -> ModelRegs {
+        let entries = ModelReg::ALL
+            .iter()
+            .map(|&reg| {
+                let rid = reg.rid(model);
+                DiagEntry {
+                    reg,
+                    rid,
+                    value: rid.map(|_| 1.5),
+                }
+            })
+            .collect();
+        ModelRegs {
+            motor_id: 1,
+            model: model.name(),
+            entries,
+        }
+    }
+
+    /// TOML requires plain values before tables; `values` must therefore be the
+    /// last field. Serializing is the only way to catch a field reorder.
+    #[test]
+    fn diag_toml_serializes_for_both_models() {
+        for &model in MotorModel::ALL {
+            let text = toml::to_string_pretty(&diag_for(model).to_toml())
+                .unwrap_or_else(|e| panic!("{} dump failed to serialize: {e}", model.name()));
+            assert!(text.contains("motor_id = 1"));
+            assert!(text.contains(&format!("model = \"{}\"", model.name())));
+        }
+    }
+
+    /// Every model must be reachable through `--model`, and each must land on
+    /// a dump that has at least one readable register.
+    #[test]
+    fn every_model_is_selectable_and_dumps_something() {
+        for &model in MotorModel::ALL {
+            assert_eq!(
+                MotorModel::from_name(model.name()),
+                Some(model),
+                "--model {} does not parse",
+                model.name()
+            );
+            let d = diag_for(model).to_toml();
+            assert!(
+                !d.values.is_empty(),
+                "{} exposes no model-specific registers",
+                model.name()
+            );
+        }
+    }
+
+    /// DM-J10422P is the only model on its own layout, with two registers no
+    /// other model has and none of the J3507-only ones.
+    #[test]
+    fn dm10422p_exposes_its_unique_registers() {
+        let d = diag_for(MotorModel::Dm10422P).to_toml();
+        assert!(d.values.contains_key("x_off"), "x_off is DM10422P-only");
+        assert!(d.values.contains_key("IBase"), "IBase is DM10422P-only");
+        // `Imax` is a different quantity at the same address on J4310.
+        assert!(d.not_on_this_model.contains(&"Imax"));
+        assert!(d.not_on_this_model.contains(&"k1"));
+        // No other model exposes x_off / IBase.
+        for &model in MotorModel::ALL {
+            if model == MotorModel::Dm10422P {
+                continue;
+            }
+            let other = diag_for(model).to_toml();
+            assert!(!other.values.contains_key("x_off"), "{}", model.name());
+            assert!(!other.values.contains_key("IBase"), "{}", model.name());
+        }
+    }
+
+    /// Registers absent from a model are reported, never read, and never land
+    /// in `values` — the whole point of routing through `ModelReg`.
+    #[test]
+    fn diag_partitions_registers_by_model() {
+        let dm4310 = diag_for(MotorModel::Dm4310).to_toml();
+        assert!(dm4310.values.contains_key("VBus"), "DM4310 exposes VBus");
+        assert!(!dm4310.values.contains_key("k1"), "k1 is DM3507-only");
+        assert!(dm4310.not_on_this_model.contains(&"k1"));
+
+        let dm3507 = diag_for(MotorModel::Dm3507).to_toml();
+        assert!(dm3507.values.contains_key("k1"), "DM3507 exposes k1");
+        assert!(!dm3507.values.contains_key("VBus"), "VBus is DM4310-only");
+        assert!(dm3507.not_on_this_model.contains(&"VBus"));
+
+        // m_off exists on both, so it must never show up as unavailable.
+        for d in [&dm4310, &dm3507] {
+            assert!(d.values.contains_key("m_off"));
+            assert!(!d.not_on_this_model.contains(&"m_off"));
+        }
+    }
 }

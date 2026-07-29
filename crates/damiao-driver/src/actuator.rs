@@ -50,6 +50,15 @@ fn dm_to_misa_feedback(fb: Feedback) -> MisaFeedback {
 fn dm_err_to_misa(err: ErrorCode) -> ErrorFlags {
     let mut bits = 0u32;
     match err {
+        // Calibration-state faults (manual: "calibration error" for both) —
+        // map to the generic "uncalibrated" bit rather than a temperature/
+        // voltage/current one.
+        ErrorCode::OutputShaftCalibration | ErrorCode::EncoderCalibration => {
+            bits |= ErrorFlags::UNCALIBRATED
+        }
+        // "Sensor output error" — distinct from a calibration-state issue,
+        // maps to the generic encoder/sensor fault bit.
+        ErrorCode::SensorOutput => bits |= ErrorFlags::ENCODER_FAULT,
         ErrorCode::OverVoltage => bits |= ErrorFlags::OVER_VOLTAGE,
         ErrorCode::UnderVoltage => bits |= ErrorFlags::UNDER_VOLTAGE,
         ErrorCode::OverCurrent => bits |= ErrorFlags::OVER_CURRENT,

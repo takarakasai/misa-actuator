@@ -21,8 +21,16 @@ use crate::quasistatic::{
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LoadMapReport {
     pub n_points: usize,
-    /// Position where holding torque is smallest — the load's equilibrium.
+    /// Position where *raw* holding torque is smallest. Friction noise unless
+    /// the static load dominates — prefer `static_equilibrium_position_rad`.
     pub equilibrium_position_rad: Option<f32>,
+    /// Equilibrium after removing friction (mean of the two passes).
+    pub static_equilibrium_position_rad: Option<f32>,
+    /// Mean Coulomb friction from the outbound/return spread (N·m).
+    pub mean_friction_nm: Option<f32>,
+    /// Peak |static load| once friction is removed (N·m). Well below
+    /// `mean_friction_nm` means this span has no real gravity/spring term.
+    pub peak_static_load_nm: Option<f32>,
     /// Largest |holding torque| over the sweep (N·m).
     pub peak_holding_torque_nm: Option<f32>,
     /// Largest outbound-vs-return torque gap (N·m); about twice the Coulomb
@@ -44,6 +52,9 @@ pub fn run_load_map_to_csv(
     Ok(LoadMapReport {
         n_points: map.points.len(),
         equilibrium_position_rad: map.equilibrium_position_rad(),
+        static_equilibrium_position_rad: map.static_equilibrium_position_rad(),
+        mean_friction_nm: map.mean_friction_nm(),
+        peak_static_load_nm: map.peak_static_load_nm(),
         peak_holding_torque_nm: map.peak_holding_torque_nm(),
         peak_hysteresis_nm: map.peak_hysteresis_nm(),
         abort: map.abort,
@@ -62,6 +73,9 @@ pub struct BreakawayReport {
     /// Largest torque actually commanded (N·m) — the bound when there was no
     /// breakaway.
     pub peak_commanded_nm: f32,
+    /// Whether the shaft was at rest before the ramp. `false` invalidates the
+    /// breakaway torque: the motion test can trip on pre-existing motion.
+    pub rested: bool,
     pub abort: Option<AbortReason>,
 }
 
@@ -80,6 +94,7 @@ pub fn run_breakaway_to_csv(
         breakaway_torque_nm: r.breakaway_torque_nm,
         breakaway_position_rad: r.breakaway_position_rad,
         peak_commanded_nm: r.points.iter().map(|p| p.cmd.abs()).fold(0.0, f32::max),
+        rested: r.rested,
         abort: r.abort,
     })
 }

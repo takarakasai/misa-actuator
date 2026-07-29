@@ -83,6 +83,16 @@ pub enum CharacterizeCmd {
         /// usually quantized to 1 °C.
         #[arg(long, default_value_t = 20.0)]
         rate: f32,
+        /// Position-leash stiffness (N·m/rad) holding the shaft where it started
+        /// while the torque heats the motor. 0 commands open-loop torque, which
+        /// only works on a shaft that is mechanically restrained — otherwise any
+        /// torque above breakaway accelerates it out of the safety window before
+        /// any thermal data is collected.
+        #[arg(long, default_value_t = 8.0)]
+        leash_kp: f32,
+        /// Leash damping (N·m·s/rad).
+        #[arg(long, default_value_t = 0.5)]
+        leash_kd: f32,
     },
     /// Torque vs current, fitted to a torque constant.
     ///
@@ -91,8 +101,13 @@ pub enum CharacterizeCmd {
     /// — compare the fitted figure against the register value from `params`.
     Kt {
         /// Largest |torque| commanded (N·m).
+        ///
+        /// Named `--amplitude` rather than `--max-torque` so it cannot collide
+        /// with the envelope's global `--max-torque`: clap would fold the two
+        /// into one value, silently tightening the envelope to the sweep
+        /// amplitude and aborting on the first level.
         #[arg(long, default_value_t = 0.5)]
-        max_torque: f32,
+        amplitude: f32,
         /// Levels from -max to +max, including zero.
         #[arg(long, default_value_t = 9)]
         steps: usize,
@@ -149,14 +164,26 @@ pub fn run_characterize(
             println!("load map: ±{span} rad, {steps} steps/pass, {settle}s dwell ...");
             let r = run_load_map_to_csv(act, &spec, limits, &abort, &mut csv)?;
             println!("  points measured        : {}", r.n_points);
-            print_opt("equilibrium position", r.equilibrium_position_rad, "rad");
             print_opt("peak holding torque", r.peak_holding_torque_nm, "N·m");
-            match r.peak_hysteresis_nm {
-                Some(h) => println!(
-                    "  peak hysteresis        : {h:.4} N·m  (Coulomb friction ≈ {:.4} N·m)",
-                    h / 2.0
-                ),
-                None => println!("  peak hysteresis        : <no return pass>"),
+            // The raw and friction-compensated views answer different
+            // questions; printing both makes it obvious when friction is doing
+            // all the work.
+            print_opt("equilibrium (raw)", r.equilibrium_position_rad, "rad");
+            print_opt(
+                "equilibrium (de-frictioned)",
+                r.static_equilibrium_position_rad,
+                "rad",
+            );
+            print_opt("mean friction", r.mean_friction_nm, "N·m");
+            print_opt("peak static load", r.peak_static_load_nm, "N·m");
+            if let (Some(load), Some(fric)) = (r.peak_static_load_nm, r.mean_friction_nm) {
+                if load < fric {
+                    println!(
+                        "  note: peak static load ({load:.4} N·m) is below the friction \
+                         ({fric:.4} N·m) — over this span the rig is friction-dominated, so \
+                         the raw equilibrium is not meaningful"
+                    );
+                }
             }
             report_abort(r.abort);
         }
@@ -198,13 +225,23 @@ pub fn run_characterize(
                     ),
                 }
                 print_opt("breakaway position", r.breakaway_position_rad, "rad");
+                if !r.rested {
+                    eprintln!(
+                        "  WARNING: the shaft never came to rest before the ramp — this figure \
+                         may be pre-existing motion rather than a breakaway"
+                    );
+                }
                 report_abort(r.abort);
                 results.push(r);
             }
             // With both directions, the mean is the static load and half the
             // difference is the friction that opposes motion either way.
             if let [a, b] = results.as_slice() {
-                if let (Some(ta), Some(tb)) = (a.breakaway_torque_nm, b.breakaway_torque_nm) {
+                // Only meaningful if both ramps started from rest; otherwise the
+                // mean/spread are arithmetic on an artefact.
+                if let (Some(ta), Some(tb), true) =
+                    (a.breakaway_torque_nm, b.breakaway_torque_nm, a.rested && b.rested)
+                {
                     println!("  static load (mean)     : {:+.4} N·m", (ta + tb) / 2.0);
                     println!("  friction (half-spread) : {:.4} N·m", (ta - tb).abs() / 2.0);
                 }
@@ -214,13 +251,27 @@ pub fn run_characterize(
             torque,
             duration,
             rate,
+            leash_kp,
+            leash_kd,
         } => {
             let spec = ThermalSpec {
                 hold_torque_nm: *torque,
                 duration_s: *duration,
                 rate_hz: *rate,
+                leash_kp: *leash_kp,
+                leash_kd: *leash_kd,
             };
-            println!("thermal: holding {torque} N·m for up to {duration}s ...");
+            if *leash_kp > 0.0 {
+                println!(
+                    "thermal: holding {torque} N·m for up to {duration}s, leashed at kp={leash_kp} \
+                     kd={leash_kd} ..."
+                );
+            } else {
+                println!(
+                    "thermal: holding {torque} N·m open-loop for up to {duration}s — the shaft \
+                     must be mechanically restrained ..."
+                );
+            }
             let r = run_thermal_to_csv(act, &spec, limits, &abort, &mut csv)?;
             println!("  samples                : {}", r.n_points);
             print_opt("mean torque delivered", r.mean_torque_nm, "N·m");
@@ -238,17 +289,17 @@ pub fn run_characterize(
             report_abort(r.abort);
         }
         CharacterizeCmd::Kt {
-            max_torque,
+            amplitude,
             steps,
             settle,
         } => {
             let spec = KtSpec {
-                max_torque_nm: *max_torque,
+                max_torque_nm: *amplitude,
                 steps: *steps,
                 settle_s: *settle,
-                ..KtSpec::bipolar(*max_torque)
+                ..KtSpec::bipolar(*amplitude)
             };
-            println!("Kt sweep: ±{max_torque} N·m in {steps} levels, {settle}s dwell ...");
+            println!("Kt sweep: ±{amplitude} N·m in {steps} levels, {settle}s dwell ...");
             let r = run_kt_to_csv(act, &spec, limits, &abort, &mut csv)?;
             println!("  levels measured        : {}", r.n_points);
             match r.kt_nm_per_a {

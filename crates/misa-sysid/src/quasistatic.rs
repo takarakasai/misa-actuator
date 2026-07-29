@@ -127,9 +127,24 @@ pub struct LoadMapSpec {
     pub to_rad: f32,
     /// Number of positions visited, including both ends (>= 2).
     pub steps: usize,
-    /// How long to dwell at each position before recording, so the reading is
-    /// the *holding* torque and not the acceleration transient (s).
+    /// How long to dwell at each position *after arriving* before recording, so
+    /// the reading is the holding torque and not the acceleration transient (s).
     pub settle_s: f32,
+    /// How close counts as arrived (rad).
+    ///
+    /// The dwell only starts once the shaft is this close to the target.
+    /// Without an arrival check the first point of a sweep records a travel
+    /// transient: reaching `from_rad` can be a long move, and at
+    /// [`Self::max_speed_rad_s`] it may take much longer than `settle_s` — seen
+    /// on a DM-J4310, where the first point of a ±0.12 rad sweep was logged at
+    /// -0.011 rad while still travelling toward -0.05.
+    pub arrive_tolerance_rad: f32,
+    /// Give up waiting to arrive after this long and record anyway (s).
+    ///
+    /// A shaft blocked by an end stop never arrives; recording the stalled
+    /// torque is the informative outcome, so this bounds the wait rather than
+    /// hanging. The [`SafetyLimits`] time budget still applies on top.
+    pub travel_timeout_s: f32,
     /// Position-controller speed cap while moving between points (rad/s).
     pub max_speed_rad_s: f32,
     /// Also sweep back to the start, which exposes hysteresis: the difference
@@ -146,6 +161,8 @@ impl LoadMapSpec {
             to_rad: half_span_rad,
             steps: steps.max(2),
             settle_s: 0.3,
+            arrive_tolerance_rad: 0.005,
+            travel_timeout_s: 3.0,
             max_speed_rad_s: 0.5,
             return_sweep: true,
         }
@@ -179,8 +196,115 @@ pub struct LoadMap {
 }
 
 impl LoadMap {
-    /// The position whose holding torque is smallest in magnitude — the load's
-    /// equilibrium. `None` if nothing was measured.
+    /// Outbound/return point pairs that visited the **same commanded offset**.
+    ///
+    /// Paired by sweep index rather than by nearest measured position: the visit
+    /// order is deterministic, so `back[j]` is the same commanded offset as
+    /// `out[n - 2 - j]`. Matching on measured position instead would pair points
+    /// at genuinely different offsets whenever one of them is missing, and read
+    /// the resulting spring-torque difference as friction.
+    ///
+    /// The **first** outbound point is excluded, and with it the last return
+    /// point that would have paired with it: the move that reaches `from_rad`
+    /// travels opposite to the outbound sweep, so friction there acts in the
+    /// return direction and pairing it would cancel the very spread being
+    /// measured. Both remain in [`Self::points`] — only this split drops them.
+    fn pairs(&self) -> Vec<(&Point, &Point)> {
+        if !self.spec.return_sweep {
+            return Vec::new();
+        }
+        let n = self.spec.steps.max(2);
+        let (Some(out), Some(back)) = (self.points.get(..n), self.points.get(n..)) else {
+            return Vec::new();
+        };
+        let mut pairs = Vec::with_capacity(back.len());
+        for (j, b) in back.iter().enumerate() {
+            // back[j] revisits offset index n - 2 - j; index 0 has no usable
+            // outbound partner (see above).
+            let Some(i) = (n - 2).checked_sub(j).filter(|&i| i >= 1) else {
+                continue;
+            };
+            if let Some(o) = out.get(i) {
+                pairs.push((o, b));
+            }
+        }
+        pairs
+    }
+
+    /// Friction-compensated load curve: `(position, static_load, friction)` per
+    /// matched outbound/return pair.
+    ///
+    /// At a given position the outbound and return passes differ only in which
+    /// way friction acts, so their **mean** is the conservative (gravity/spring)
+    /// load and **half their difference** is the Coulomb friction. Separating
+    /// them is the point of the return sweep: on a DM-J4310 the raw holding
+    /// torque read +0.17 N·m outbound and -0.15 N·m on the way back across the
+    /// whole span, which is friction of ~0.16 N·m over a static load of
+    /// essentially zero — indistinguishable without this pairing.
+    ///
+    /// Empty unless [`LoadMapSpec::return_sweep`] produced a second pass.
+    pub fn static_load_curve(&self) -> Vec<(f32, f32, f32)> {
+        let mut curve: Vec<(f32, f32, f32)> = self
+            .pairs()
+            .into_iter()
+            .filter(|(o, b)| o.torque_nm.is_finite() && b.torque_nm.is_finite())
+            .map(|(o, b)| {
+                (
+                    0.5 * (o.position_rad + b.position_rad),
+                    0.5 * (o.torque_nm + b.torque_nm),
+                    0.5 * (o.torque_nm - b.torque_nm).abs(),
+                )
+            })
+            .collect();
+        curve.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
+        curve
+    }
+
+    /// Equilibrium taken from the friction-compensated curve — where the
+    /// *static* load crosses zero.
+    ///
+    /// Prefer this over [`Self::equilibrium_position_rad`]: that one minimizes
+    /// raw |holding torque|, which on a friction-dominated rig just picks
+    /// whichever sample happened to sit lowest in the friction band and moves
+    /// around between runs. `None` without a return sweep.
+    pub fn static_equilibrium_position_rad(&self) -> Option<f32> {
+        let curve = self.static_load_curve();
+        curve
+            .iter()
+            .min_by(|a, b| {
+                a.1.abs()
+                    .partial_cmp(&b.1.abs())
+                    .unwrap_or(core::cmp::Ordering::Equal)
+            })
+            .map(|&(pos, _, _)| pos)
+    }
+
+    /// Mean Coulomb friction over the friction-compensated curve (N·m).
+    /// `None` without a return sweep.
+    pub fn mean_friction_nm(&self) -> Option<f32> {
+        let curve = self.static_load_curve();
+        (!curve.is_empty())
+            .then(|| curve.iter().map(|&(_, _, f)| f).sum::<f32>() / curve.len() as f32)
+    }
+
+    /// Largest |static load| after removing friction (N·m). `None` without a
+    /// return sweep.
+    ///
+    /// Compare against [`Self::mean_friction_nm`]: a peak well below the
+    /// friction means the rig has no meaningful gravity/spring term over this
+    /// span, so a `load-map` reading is measuring friction and nothing else.
+    pub fn peak_static_load_nm(&self) -> Option<f32> {
+        self.static_load_curve()
+            .iter()
+            .map(|&(_, load, _)| load.abs())
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal))
+    }
+
+    /// The position whose **raw** holding torque is smallest in magnitude.
+    ///
+    /// Only meaningful when the static load dominates friction; otherwise this
+    /// is friction noise — see [`Self::static_equilibrium_position_rad`], which
+    /// removes friction first.
     pub fn equilibrium_position_rad(&self) -> Option<f32> {
         self.points
             .iter()
@@ -208,27 +332,11 @@ impl LoadMap {
     ///
     /// `None` unless [`LoadMapSpec::return_sweep`] produced a second pass.
     pub fn peak_hysteresis_nm(&self) -> Option<f32> {
-        if !self.spec.return_sweep {
-            return None;
-        }
-        let n = self.spec.steps.max(2);
-        let out = self.points.get(..n)?;
-        let back = self.points.get(n..)?;
-        let mut worst: Option<f32> = None;
-        for b in back {
-            // Pair with the outbound point closest in position.
-            let nearest = out.iter().min_by(|x, y| {
-                (x.position_rad - b.position_rad)
-                    .abs()
-                    .partial_cmp(&(y.position_rad - b.position_rad).abs())
-                    .unwrap_or(core::cmp::Ordering::Equal)
-            })?;
-            let gap = (nearest.torque_nm - b.torque_nm).abs();
-            if gap.is_finite() && worst.is_none_or(|w| gap > w) {
-                worst = Some(gap);
-            }
-        }
-        worst
+        self.pairs()
+            .into_iter()
+            .map(|(o, b)| (o.torque_nm - b.torque_nm).abs())
+            .filter(|g| g.is_finite())
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal))
     }
 }
 
@@ -257,11 +365,37 @@ pub fn run_load_map(
             break;
         }
         let target = start + offset;
-        // Drive to the point, then dwell so the reading is a holding torque
-        // rather than the acceleration transient.
+        let mut fb = act.set_position(target, spec.max_speed_rad_s)?;
+
+        // Phase 1: travel. Wait until the shaft is actually near the target,
+        // otherwise the recorded "holding" torque is a travel transient — the
+        // first point of a sweep is the worst case, since reaching `from_rad`
+        // can be a long move. A shaft that never arrives (end stop) falls
+        // through on the timeout, which is itself the informative reading.
+        let travel_deadline = Instant::now() + Duration::from_secs_f32(spec.travel_timeout_s.max(0.0));
+        while (fb.position_rad - target).abs() > spec.arrive_tolerance_rad {
+            if Instant::now() >= travel_deadline {
+                break;
+            }
+            if abort.load(Ordering::Relaxed) {
+                stop = Some(AbortReason::Cancelled);
+                break;
+            }
+            fb = act.set_position(target, spec.max_speed_rad_s)?;
+            if let Some(r) = guard.check(t0.elapsed().as_secs_f32(), &fb) {
+                stop = Some(r);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if stop.is_some() {
+            points.push(Point::from(t0.elapsed().as_secs_f32(), target, &fb));
+            break;
+        }
+
+        // Phase 2: settle, so the torque reading is steady-state.
         let settle = Duration::from_secs_f32(spec.settle_s.max(0.0));
         let dwell_start = Instant::now();
-        let mut fb = act.set_position(target, spec.max_speed_rad_s)?;
         while dwell_start.elapsed() < settle {
             if abort.load(Ordering::Relaxed) {
                 stop = Some(AbortReason::Cancelled);
@@ -313,6 +447,21 @@ pub struct BreakawaySpec {
     pub direction: Direction,
     /// Command rate (Hz).
     pub rate_hz: f32,
+    /// Require the shaft to hold still for this long, at zero torque, before
+    /// the ramp starts (s).
+    ///
+    /// Without this the measurement is worthless whenever the shaft is already
+    /// moving: the motion test trips on the very first sample and reports a
+    /// breakaway torque of zero. Seen on a DM-J4310 running `--both`, where the
+    /// second ramp began while the shaft was still coasting from the first and
+    /// duly reported -0.0000 N·m.
+    pub rest_window_s: f32,
+    /// Give up waiting for stillness after this long and ramp anyway (s).
+    ///
+    /// A shaft that never settles — a live load, or a rig being touched — still
+    /// gets measured, but [`Breakaway::rested`] records that the precondition
+    /// did not hold so the number can be discounted.
+    pub rest_timeout_s: f32,
 }
 
 impl BreakawaySpec {
@@ -326,6 +475,8 @@ impl BreakawaySpec {
             motion_threshold_rad: 0.02,
             direction,
             rate_hz: 200.0,
+            rest_window_s: 0.3,
+            rest_timeout_s: 3.0,
         }
     }
 }
@@ -341,6 +492,10 @@ pub struct Breakaway {
     pub breakaway_position_rad: Option<f32>,
     /// The whole ramp, so the torque/velocity curve can be inspected.
     pub points: Vec<Point>,
+    /// Whether the shaft actually came to rest before the ramp started. `false`
+    /// means [`BreakawaySpec::rest_timeout_s`] expired first, so the breakaway
+    /// torque may be an artefact of pre-existing motion.
+    pub rested: bool,
     pub spec: BreakawaySpec,
     pub abort: Option<AbortReason>,
 }
@@ -359,10 +514,36 @@ pub fn run_breakaway(
     abort: &AtomicBool,
 ) -> Result<Breakaway> {
     act.set_run_mode(RunMode::Torque)?;
-    let start = act.enable()?.position_rad;
+    act.enable()?;
+
+    // Settle first: the motion test that ends the ramp would otherwise trip on
+    // motion that was already there, reporting a breakaway torque of zero.
+    // Commanding zero torque while waiting also lets a loaded shaft relax to
+    // where it actually rests, which is where the measurement belongs.
+    let period = Duration::from_secs_f32(1.0 / spec.rate_hz.max(1.0));
+    let rest_deadline = Instant::now() + Duration::from_secs_f32(spec.rest_timeout_s.max(0.0));
+    let rest_window = Duration::from_secs_f32(spec.rest_window_s.max(0.0));
+    let mut still_since: Option<Instant> = None;
+    let mut fb = act.set_torque(0.0)?;
+    let rested = loop {
+        if fb.velocity_rad_per_s.abs() <= spec.motion_threshold_rad_per_s {
+            let since = *still_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= rest_window {
+                break true;
+            }
+        } else {
+            still_since = None;
+        }
+        if Instant::now() >= rest_deadline || abort.load(Ordering::Relaxed) {
+            break false;
+        }
+        std::thread::sleep(period);
+        fb = act.set_torque(0.0)?;
+    };
+
+    let start = fb.position_rad;
     let mut guard = Guard::new(limits, start);
 
-    let period = Duration::from_secs_f32(1.0 / spec.rate_hz.max(1.0));
     let ceiling = spec.max_torque_nm.min(limits.max_torque_nm);
     let mut points = Vec::new();
     let mut stop = None;
@@ -407,6 +588,7 @@ pub fn run_breakaway(
         breakaway_torque_nm: torque_at_motion,
         breakaway_position_rad: position_at_motion,
         points,
+        rested,
         spec: *spec,
         abort: stop,
     })
@@ -424,6 +606,22 @@ pub struct ThermalSpec {
     /// Sample rate (Hz). A few Hz is plenty — motor temperature sensors are
     /// slow and typically quantized to 1 °C.
     pub rate_hz: f32,
+    /// Position "leash" stiffness (N·m/rad) holding the shaft near where it
+    /// started while the torque heats the motor. `0.0` commands open-loop
+    /// torque instead.
+    ///
+    /// A free shaft cannot be given a fixed-torque thermal test: any torque
+    /// above breakaway simply accelerates it away. On a DM-J4310 an open-loop
+    /// 1.5 N·m hold left the ±0.35 rad window in 0.1 s — the safety envelope
+    /// caught it, but no thermal data was collected. The leash is the same trick
+    /// [`crate::Excitation::MitTorque`] uses to excite a plant without letting
+    /// it run away.
+    ///
+    /// Needs native MIT control (DAMIAO / RobStride). On LKMotor the gains are
+    /// ignored, so the shaft must be mechanically restrained instead.
+    pub leash_kp: f32,
+    /// Leash damping (N·m·s/rad). Pairs with [`Self::leash_kp`].
+    pub leash_kd: f32,
 }
 
 /// Temperature response to a held torque.
@@ -492,7 +690,12 @@ pub fn run_thermal(
     limits: SafetyLimits,
     abort: &AtomicBool,
 ) -> Result<Thermal> {
-    act.set_run_mode(RunMode::Torque)?;
+    let leashed = spec.leash_kp > 0.0 || spec.leash_kd > 0.0;
+    act.set_run_mode(if leashed {
+        RunMode::Mit
+    } else {
+        RunMode::Torque
+    })?;
     let start = act.enable()?.position_rad;
     let mut guard = Guard::new(limits, start);
 
@@ -512,7 +715,11 @@ pub fn run_thermal(
         }
         let iter_start = Instant::now();
 
-        let fb = act.set_torque(spec.hold_torque_nm)?;
+        let fb = if leashed {
+            act.mit_control(start, 0.0, spec.leash_kp, spec.leash_kd, spec.hold_torque_nm)?
+        } else {
+            act.set_torque(spec.hold_torque_nm)?
+        };
         points.push(Point::from(t, spec.hold_torque_nm, &fb));
         if let Some(r) = guard.check(t, &fb) {
             stop = Some(r);
@@ -996,6 +1203,9 @@ mod tests {
             hold_torque_nm: 1.0,
             duration_s: 0.4,
             rate_hz: 500.0,
+            // Open-loop: these mock rigs implement set_torque, not MIT.
+            leash_kp: 0.0,
+            leash_kd: 0.0,
         };
         let t = run_thermal(&mut rig, &spec, roomy(), &no_abort()).unwrap();
         assert_eq!(t.abort, None);
@@ -1016,6 +1226,9 @@ mod tests {
             hold_torque_nm: 1.0,
             duration_s: 0.1,
             rate_hz: 500.0,
+            // Open-loop: these mock rigs implement set_torque, not MIT.
+            leash_kp: 0.0,
+            leash_kd: 0.0,
         };
         let t = run_thermal(&mut rig, &spec, roomy(), &no_abort()).unwrap();
         assert_eq!(t.seconds_to_limit(100.0), None);
@@ -1034,6 +1247,9 @@ mod tests {
             hold_torque_nm: 1.0,
             duration_s: 10.0,
             rate_hz: 1000.0,
+            // Open-loop: these mock rigs implement set_torque, not MIT.
+            leash_kp: 0.0,
+            leash_kd: 0.0,
         };
         let t = run_thermal(&mut rig, &spec, limits, &no_abort()).unwrap();
         assert!(
@@ -1116,6 +1332,9 @@ mod tests {
                 hold_torque_nm: 0.1,
                 duration_s: 1.0,
                 rate_hz: 100.0,
+                // Open-loop: these mock rigs implement set_torque, not MIT.
+                leash_kp: 0.0,
+                leash_kd: 0.0,
             },
             limits,
             &abort,
@@ -1144,5 +1363,474 @@ mod tests {
         assert_eq!(lines.len(), 1 + map.points.len());
         assert!(lines[0].starts_with("t_s,cmd,position_rad"));
         assert!(lines[0].ends_with("temperature_c"));
+    }
+
+    /// A friction-dominated rig: the two passes differ by 2*mu while the static
+    /// load is zero. Recovering that is the point of the return sweep, and was
+    /// the situation found on the DM-J4310 bench rig.
+    #[test]
+    fn load_map_separates_friction_from_a_zero_static_load() {
+        // No spring (k = 0), friction 0.16 N·m, reported as a direction-
+        // dependent holding torque by the stub below.
+        struct Frictional {
+            pos: f32,
+            mu: f32,
+            last_dir: f32,
+        }
+        impl Actuator for Frictional {
+            fn motor_id(&self) -> u8 {
+                1
+            }
+            fn enable(&mut self) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn disable(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_zero(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_run_mode(&mut self, _m: RunMode) -> Result<()> {
+                Ok(())
+            }
+            fn set_position(&mut self, p: f32, _v: f32) -> Result<MotorFeedback> {
+                if (p - self.pos).abs() > 1e-6 {
+                    self.last_dir = (p - self.pos).signum();
+                }
+                self.pos = p;
+                Ok(self.fb())
+            }
+            fn set_velocity(&mut self, _v: f32) -> Result<MotorFeedback> {
+                Err(misa_actuator::Error::Unsupported("no vel"))
+            }
+            fn set_torque(&mut self, _t: f32) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn mit_control(
+                &mut self,
+                _p: f32,
+                _v: f32,
+                _kp: f32,
+                _kd: f32,
+                _t: f32,
+            ) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn measure(&mut self) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn read_status(&mut self) -> Result<misa_actuator::MotorStatus> {
+                Ok(misa_actuator::MotorStatus {
+                    voltage_v: 24.0,
+                    temperature_c: 30.0,
+                    error: Default::default(),
+                })
+            }
+        }
+        impl Frictional {
+            fn fb(&self) -> MotorFeedback {
+                MotorFeedback {
+                    position_rad: self.pos,
+                    velocity_rad_per_s: 0.0,
+                    // Holding torque opposes the direction of last travel: pure
+                    // Coulomb friction, no position term at all.
+                    torque_nm: self.mu * self.last_dir,
+                    current_a: f32::NAN,
+                    temperature_c: 30.0,
+                }
+            }
+        }
+
+        let mu = 0.16;
+        let mut rig = Frictional {
+            pos: 0.0,
+            mu,
+            last_dir: 1.0,
+        };
+        let spec = LoadMapSpec {
+            settle_s: 0.0,
+            travel_timeout_s: 0.0,
+            ..LoadMapSpec::symmetric(0.1, 5)
+        };
+        let map = run_load_map(&mut rig, &spec, roomy(), &no_abort()).unwrap();
+
+        // Raw peak holding torque is just the friction level.
+        assert!((map.peak_holding_torque_nm().unwrap() - mu).abs() < 1e-3);
+        // Friction is recovered, and the static load is ~zero.
+        assert!((map.mean_friction_nm().unwrap() - mu).abs() < 1e-3);
+        assert!(
+            map.peak_static_load_nm().unwrap() < 1e-3,
+            "static load should vanish, got {:?}",
+            map.peak_static_load_nm()
+        );
+        // Which is exactly when the raw equilibrium is not to be trusted.
+        assert!(map.peak_static_load_nm().unwrap() < map.mean_friction_nm().unwrap());
+    }
+
+    /// With a spring and no friction, the de-frictioned equilibrium must agree
+    /// with the planted one and the friction estimate must vanish.
+    #[test]
+    fn static_equilibrium_matches_the_spring_with_no_friction() {
+        let mut rig = Rig::new(0.0, 4.0, 0.0, 0.5);
+        let spec = LoadMapSpec {
+            settle_s: 0.0,
+            travel_timeout_s: 0.0,
+            ..LoadMapSpec::symmetric(0.4, 5)
+        };
+        let map = run_load_map(&mut rig, &spec, roomy(), &no_abort()).unwrap();
+        let eq = map.static_equilibrium_position_rad().unwrap();
+        assert!(eq.abs() < 0.15, "de-frictioned equilibrium at {eq}");
+        assert!(map.mean_friction_nm().unwrap() < 1e-3);
+        // k = 4 N·m/rad over offsets +/-0.4 in 5 steps, but the +/-0.4 extremes
+        // are excluded from the pairing by design, so the widest paired offset
+        // is 0.2 rad => 0.8 N·m.
+        let peak = map.peak_static_load_nm().unwrap();
+        assert!((peak - 0.8).abs() < 1e-3, "spring load {peak}, expected 0.8");
+    }
+
+    /// Without a return pass there is nothing to pair, so the friction-based
+    /// views report nothing rather than guessing.
+    #[test]
+    fn friction_views_need_a_return_sweep() {
+        let mut rig = Rig::new(0.0, 4.0, 0.0, 0.5);
+        let spec = LoadMapSpec {
+            settle_s: 0.0,
+            travel_timeout_s: 0.0,
+            return_sweep: false,
+            ..LoadMapSpec::symmetric(0.2, 4)
+        };
+        let map = run_load_map(&mut rig, &spec, roomy(), &no_abort()).unwrap();
+        assert!(map.static_load_curve().is_empty());
+        assert_eq!(map.static_equilibrium_position_rad(), None);
+        assert_eq!(map.mean_friction_nm(), None);
+        assert_eq!(map.peak_static_load_nm(), None);
+    }
+
+    /// The arrival wait must not hang on a shaft that cannot reach the target:
+    /// it falls through on the travel timeout and records the stalled reading.
+    #[test]
+    fn load_map_times_out_travel_instead_of_hanging() {
+        /// A shaft clamped at 0.0 — it never arrives anywhere.
+        struct Stuck;
+        impl Actuator for Stuck {
+            fn motor_id(&self) -> u8 {
+                1
+            }
+            fn enable(&mut self) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn disable(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_zero(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_run_mode(&mut self, _m: RunMode) -> Result<()> {
+                Ok(())
+            }
+            fn set_position(&mut self, _p: f32, _v: f32) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn set_velocity(&mut self, _v: f32) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn set_torque(&mut self, _t: f32) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn mit_control(
+                &mut self,
+                _p: f32,
+                _v: f32,
+                _kp: f32,
+                _kd: f32,
+                _t: f32,
+            ) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn measure(&mut self) -> Result<MotorFeedback> {
+                Ok(MotorFeedback {
+                    position_rad: 0.0,
+                    velocity_rad_per_s: 0.0,
+                    torque_nm: 0.5,
+                    current_a: f32::NAN,
+                    temperature_c: 30.0,
+                })
+            }
+            fn read_status(&mut self) -> Result<misa_actuator::MotorStatus> {
+                Ok(misa_actuator::MotorStatus {
+                    voltage_v: 24.0,
+                    temperature_c: 30.0,
+                    error: Default::default(),
+                })
+            }
+        }
+        let spec = LoadMapSpec {
+            settle_s: 0.0,
+            travel_timeout_s: 0.02, // short, so the test stays fast
+            ..LoadMapSpec::symmetric(0.5, 3)
+        };
+        let map = run_load_map(&mut Stuck, &spec, roomy(), &no_abort()).unwrap();
+        // Every commanded point still produced a reading.
+        assert_eq!(map.points.len(), 5);
+        assert_eq!(map.abort, None);
+    }
+
+    /// A shaft that is already moving must not be read as an instant breakaway
+    /// at zero torque. This is what `--both` hit on real hardware: the second
+    /// ramp began while the shaft still coasted from the first and reported
+    /// -0.0000 N·m.
+    #[test]
+    fn breakaway_waits_for_rest_before_ramping() {
+        /// Coasts at 0.5 rad/s for the first few commands, then stops.
+        struct Coasting {
+            commands: u32,
+            settle_after: u32,
+            pos: f32,
+        }
+        impl Coasting {
+            fn fb(&self) -> MotorFeedback {
+                let moving = self.commands < self.settle_after;
+                MotorFeedback {
+                    position_rad: self.pos,
+                    velocity_rad_per_s: if moving { 0.5 } else { 0.0 },
+                    torque_nm: 0.0,
+                    current_a: f32::NAN,
+                    temperature_c: 30.0,
+                }
+            }
+        }
+        impl Actuator for Coasting {
+            fn motor_id(&self) -> u8 {
+                1
+            }
+            fn enable(&mut self) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn disable(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_zero(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_run_mode(&mut self, _m: RunMode) -> Result<()> {
+                Ok(())
+            }
+            fn set_position(&mut self, _p: f32, _v: f32) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn set_velocity(&mut self, _v: f32) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn set_torque(&mut self, _t: f32) -> Result<MotorFeedback> {
+                self.commands += 1;
+                Ok(self.fb())
+            }
+            fn mit_control(
+                &mut self,
+                _p: f32,
+                _v: f32,
+                _kp: f32,
+                _kd: f32,
+                _t: f32,
+            ) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn measure(&mut self) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn read_status(&mut self) -> Result<misa_actuator::MotorStatus> {
+                Ok(misa_actuator::MotorStatus {
+                    voltage_v: 24.0,
+                    temperature_c: 30.0,
+                    error: Default::default(),
+                })
+            }
+        }
+
+        let mut rig = Coasting {
+            commands: 0,
+            settle_after: 3,
+            pos: 0.0,
+        };
+        let spec = BreakawaySpec {
+            ramp_nm_per_s: 20.0,
+            rate_hz: 2000.0,
+            rest_window_s: 0.0, // one still sample is enough for the test
+            rest_timeout_s: 1.0,
+            ..BreakawaySpec::slow(1.0, Direction::Positive)
+        };
+        let r = run_breakaway(&mut rig, &spec, roomy(), &no_abort()).unwrap();
+        assert!(r.rested, "should have waited for stillness");
+        // Having waited, the shaft is stopped, so this rig never breaks away and
+        // the ramp runs to its ceiling — rather than reporting a bogus 0 N·m.
+        assert_eq!(r.breakaway_torque_nm, None);
+    }
+
+    /// A shaft that never settles is still measured, but flagged so the number
+    /// can be discounted rather than silently trusted.
+    #[test]
+    fn breakaway_flags_a_shaft_that_never_rests() {
+        /// Always moving.
+        struct Spinning;
+        impl Actuator for Spinning {
+            fn motor_id(&self) -> u8 {
+                1
+            }
+            fn enable(&mut self) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn disable(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_zero(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_run_mode(&mut self, _m: RunMode) -> Result<()> {
+                Ok(())
+            }
+            fn set_position(&mut self, _p: f32, _v: f32) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn set_velocity(&mut self, _v: f32) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn set_torque(&mut self, _t: f32) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn mit_control(
+                &mut self,
+                _p: f32,
+                _v: f32,
+                _kp: f32,
+                _kd: f32,
+                _t: f32,
+            ) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn measure(&mut self) -> Result<MotorFeedback> {
+                Ok(MotorFeedback {
+                    position_rad: 0.0,
+                    velocity_rad_per_s: 1.0,
+                    torque_nm: 0.0,
+                    current_a: f32::NAN,
+                    temperature_c: 30.0,
+                })
+            }
+            fn read_status(&mut self) -> Result<misa_actuator::MotorStatus> {
+                Ok(misa_actuator::MotorStatus {
+                    voltage_v: 24.0,
+                    temperature_c: 30.0,
+                    error: Default::default(),
+                })
+            }
+        }
+        let spec = BreakawaySpec {
+            ramp_nm_per_s: 20.0,
+            rate_hz: 2000.0,
+            rest_window_s: 0.05,
+            rest_timeout_s: 0.05, // gives up almost immediately
+            ..BreakawaySpec::slow(1.0, Direction::Positive)
+        };
+        let r = run_breakaway(&mut Spinning, &spec, roomy(), &no_abort()).unwrap();
+        assert!(!r.rested, "must record that stillness was never reached");
+    }
+
+    /// With a leash the run must drive `mit_control`, not `set_torque`: that is
+    /// what keeps a free shaft from accelerating out of the safety window before
+    /// any thermal data is collected.
+    #[test]
+    fn thermal_uses_mit_when_leashed_and_torque_when_not() {
+        /// Records which control path was exercised.
+        struct Counting {
+            mit: u32,
+            torque: u32,
+        }
+        impl Counting {
+            fn fb(&self) -> MotorFeedback {
+                MotorFeedback {
+                    position_rad: 0.0,
+                    velocity_rad_per_s: 0.0,
+                    torque_nm: 0.1,
+                    current_a: f32::NAN,
+                    temperature_c: 30.0,
+                }
+            }
+        }
+        impl Actuator for Counting {
+            fn motor_id(&self) -> u8 {
+                1
+            }
+            fn enable(&mut self) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn disable(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_zero(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_run_mode(&mut self, _m: RunMode) -> Result<()> {
+                Ok(())
+            }
+            fn set_position(&mut self, _p: f32, _v: f32) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn set_velocity(&mut self, _v: f32) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn set_torque(&mut self, _t: f32) -> Result<MotorFeedback> {
+                self.torque += 1;
+                Ok(self.fb())
+            }
+            fn mit_control(
+                &mut self,
+                _p: f32,
+                _v: f32,
+                _kp: f32,
+                _kd: f32,
+                _t: f32,
+            ) -> Result<MotorFeedback> {
+                self.mit += 1;
+                Ok(self.fb())
+            }
+            fn measure(&mut self) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn read_status(&mut self) -> Result<misa_actuator::MotorStatus> {
+                Ok(misa_actuator::MotorStatus {
+                    voltage_v: 24.0,
+                    temperature_c: 30.0,
+                    error: Default::default(),
+                })
+            }
+        }
+
+        let base = ThermalSpec {
+            hold_torque_nm: 0.2,
+            duration_s: 0.05,
+            rate_hz: 500.0,
+            leash_kp: 0.0,
+            leash_kd: 0.0,
+        };
+
+        let mut open = Counting { mit: 0, torque: 0 };
+        run_thermal(&mut open, &base, roomy(), &no_abort()).unwrap();
+        assert!(open.torque > 0, "open-loop must use set_torque");
+        assert_eq!(open.mit, 0, "open-loop must not use mit_control");
+
+        let mut leashed = Counting { mit: 0, torque: 0 };
+        let spec = ThermalSpec {
+            leash_kp: 8.0,
+            leash_kd: 0.5,
+            ..base
+        };
+        run_thermal(&mut leashed, &spec, roomy(), &no_abort()).unwrap();
+        assert!(leashed.mit > 0, "leashed must use mit_control");
+        // The final safe-stop still commands zero torque, so allow exactly that.
+        assert!(
+            leashed.torque <= 1,
+            "leashed must not drive open-loop torque during the hold, got {}",
+            leashed.torque
+        );
     }
 }

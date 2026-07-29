@@ -5,3 +5,10 @@
 *.csv
 # scripts/hw_check.sh run logs
 /hw_check_logs/
+
+# Vendor manuals (PDF) and vendor SDK checkouts are large binaries kept only
+# in the working tree — the markdown transcriptions under ref/*.md are the
+# committed reference. Note the 5 PDFs committed before this rule remain
+# tracked; .gitignore does not untrack existing files.
+crates/*/ref/*.pdf
+crates/*/ref/sdk/

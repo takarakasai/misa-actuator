@@ -92,7 +92,8 @@ pub use scan::{probe_one, scan_bus_on, ScanProgress};
 pub use damiao_protocol as protocol;
 
 pub use damiao_protocol::{
-    ControlMode, ErrorCode, Feedback, Limits, MotorModel, Rid, DEFAULT_MASTER_ID,
+    ControlMode, ErrorCode, Feedback, Limits, LimitsSource, ModelReg, MotorModel, RegisterLayout,
+    Rid, DEFAULT_MASTER_ID,
 };
 
 #[cfg(test)]

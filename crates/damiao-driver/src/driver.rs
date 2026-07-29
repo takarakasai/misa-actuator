@@ -20,7 +20,8 @@ use damiao_protocol::{
     build_clear_error_frame, build_disable_frame, build_enable_frame, build_mit_frame,
     build_pos_vel_frame, build_read_reg, build_save_all, build_set_zero_frame, build_vel_frame,
     build_write_reg_f32, build_write_reg_int, parse_feedback, parse_reg_reply, ControlMode,
-    Feedback, Limits, MotorModel, RegReply, Rid, DATA_LEN, DEFAULT_MASTER_ID, REGISTER_ID,
+    Feedback, Limits, ModelReg, MotorModel, RegReply, Rid, DATA_LEN, DEFAULT_MASTER_ID,
+    REGISTER_ID,
 };
 
 use crate::bus::{DamiaoBus, SocketCanBus, SocketCanFdBus};
@@ -149,6 +150,15 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
     /// The quantization limits in effect.
     pub fn limits(&self) -> Limits {
         self.limits
+    }
+
+    /// Overwrite the MIT quantization limits in effect.
+    ///
+    /// Prefer [`Self::refresh_limits_from_registers`], which reads them from
+    /// the motor. Use this only when the values come from somewhere the driver
+    /// cannot reach (a saved config, a model not in [`MotorModel`]).
+    pub fn set_limits(&mut self, limits: Limits) {
+        self.limits = limits;
     }
     /// Driver's tracked control mode.
     pub fn mode(&self) -> ControlMode {
@@ -449,6 +459,81 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
         let (id, data) = build_read_reg(self.can_id, rid);
         self.send(id, &data)?;
         self.recv_reg_reply(rid)
+    }
+
+    /// Replace the MIT quantization limits with the motor's own
+    /// `PMAX`/`VMAX`/`TMAX` registers (RID `0x15`/`0x16`/`0x17`), and return
+    /// what was read.
+    ///
+    /// **This is the authoritative source for MIT scaling.** The per-model
+    /// defaults from [`MotorModel::limits`] are only that — defaults: no
+    /// official manual states concrete mapping ranges for any model (they are
+    /// documented purely as writable registers with range `(0.0, fmax]`), and
+    /// the vendor SDK's `Limit_Param` table contradicts itself across its own
+    /// four copies. The vendor SDK has the same escape hatch
+    /// (`changeMotorLimit`), so reading the registers is the intended flow
+    /// rather than a workaround.
+    ///
+    /// Call this once after opening a motor — especially when
+    /// [`MotorModel::limits_source`] is not
+    /// [`LimitsSource::Sdk`](damiao_protocol::LimitsSource::Sdk) — before
+    /// issuing MIT commands. Position, velocity and torque are all quantized
+    /// against these ranges, so a mismatch silently mis-scales every MIT
+    /// command and every decoded feedback value rather than raising an error.
+    ///
+    /// Kp/Kd ranges are fixed by the protocol (`[0,500]` / `[0,5]`) and are
+    /// left untouched.
+    pub fn refresh_limits_from_registers(&mut self) -> Result<Limits> {
+        let p_max = self.read_register(Rid::PMAX)?.as_f32();
+        let v_max = self.read_register(Rid::VMAX)?.as_f32();
+        let t_max = self.read_register(Rid::TMAX)?.as_f32();
+        // A zero or negative range would make the quantizer divide the field
+        // across an empty interval; the manual's own range is `(0.0, fmax]`,
+        // so treat anything outside that as a failed/garbled read and keep
+        // the previous limits rather than poisoning all later scaling.
+        if !(p_max > 0.0 && v_max > 0.0 && t_max > 0.0) {
+            return Err(Error::InvalidResponse(format!(
+                "motor {} returned non-positive MIT ranges (PMAX={p_max}, VMAX={v_max}, \
+                 TMAX={t_max}); keeping previous limits",
+                self.can_id
+            )));
+        }
+        self.limits = Limits {
+            p_max,
+            v_max,
+            t_max,
+            ..self.limits
+        };
+        log::info!(
+            "damiao motor {}: MIT limits from registers — PMAX={} VMAX={} TMAX={}",
+            self.can_id,
+            p_max,
+            v_max,
+            t_max
+        );
+        Ok(self.limits)
+    }
+
+    /// Read a model-specific register by meaning rather than by RID.
+    ///
+    /// These registers live above the common `0x00`–`0x25` block, where the
+    /// DM4310 and DM3507 maps diverge — `m_off` in particular sits at a
+    /// different address on each. Resolving through [`ModelReg`] against the
+    /// configured [`Self::model`] makes it impossible to read the wrong
+    /// address for the motor in hand.
+    ///
+    /// Fails with [`Error::Unsupported`] if this model's register map does
+    /// not document `reg`, rather than reading an undocumented address and
+    /// returning a meaningless value.
+    pub fn read_model_register(&mut self, reg: ModelReg) -> Result<RegReply> {
+        match reg.rid(self.model) {
+            Some(rid) => self.read_register(rid),
+            None => Err(Error::Unsupported {
+                motor_id: self.can_id,
+                model: self.model.name(),
+                op: reg.name(),
+            }),
+        }
     }
 
     /// Write an integer register and persist nothing (volatile until saved).

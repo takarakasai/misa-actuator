@@ -190,9 +190,11 @@ mod tests {
 
     #[test]
     fn pos_vel_and_vel_are_le_floats() {
-        let (id, data) = build_pos_vel_frame(1, 3.14, 5.0);
+        // Arbitrary exactly-representable float — this test only checks the
+        // little-endian byte round-trip, not any particular constant.
+        let (id, data) = build_pos_vel_frame(1, 1.25, 5.0);
         assert_eq!(id, 0x101);
-        assert_eq!(f32::from_le_bytes([data[0], data[1], data[2], data[3]]), 3.14);
+        assert_eq!(f32::from_le_bytes([data[0], data[1], data[2], data[3]]), 1.25);
         assert_eq!(f32::from_le_bytes([data[4], data[5], data[6], data[7]]), 5.0);
 
         let (id, data) = build_vel_frame(1, -2.5);

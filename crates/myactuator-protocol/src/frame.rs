@@ -6,6 +6,7 @@
 use crate::feedback::{
     ErrorState, PidIndex, RunMode, SingleTurnEncoder, Status1, Status2, Status3,
 };
+use crate::param::ParamIndex;
 
 /// All V3 frames carry exactly 8 data bytes.
 pub const DATA_LEN: usize = 8;
@@ -80,6 +81,13 @@ pub enum Cmd {
     ReadVersionDate = 0xB2,
     /// Read the motor model name (ASCII).
     ReadMotorModel = 0xB5,
+    /// Generic indexed parameter read/write, selected by [`crate::ParamIndex`]
+    /// (undocumented — reverse-engineered from Setup Software V4.0 traffic,
+    /// see `doc/setup-software-c0-param-protocol.md`).
+    ReadWriteParam = 0xC0,
+    /// Commit all `ReadWriteParam` RAM writes to flash (undocumented, same
+    /// source as `ReadWriteParam`).
+    CommitParams = 0xC1,
 }
 
 /// A command byte followed by 7 zero bytes — the shape of every "plain" frame.
@@ -206,6 +214,32 @@ pub const fn build_set_zero_rom() -> [u8; DATA_LEN] {
 pub const fn build_function_control(index: u8, value: i32) -> [u8; DATA_LEN] {
     let v = value.to_le_bytes();
     [Cmd::FunctionControl as u8, index, 0, 0, v[0], v[1], v[2], v[3]]
+}
+
+/// `0xC0` (undocumented) — read one parameter, selected by [`ParamIndex`].
+/// Wire layout: `[0xC0, 0x00, index, 0x01, 0, 0, 0, 0]` — byte 3 is a flag
+/// (`0x01` = read, `0x00` = write, see [`build_write_param`]); the request's
+/// value bytes are ignored on a read. See
+/// `doc/setup-software-c0-param-protocol.md` §1.
+pub const fn build_read_param(index: ParamIndex) -> [u8; DATA_LEN] {
+    [Cmd::ReadWriteParam as u8, 0x00, index.code(), 0x01, 0, 0, 0, 0]
+}
+
+/// `0xC0` (undocumented) — write one parameter to RAM, selected by
+/// [`ParamIndex`]. Takes effect immediately but is lost on power-cycle
+/// unless followed by [`build_commit_params`]. See
+/// `doc/setup-software-c0-param-protocol.md` §1, §1.5 for a caveat on
+/// [`ParamIndex::EnableCanFilter`] specifically (write observed not to take
+/// effect via this path).
+pub fn build_write_param(index: ParamIndex, value: f32) -> [u8; DATA_LEN] {
+    let v = value.to_le_bytes();
+    [Cmd::ReadWriteParam as u8, 0x00, index.code(), 0x00, v[0], v[1], v[2], v[3]]
+}
+
+/// `0xC1` (undocumented) — commit all `ReadWriteParam` RAM writes to flash.
+/// No payload. See `doc/setup-software-c0-param-protocol.md` §2.
+pub const fn build_commit_params() -> [u8; DATA_LEN] {
+    plain(Cmd::CommitParams)
 }
 
 /// `0xA1` — torque closed-loop control. `iq_centi_amps` is the target torque
@@ -399,6 +433,20 @@ pub fn parse_version_date(data: &[u8]) -> Option<u32> {
     Some(u32::from_le_bytes([data[4], data[5], data[6], data[7]]))
 }
 
+/// Parse a `ReadWriteParam` reply (`0xC0`, undocumented) into its `f32`
+/// value. `data[2]` echoes the requested [`ParamIndex`] but isn't checked
+/// here — callers issuing concurrent requests for different indices should
+/// verify it matches. Used for both read replies (value = current setting)
+/// and write replies (value = an ack whose meaning is not understood, see
+/// `doc/setup-software-c0-param-protocol.md` §1 — don't rely on it to judge
+/// write success).
+pub fn parse_param_value(data: &[u8]) -> Option<f32> {
+    if data.len() < DATA_LEN || data[0] != Cmd::ReadWriteParam as u8 {
+        return None;
+    }
+    Some(f32::from_le_bytes([data[4], data[5], data[6], data[7]]))
+}
+
 /// Parse a motor-model reply (`0xB5`) into its raw ASCII bytes (`data[1..8]`,
 /// up to 7 characters; unused trailing bytes are typically `0x00`).
 pub fn parse_motor_model(data: &[u8]) -> Option<[u8; 7]> {
@@ -498,6 +546,53 @@ mod new_command_tests {
         let s = parse_status1(&data).unwrap();
         assert_eq!(s.temperature_c, 50);
         assert_eq!(s.mos_temperature_c, 0);
+    }
+
+    // `0xC0`/`0xC1` (undocumented, no manual — reverse-engineered from a live
+    // capture of Setup Software V4.0 against a real X4-36, FW `2026042402`).
+    // See `doc/setup-software-c0-param-protocol.md`. Byte arrays below are
+    // taken verbatim from that capture.
+
+    #[test]
+    fn read_param_request_layout_matches_capture() {
+        // Over Voltage read request: C0 00 13 01 00 00 00 00.
+        assert_eq!(
+            build_read_param(ParamIndex::OverVoltage),
+            [0xC0, 0x00, 0x13, 0x01, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn read_param_reply_matches_capture() {
+        // Over Voltage read reply: C0 00 13 01 00 00 5C 42 -> 55.0.
+        let data = [0xC0, 0x00, 0x13, 0x01, 0x00, 0x00, 0x5C, 0x42];
+        assert_eq!(parse_param_value(&data), Some(55.0));
+    }
+
+    #[test]
+    fn write_param_request_layout_matches_capture() {
+        // Brake Mode write (Resistor = 1.0): C0 00 19 00 00 00 80 3F.
+        assert_eq!(
+            build_write_param(ParamIndex::BrakeMode, 1.0),
+            [0xC0, 0x00, 0x19, 0x00, 0x00, 0x00, 0x80, 0x3F]
+        );
+        // ... and back to E-Brake = 0.0: C0 00 19 00 00 00 00 00.
+        assert_eq!(
+            build_write_param(ParamIndex::BrakeMode, 0.0),
+            [0xC0, 0x00, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn commit_params_request_matches_capture() {
+        // C1 00 00 00 00 00 00 00.
+        assert_eq!(build_commit_params(), [0xC1, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn param_value_wrong_command_byte_is_rejected() {
+        let data = [0xB2, 0x00, 0x13, 0x01, 0x00, 0x00, 0x5C, 0x42];
+        assert_eq!(parse_param_value(&data), None);
     }
 }
 

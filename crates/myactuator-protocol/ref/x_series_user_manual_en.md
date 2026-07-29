@@ -4,6 +4,10 @@
 **Version:** V1.1
 **Date:** 2025.05
 
+*Source: `ref/X_Series_User_Manual_en.pdf`. `ref/User Manual for X Series Products V1.1-250516.pdf`*
+*(added 2026-07-26) is the same V1.1 manual re-exported with one added paragraph — merged into*
+*the Preface below rather than duplicating this file.*
+
 ---
 
 ## Table of Contents
@@ -46,6 +50,14 @@ Thanks for choosing MYACTUATOR.
 X series joint module is a highly integrated joint module provided by the company under the premise of years of experience accumulation for customer service, which has a large transmission speed ratio, strong bearing capacity, precise control, is easy to carry, and saves a lot of time for developers.
 
 This manual introduces the parameters, usage methods, precautions, and other information of the X series integrated harmonic module. Please read carefully before starting to operate.
+
+If you need to know more about our company's other products, please contact us.
+
+*(The source PDF shows CN/EN website QR codes here, not reproducible in Markdown.)*
+
+- **Company name:** Suzhou Micro Actuator Technology Co., Ltd
+- **Hotline:** 400-998-9592
+- **Address:** Building 2, No. 599, Yuanchuang Road, Huaqiao Town, Kunshan City, Jiangsu Province
 
 ## Imprint Notice
 

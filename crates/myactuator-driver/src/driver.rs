@@ -21,19 +21,21 @@ use std::f32::consts::PI;
 use std::time::{Duration, Instant};
 
 use myactuator_protocol::{
-    build_brake_lock, build_brake_release, build_function_control, build_motion_control,
-    build_position_control, build_read_acceleration, build_read_motor_model,
+    build_brake_lock, build_brake_release, build_commit_params, build_function_control,
+    build_motion_control, build_position_control, build_read_acceleration, build_read_motor_model,
     build_read_motor_power, build_read_multi_turn_angle, build_read_multi_turn_encoder,
-    build_read_multi_turn_encoder_raw, build_read_multi_turn_zero_offset, build_read_pid,
-    build_read_run_mode, build_read_single_turn_angle, build_read_single_turn_encoder,
-    build_read_status1, build_read_status2, build_read_status3, build_read_uptime,
-    build_read_version_date, build_set_zero_rom, build_shutdown, build_speed_control, build_stop,
-    build_system_reset, build_torque_control, can_id, parse_acceleration, parse_motion_reply,
-    parse_motor_model, parse_motor_power, parse_multi_turn_angle, parse_multi_turn_encoder,
-    parse_multi_turn_encoder_raw, parse_multi_turn_zero_offset, parse_pid_value, parse_run_mode,
+    build_read_multi_turn_encoder_raw, build_read_multi_turn_zero_offset, build_read_param,
+    build_read_pid, build_read_run_mode, build_read_single_turn_angle,
+    build_read_single_turn_encoder, build_read_status1, build_read_status2, build_read_status3,
+    build_read_uptime, build_read_version_date, build_set_zero_rom, build_shutdown,
+    build_speed_control, build_stop, build_system_reset, build_torque_control, build_write_param,
+    can_id, parse_acceleration, parse_motion_reply, parse_motor_model, parse_motor_power,
+    parse_multi_turn_angle, parse_multi_turn_encoder, parse_multi_turn_encoder_raw,
+    parse_multi_turn_zero_offset, parse_param_value, parse_pid_value, parse_run_mode,
     parse_single_turn_angle, parse_single_turn_encoder, parse_status1, parse_status2,
     parse_status3, parse_uptime, parse_version_date, AccelIndex, ErrorState, MotionFeedback,
-    PidGains, PidIndex, RunMode, SingleTurnEncoder, Status1, Status2, Status3, DATA_LEN,
+    ParamIndex, PidGains, PidIndex, RunMode, SingleTurnEncoder, Status1, Status2, Status3,
+    DATA_LEN,
 };
 
 use crate::bus::{MyActuatorBus, SocketCanBus};
@@ -280,6 +282,31 @@ impl<B: MyActuatorBus> MyActuatorMotor<B> {
         })
     }
 
+    /// Read one parameter from the undocumented `0xC0` indexed space,
+    /// selected by [`ParamIndex`] — Protect/Plan/Motor Parameters and a
+    /// second PID-gain set (Kd/R(Slope)/T(Filter) per loop), reverse
+    /// engineered from Setup Software V4.0 traffic. See
+    /// `myactuator-protocol/doc/setup-software-c0-param-protocol.md`.
+    pub fn read_param(&mut self, index: ParamIndex) -> Result<f32> {
+        let reply = self.transact(build_read_param(index))?;
+        parse_param_value(&reply).ok_or_else(|| Error::InvalidResponse("bad 0xC0 read reply".into()))
+    }
+
+    /// Write one parameter to RAM (`0xC0`, undocumented). Lost on power-cycle
+    /// unless followed by [`Self::commit_params`]. [`ParamIndex::EnableCanFilter`]
+    /// is known **not** to take effect via this path on real hardware — see
+    /// the doc referenced on [`Self::read_param`], §1.5.
+    pub fn write_param(&mut self, index: ParamIndex, value: f32) -> Result<()> {
+        self.transact(build_write_param(index, value))?;
+        Ok(())
+    }
+
+    /// Commit all `0xC0` RAM writes to flash (`0xC1`, undocumented).
+    pub fn commit_params(&mut self) -> Result<()> {
+        self.transact(build_commit_params())?;
+        Ok(())
+    }
+
     /// Read one acceleration/deceleration value (`0x42`) in 1 dps/s (manual
     /// range 100-60000 per the X4-36 V4.3 manual; the plain V3.9 manual's own
     /// text is internally inconsistent, citing 50 in one section and 100 in
@@ -435,6 +462,15 @@ impl<B: MyActuatorBus> MyActuatorMotor<B> {
 
     /// Function control (`0x20`): `index` 1 = clear multi-turn value (takes
     /// effect after restart), 2 = CANID-filter enable. See the V3.9 manual.
+    ///
+    /// **Real-hardware caveat** (index 2, disable direction): sending
+    /// `index=2, value=0` to disable the CAN-ID filter, even followed by
+    /// [`Self::commit_params`], was observed on a real X4-36 to **not** take
+    /// effect — a subsequent read of [`ParamIndex::EnableCanFilter`] via
+    /// [`Self::read_param`] still reported the filter enabled. Unclear
+    /// whether a power-cycle is required or this direction is simply
+    /// unsupported on this firmware. See
+    /// `myactuator-protocol/doc/setup-software-c0-param-protocol.md` §1.5.
     pub fn function_control(&mut self, index: u8, value: i32) -> Result<()> {
         self.transact(build_function_control(index, value))?;
         Ok(())

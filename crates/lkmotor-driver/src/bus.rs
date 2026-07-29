@@ -6,10 +6,11 @@
 //! blanket-implemented for any [`LkBus`] type. New transports only need to
 //! wire up the wire I/O — every typed helper comes for free.
 
-use lkmotor_protocol::command::{Command, ControlParamId};
+use lkmotor_protocol::command::{Command, ControlParamId, SettingParamId};
 use lkmotor_protocol::response::{
-    ControlParamValue, MotorState1, MotorState2, PidTriple, parse_control_param,
-    parse_multi_turn_angle, parse_state1, parse_state2, parse_state2_payload,
+    ControlParamValue, MotorState1, MotorState2, PidTriple, SettingParamValue,
+    parse_brake_state, parse_control_param, parse_multi_turn_angle, parse_setting_param,
+    parse_state1, parse_state2, parse_state2_payload,
 };
 
 use misa_actuator::Shared;
@@ -38,6 +39,10 @@ pub trait LkBus {
     /// Send a request and return the next response addressed to `motor_id`.
     fn transact(&mut self, command: u8, motor_id: MotorId, data: &[u8]) -> Result<Response>;
 
+    /// Send a request that the motor does not reply to (e.g.
+    /// [`Command::MotorRestart`]) — fire-and-forget, no wait for a response.
+    fn send_only(&mut self, command: u8, motor_id: MotorId, data: &[u8]) -> Result<()>;
+
     /// Discard any buffered/in-flight bytes on the wire.
     fn flush_rx(&mut self) -> Result<()>;
 }
@@ -49,6 +54,10 @@ pub trait LkBus {
 impl<B: LkBus> LkBus for Shared<B> {
     fn transact(&mut self, command: u8, motor_id: MotorId, data: &[u8]) -> Result<Response> {
         self.lock().transact(command, motor_id, data)
+    }
+
+    fn send_only(&mut self, command: u8, motor_id: MotorId, data: &[u8]) -> Result<()> {
+        self.lock().send_only(command, motor_id, data)
     }
 
     fn flush_rx(&mut self) -> Result<()> {
@@ -143,6 +152,195 @@ pub trait LkCommands: LkBus {
         }
     }
 
+    /// Convenience wrapper for the torque/current limit (`paramID = 0x1E`).
+    fn read_torque_limit(&mut self, motor_id: MotorId) -> Result<i16> {
+        match self.read_control_param(motor_id, ControlParamId::TorqueLimit)? {
+            ControlParamValue::TorqueLimit(v) => Ok(v),
+            _ => unreachable!("parse_control_param returned wrong variant for TorqueLimit"),
+        }
+    }
+
+    /// Convenience wrapper for the speed limit (`paramID = 0x20`, 0.01 deg/s units).
+    fn read_speed_limit(&mut self, motor_id: MotorId) -> Result<i32> {
+        match self.read_control_param(motor_id, ControlParamId::SpeedLimit)? {
+            ControlParamValue::SpeedLimit(v) => Ok(v),
+            _ => unreachable!("parse_control_param returned wrong variant for SpeedLimit"),
+        }
+    }
+
+    /// Convenience wrapper for the angle limit (`paramID = 0x22`, 0.01 deg units).
+    fn read_angle_limit(&mut self, motor_id: MotorId) -> Result<i32> {
+        match self.read_control_param(motor_id, ControlParamId::AngleLimit)? {
+            ControlParamValue::AngleLimit(v) => Ok(v),
+            _ => unreachable!("parse_control_param returned wrong variant for AngleLimit"),
+        }
+    }
+
+    /// Convenience wrapper for the current ramp (`paramID = 0x24`).
+    fn read_current_ramp(&mut self, motor_id: MotorId) -> Result<i32> {
+        match self.read_control_param(motor_id, ControlParamId::CurrentRamp)? {
+            ControlParamValue::CurrentRamp(v) => Ok(v),
+            _ => unreachable!("parse_control_param returned wrong variant for CurrentRamp"),
+        }
+    }
+
+    /// Convenience wrapper for the speed ramp (`paramID = 0x26`, 1 dps/s units).
+    fn read_speed_ramp(&mut self, motor_id: MotorId) -> Result<i32> {
+        match self.read_control_param(motor_id, ControlParamId::SpeedRamp)? {
+            ControlParamValue::SpeedRamp(v) => Ok(v),
+            _ => unreachable!("parse_control_param returned wrong variant for SpeedRamp"),
+        }
+    }
+
+    /// Read a setting parameter (`0x40`, "Setting Parameter Table" — a
+    /// *different* parameter space from [`Self::read_control_param`], see
+    /// [`SettingParamId`]'s doc comment).
+    fn read_setting_param(
+        &mut self,
+        motor_id: MotorId,
+        param: SettingParamId,
+    ) -> Result<SettingParamValue> {
+        let data = [0x05u8, param.code(), 0, 0, 0, 0, 0];
+        let resp = self.transact(Command::ReadSettingParam.code(), motor_id, &data)?;
+        Ok(parse_setting_param(resp.command, &resp.data, param)?)
+    }
+
+    /// Convenience wrapper for the driver ID setting.
+    fn read_driver_id(&mut self, motor_id: MotorId) -> Result<u8> {
+        match self.read_setting_param(motor_id, SettingParamId::DriverId)? {
+            SettingParamValue::DriverId(v) => Ok(v),
+            _ => unreachable!("parse_setting_param returned wrong variant for DriverId"),
+        }
+    }
+
+    /// Convenience wrapper for the bus-type setting (0=None, 1=RS485, 2=CAN).
+    fn read_bus_type(&mut self, motor_id: MotorId) -> Result<u8> {
+        match self.read_setting_param(motor_id, SettingParamId::BusType)? {
+            SettingParamValue::BusType(v) => Ok(v),
+            _ => unreachable!("parse_setting_param returned wrong variant for BusType"),
+        }
+    }
+
+    /// Convenience wrapper for the RS485 baud-rate code setting.
+    fn read_rs485_baudrate(&mut self, motor_id: MotorId) -> Result<u8> {
+        match self.read_setting_param(motor_id, SettingParamId::Rs485Baudrate)? {
+            SettingParamValue::Rs485Baudrate(v) => Ok(v),
+            _ => unreachable!("parse_setting_param returned wrong variant for Rs485Baudrate"),
+        }
+    }
+
+    /// Convenience wrapper for the CAN baud-rate code setting.
+    fn read_can_baudrate(&mut self, motor_id: MotorId) -> Result<u8> {
+        match self.read_setting_param(motor_id, SettingParamId::CanBaudrate)? {
+            SettingParamValue::CanBaudrate(v) => Ok(v),
+            _ => unreachable!("parse_setting_param returned wrong variant for CanBaudrate"),
+        }
+    }
+
+    /// Convenience wrapper for the max-power setting.
+    fn read_max_power(&mut self, motor_id: MotorId) -> Result<i16> {
+        match self.read_setting_param(motor_id, SettingParamId::MaxPower)? {
+            SettingParamValue::MaxPower(v) => Ok(v),
+            _ => unreachable!("parse_setting_param returned wrong variant for MaxPower"),
+        }
+    }
+
+    /// Convenience wrapper for the max-speed setting (0.01 deg/s units).
+    fn read_max_speed_setting(&mut self, motor_id: MotorId) -> Result<i32> {
+        match self.read_setting_param(motor_id, SettingParamId::MaxSpeed)? {
+            SettingParamValue::MaxSpeed(v) => Ok(v),
+            _ => unreachable!("parse_setting_param returned wrong variant for MaxSpeed"),
+        }
+    }
+
+    /// Convenience wrapper for the max-angle setting (0.01 deg units).
+    fn read_max_angle_setting(&mut self, motor_id: MotorId) -> Result<i32> {
+        match self.read_setting_param(motor_id, SettingParamId::MaxAngle)? {
+            SettingParamValue::MaxAngle(v) => Ok(v),
+            _ => unreachable!("parse_setting_param returned wrong variant for MaxAngle"),
+        }
+    }
+
+    /// Convenience wrapper for the (persisted) current-ramp setting. **Note**:
+    /// this is `int16` per the Setting Parameter Table, unlike
+    /// [`Self::read_current_ramp`]'s `int32` — see [`SettingParamId::CurrentRamp`].
+    fn read_setting_current_ramp(&mut self, motor_id: MotorId) -> Result<i16> {
+        match self.read_setting_param(motor_id, SettingParamId::CurrentRamp)? {
+            SettingParamValue::CurrentRamp(v) => Ok(v),
+            _ => unreachable!("parse_setting_param returned wrong variant for CurrentRamp"),
+        }
+    }
+
+    /// Convenience wrapper for the (persisted) speed-ramp setting (1 dps/s units).
+    fn read_setting_speed_ramp(&mut self, motor_id: MotorId) -> Result<i32> {
+        match self.read_setting_param(motor_id, SettingParamId::SpeedRamp)? {
+            SettingParamValue::SpeedRamp(v) => Ok(v),
+            _ => unreachable!("parse_setting_param returned wrong variant for SpeedRamp"),
+        }
+    }
+
+    /// Write an 8-bit setting parameter (`0x42`) to RAM — see
+    /// [`Self::save_setting_params`] to persist it. Only
+    /// [`SettingParamId::DriverId`], [`SettingParamId::BusType`],
+    /// [`SettingParamId::Rs485Baudrate`], and [`SettingParamId::CanBaudrate`]
+    /// take a `u8` value; passing another [`SettingParamId`] here would
+    /// encode a nonsensical write, so callers should stick to those four.
+    fn write_setting_param_u8(
+        &mut self,
+        motor_id: MotorId,
+        param: SettingParamId,
+        value: u8,
+    ) -> Result<SettingParamValue> {
+        let data = [0x05u8, param.code(), value, 0, 0, 0, 0];
+        let resp = self.transact(Command::WriteSettingParam.code(), motor_id, &data)?;
+        Ok(parse_setting_param(resp.command, &resp.data, param)?)
+    }
+
+    /// Write a 16-bit setting parameter (`0x42`) to RAM —
+    /// [`SettingParamId::MaxPower`] or [`SettingParamId::CurrentRamp`].
+    fn write_setting_param_i16(
+        &mut self,
+        motor_id: MotorId,
+        param: SettingParamId,
+        value: i16,
+    ) -> Result<SettingParamValue> {
+        let mut data = [0x05u8, param.code(), 0, 0, 0, 0, 0];
+        data[2..4].copy_from_slice(&value.to_le_bytes());
+        let resp = self.transact(Command::WriteSettingParam.code(), motor_id, &data)?;
+        Ok(parse_setting_param(resp.command, &resp.data, param)?)
+    }
+
+    /// Write a 32-bit setting parameter (`0x42`) to RAM —
+    /// [`SettingParamId::MaxSpeed`], [`SettingParamId::MaxAngle`], or
+    /// [`SettingParamId::SpeedRamp`].
+    fn write_setting_param_i32(
+        &mut self,
+        motor_id: MotorId,
+        param: SettingParamId,
+        value: i32,
+    ) -> Result<SettingParamValue> {
+        let mut data = [0x05u8, param.code(), 0, 0, 0, 0, 0];
+        data[2..6].copy_from_slice(&value.to_le_bytes());
+        let resp = self.transact(Command::WriteSettingParam.code(), motor_id, &data)?;
+        Ok(parse_setting_param(resp.command, &resp.data, param)?)
+    }
+
+    /// Commit all `write_setting_param_*` RAM writes to ROM (`0x44`). Takes
+    /// effect after [`Self::motor_restart`] or a power cycle.
+    fn save_setting_params(&mut self, motor_id: MotorId) -> Result<()> {
+        let data = [0x05u8, 0xFA, 0, 0, 0, 0, 0];
+        self.transact(Command::SaveSettingParam.code(), motor_id, &data)?;
+        Ok(())
+    }
+
+    /// Restart the motor (`0x07`), equivalent to a power cycle. The motor
+    /// sends no reply, so this uses [`LkBus::send_only`] rather than
+    /// [`LkBus::transact`] (which would otherwise time out waiting for a
+    /// response that never arrives).
+    fn motor_restart(&mut self, motor_id: MotorId) -> Result<()> {
+        self.send_only(Command::MotorRestart.code(), motor_id, &[])
+    }
+
     /// Closed-loop torque/current control (`0xA1`).
     fn torque_control(&mut self, motor_id: MotorId, current_a: f32) -> Result<Response> {
         let raw = current_amps_to_raw(current_a);
@@ -184,6 +382,83 @@ pub trait LkCommands: LkBus {
     fn read_multi_turn_angle(&mut self, motor_id: MotorId) -> Result<i64> {
         let resp = self.transact(Command::ReadMultiTurnAngle.code(), motor_id, &[])?;
         Ok(parse_multi_turn_angle(resp.command, &resp.data)?)
+    }
+
+    /// Single-turn position control 1 (`0xA5`). `counterclockwise`: `false`=CW,
+    /// `true`=CCW. `angle_centideg` is unsigned `0.01 deg/LSB`. Reply is
+    /// State2-shaped — decode with [`parse_state2_from_response`].
+    fn position_control_singleturn(
+        &mut self,
+        motor_id: MotorId,
+        counterclockwise: bool,
+        angle_centideg: u32,
+    ) -> Result<Response> {
+        let mut data = [0u8; 7];
+        data[0] = counterclockwise as u8;
+        data[3..7].copy_from_slice(&angle_centideg.to_le_bytes());
+        self.transact(Command::PositionClosedLoop3.code(), motor_id, &data)
+    }
+
+    /// Single-turn position control 2 (`0xA6`) — as
+    /// [`Self::position_control_singleturn`] plus a max-speed cap (1 dps/LSB).
+    fn position_control_singleturn_with_speed(
+        &mut self,
+        motor_id: MotorId,
+        counterclockwise: bool,
+        max_speed_dps: u16,
+        angle_centideg: u32,
+    ) -> Result<Response> {
+        let mut data = [0u8; 7];
+        data[0] = counterclockwise as u8;
+        data[1..3].copy_from_slice(&max_speed_dps.to_le_bytes());
+        data[3..7].copy_from_slice(&angle_centideg.to_le_bytes());
+        self.transact(Command::PositionClosedLoop4.code(), motor_id, &data)
+    }
+
+    /// Incremental position control 1 (`0xA7`). `angle_increment_centideg` is
+    /// signed `0.01 deg/LSB`; the sign selects the direction of motion.
+    fn position_control_incremental(
+        &mut self,
+        motor_id: MotorId,
+        angle_increment_centideg: i32,
+    ) -> Result<Response> {
+        let mut data = [0u8; 7];
+        data[3..7].copy_from_slice(&angle_increment_centideg.to_le_bytes());
+        self.transact(Command::IncrementalPosition1.code(), motor_id, &data)
+    }
+
+    /// Incremental position control 2 (`0xA8`) — as
+    /// [`Self::position_control_incremental`] plus a max-speed cap. **Note**:
+    /// wire field is 2 bytes (`u16`) despite the manual's prose claiming
+    /// `uint32_t` — see `lkmotor_protocol::request::encode_position_incremental_with_speed`.
+    fn position_control_incremental_with_speed(
+        &mut self,
+        motor_id: MotorId,
+        max_speed_dps: u16,
+        angle_increment_centideg: i32,
+    ) -> Result<Response> {
+        let mut data = [0u8; 7];
+        data[1..3].copy_from_slice(&max_speed_dps.to_le_bytes());
+        data[3..7].copy_from_slice(&angle_increment_centideg.to_le_bytes());
+        self.transact(Command::IncrementalPosition2.code(), motor_id, &data)
+    }
+
+    /// Engage or release the brake (`0x8C`). `released=false` holds the
+    /// output (brake engaged); `released=true` frees it.
+    fn set_brake(&mut self, motor_id: MotorId, released: bool) -> Result<bool> {
+        let mut data = [0u8; 7];
+        data[0] = released as u8;
+        let resp = self.transact(Command::BrakeControl.code(), motor_id, &data)?;
+        Ok(parse_brake_state(resp.command, &resp.data)?)
+    }
+
+    /// Read the current brake state (`0x8C`, read-marker `0x10`). Returns
+    /// `true` if released (free), `false` if engaged (holding).
+    fn read_brake_state(&mut self, motor_id: MotorId) -> Result<bool> {
+        let mut data = [0u8; 7];
+        data[0] = 0x10;
+        let resp = self.transact(Command::BrakeControl.code(), motor_id, &data)?;
+        Ok(parse_brake_state(resp.command, &resp.data)?)
     }
 }
 

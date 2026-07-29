@@ -24,14 +24,22 @@ pub struct Feedback {
 
 /// The status/error code carried in the high nibble of feedback byte 0.
 ///
-/// `0x0`/`0x1` are normal (disabled / enabled); `0x8`..=`0xE` are faults.
-/// Values are taken from the DM-J4310-2EC manual and the official SDK.
+/// `0x0`/`0x1` are normal (disabled / enabled); `0x3`..=`0x5` and
+/// `0x8`..=`0xE` are faults. Values are confirmed against the official
+/// DM-J4310-2EC/DM-J3507-2EC manuals' "LED Status" fault-code table
+/// (`ref/dm4310_manual_en.md`, `ref/dm3507_manual_en.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
     /// `0x0` — motor disabled (closed-loop off).
     Disabled,
     /// `0x1` — motor enabled, running normally.
     Enabled,
+    /// `0x3` — output shaft (2nd/output encoder) calibration error.
+    OutputShaftCalibration,
+    /// `0x4` — sensor output error.
+    SensorOutput,
+    /// `0x5` — motor encoder calibration error.
+    EncoderCalibration,
     /// `0x8` — over-voltage.
     OverVoltage,
     /// `0x9` — under-voltage.
@@ -56,6 +64,9 @@ impl ErrorCode {
         match n & 0x0F {
             0x0 => ErrorCode::Disabled,
             0x1 => ErrorCode::Enabled,
+            0x3 => ErrorCode::OutputShaftCalibration,
+            0x4 => ErrorCode::SensorOutput,
+            0x5 => ErrorCode::EncoderCalibration,
             0x8 => ErrorCode::OverVoltage,
             0x9 => ErrorCode::UnderVoltage,
             0xA => ErrorCode::OverCurrent,
@@ -72,6 +83,9 @@ impl ErrorCode {
         match self {
             ErrorCode::Disabled => 0x0,
             ErrorCode::Enabled => 0x1,
+            ErrorCode::OutputShaftCalibration => 0x3,
+            ErrorCode::SensorOutput => 0x4,
+            ErrorCode::EncoderCalibration => 0x5,
             ErrorCode::OverVoltage => 0x8,
             ErrorCode::UnderVoltage => 0x9,
             ErrorCode::OverCurrent => 0xA,
@@ -83,12 +97,15 @@ impl ErrorCode {
         }
     }
 
-    /// `true` for `0x8`..=`0xE` (an actual fault, not the normal
-    /// disabled/enabled states).
+    /// `true` for `0x3`..=`0x5` and `0x8`..=`0xE` (an actual fault, not the
+    /// normal disabled/enabled states).
     pub const fn is_fault(self) -> bool {
         matches!(
             self,
-            ErrorCode::OverVoltage
+            ErrorCode::OutputShaftCalibration
+                | ErrorCode::SensorOutput
+                | ErrorCode::EncoderCalibration
+                | ErrorCode::OverVoltage
                 | ErrorCode::UnderVoltage
                 | ErrorCode::OverCurrent
                 | ErrorCode::MosOverTemp

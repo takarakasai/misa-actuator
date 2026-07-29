@@ -179,28 +179,87 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
         self.torque_constant = (kt_nm_per_a.is_finite() && kt_nm_per_a > 0.0).then_some(kt_nm_per_a);
     }
 
-    /// Read the motor's `KT_Value` register (RID `0x01`) and adopt it as the
-    /// torque constant, returning what was decided.
+    /// Compute the torque constant from the motor's identified parameters
+    /// (N·m/A, referred to the **output** shaft).
     ///
-    /// `Ok(None)` means the motor answered but the value is unusable — a bench
-    /// DM-J4310 reports `0.0`, i.e. the constant was never identified on that
-    /// unit. That is reported rather than treated as an error, because the read
-    /// itself succeeded and the caller may legitimately continue without
-    /// current readings (or supply one via [`Self::set_torque_constant`]).
+    /// Uses the formula the official manuals give:
     ///
-    /// Not read during construction on purpose: it costs a bus round-trip, and
-    /// a driver that cannot be built without one would be unusable for the
-    /// scan/probe paths that run before a motor is known to be present.
+    /// ```text
+    /// Kt = 1.5 * Npp * flux * Gr * GREF
+    /// ```
+    ///
+    /// with `Npp` (RID `0x10`), `flux` (RID `0x13`), `Gr` (RID `0x14`) and
+    /// `GREF` (RID `0x1E`) all read from the motor. Because `Gr` and `GREF` are
+    /// factors, the result is per amp **at the output shaft**, matching the
+    /// frame the feedback torque is reported in — a motor-shaft constant would
+    /// be off by the gear ratio (10x on a DM-J4310).
+    ///
+    /// Cross-checks against the bench DM-J4310: the registers give
+    /// `1.5 * 14 * 0.00449164 * 10 * 1 = 0.9432` N·m/A, and multiplying by that
+    /// unit's driver current limit `Imax = 10.2612 A` gives 9.68 N·m against a
+    /// `TMAX` of 10 — the current limit maps onto the torque range as it should.
+    ///
+    /// Returns `Ok(None)` if any factor is missing or non-positive, since the
+    /// product would then be meaningless.
+    pub fn compute_torque_constant(&mut self) -> Result<Option<f32>> {
+        let npp = self.read_register(Rid::NPP)?.as_i32() as f32;
+        let flux = self.read_register(Rid::FLUX)?.as_f32();
+        let gr = self.read_register(Rid::GR)?.as_f32();
+        let gref = self.read_register(Rid::GREF)?.as_f32();
+        let kt = 1.5 * npp * flux * gr * gref;
+        let usable = [npp, flux, gr, gref, kt]
+            .iter()
+            .all(|v| v.is_finite() && *v > 0.0);
+        Ok(usable.then_some(kt))
+    }
+
+    /// Read the motor's torque constant and adopt it, returning what was
+    /// decided.
+    ///
+    /// Prefers `KT_Value` (RID `0x01`) when it holds an explicit override, and
+    /// otherwise derives it via [`Self::compute_torque_constant`].
+    ///
+    /// **`KT_Value == 0` is the normal, recommended state, not a fault.** The
+    /// manuals describe the field as "Motor torque constant. Set to 0 when
+    /// motor parameter identification is accurate" — i.e. zero means "use the
+    /// identified parameters", which is exactly what the fallback does. A bench
+    /// DM-J4310 ships this way. (An earlier version of this method reported the
+    /// zero as "current cannot be derived", which had it backwards.)
+    ///
+    /// Not read during construction on purpose: it costs several bus
+    /// round-trips, and a driver that cannot be built without them would be
+    /// unusable for the scan/probe paths that run before a motor is known to be
+    /// present.
     pub fn refresh_torque_constant(&mut self) -> Result<Option<f32>> {
-        let kt = self.read_register(Rid::KT_VALUE)?.as_f32();
-        self.set_torque_constant(kt);
-        if self.torque_constant.is_none() {
-            log::warn!(
-                "damiao motor {}: KT_Value reads {} — current cannot be derived from torque; \
-                 set it explicitly if you know it",
+        let explicit = self.read_register(Rid::KT_VALUE)?.as_f32();
+        if explicit.is_finite() && explicit > 0.0 {
+            self.set_torque_constant(explicit);
+            log::info!(
+                "damiao motor {}: torque constant {} N·m/A from KT_Value",
                 self.can_id,
-                kt
+                explicit
             );
+            return Ok(self.torque_constant);
+        }
+
+        match self.compute_torque_constant()? {
+            Some(kt) => {
+                self.set_torque_constant(kt);
+                log::info!(
+                    "damiao motor {}: KT_Value is 0 (identified parameters in use); \
+                     torque constant {} N·m/A derived from Npp/flux/Gr/GREF",
+                    self.can_id,
+                    kt
+                );
+            }
+            None => {
+                self.torque_constant = None;
+                log::warn!(
+                    "damiao motor {}: KT_Value is 0 and Npp/flux/Gr/GREF do not give a usable \
+                     product — current cannot be derived from torque",
+                    self.can_id
+                );
+            }
         }
         Ok(self.torque_constant)
     }

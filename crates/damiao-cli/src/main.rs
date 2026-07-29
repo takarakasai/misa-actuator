@@ -66,6 +66,16 @@ struct Cli {
     #[arg(long)]
     refresh_limits: bool,
 
+    /// Read the motor's torque constant so feedback can report current.
+    ///
+    /// DAMIAO's feedback frame carries torque but no current, so current is
+    /// derived as `torque / Kt`. Kt comes from `KT_Value` when that holds an
+    /// override, else from the manuals' `1.5 * Npp * flux * Gr * GREF` using the
+    /// motor's own identified parameters — `KT_Value == 0` is the normal state,
+    /// meaning "use those parameters". Costs a few register reads.
+    #[arg(long)]
+    refresh_kt: bool,
+
     /// Use a CAN-FD bus (interface must be `fd on`). Default is classic CAN.
     #[arg(long)]
     fd: bool,
@@ -326,6 +336,15 @@ fn configure<B: DamiaoBus>(
     motor.set_timeout(timeout)?;
     // Match feedback on the requested Master ID (default 0).
     motor.set_master_id(cli.master_id);
+
+    if cli.refresh_kt {
+        match motor.refresh_torque_constant()? {
+            Some(kt) => println!("torque constant: {kt} N·m/A — feedback current = torque / Kt"),
+            None => eprintln!(
+                "warning: could not determine a torque constant; feedback current stays NaN"
+            ),
+        }
+    }
 
     let model = motor.model();
     if cli.refresh_limits {

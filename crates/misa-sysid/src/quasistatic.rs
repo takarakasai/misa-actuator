@@ -94,12 +94,24 @@ impl Point {
     }
 }
 
-/// Write points as CSV (header + one row per point).
-pub fn write_points_csv(points: &[Point], w: &mut dyn Write) -> io::Result<()> {
-    writeln!(
-        w,
-        "t_s,cmd,position_rad,velocity_rad_per_s,torque_nm,current_a,temperature_c"
-    )?;
+/// The CSV header row emitted by [`write_points_csv`].
+pub const POINTS_CSV_HEADER: &str =
+    "t_s,cmd,position_rad,velocity_rad_per_s,torque_nm,current_a,temperature_c";
+
+/// Write points as CSV: the header when `write_header`, then one row per point.
+///
+/// `write_header` exists for runs that append to a writer another run already
+/// used — a two-direction breakaway is one file with two ramps in it, and
+/// re-emitting the header between them puts a text row in the middle of the
+/// data.
+pub fn write_points_csv(
+    points: &[Point],
+    w: &mut dyn Write,
+    write_header: bool,
+) -> io::Result<()> {
+    if write_header {
+        writeln!(w, "{POINTS_CSV_HEADER}")?;
+    }
     for p in points {
         writeln!(
             w,
@@ -606,19 +618,26 @@ pub struct ThermalSpec {
     /// Sample rate (Hz). A few Hz is plenty — motor temperature sensors are
     /// slow and typically quantized to 1 °C.
     pub rate_hz: f32,
-    /// Position "leash" stiffness (N·m/rad) holding the shaft near where it
-    /// started while the torque heats the motor. `0.0` commands open-loop
-    /// torque instead.
+    /// Position "leash" stiffness (N·m/rad) that stops the shaft running away.
+    /// `0.0` commands open-loop torque instead.
     ///
-    /// A free shaft cannot be given a fixed-torque thermal test: any torque
-    /// above breakaway simply accelerates it away. On a DM-J4310 an open-loop
-    /// 1.5 N·m hold left the ±0.35 rad window in 0.1 s — the safety envelope
-    /// caught it, but no thermal data was collected. The leash is the same trick
-    /// [`crate::Excitation::MitTorque`] uses to excite a plant without letting
-    /// it run away.
+    /// **The leash prevents runaway; it does not make a free shaft hold
+    /// torque.** At steady state the shaft settles at `err = -tau_ff / kp`,
+    /// where the motor produces `kp * err + tau_ff = 0` — the leash cancels the
+    /// very feed-forward you asked it to hold. Measured on an RS04 (friction
+    /// 0.054 N·m): commanding 2.0 N·m delivered 0.141 N·m, and the run would
+    /// otherwise have reported "sustainable" about a torque the motor never
+    /// produced.
+    ///
+    /// So a fixed-torque thermal test needs the output shaft **mechanically
+    /// restrained**, or a rig whose own load restrains it — a DM-J4310 against
+    /// its end stop did deliver 1.218 of a commanded 1.5 N·m and warmed at
+    /// 0.116 °C/s. [`Thermal::delivered_fraction`] reports whether the torque
+    /// actually arrived, so a leash-cancelled run is visible rather than
+    /// mistaken for a thermal result.
     ///
     /// Needs native MIT control (DAMIAO / RobStride). On LKMotor the gains are
-    /// ignored, so the shaft must be mechanically restrained instead.
+    /// ignored, so the shaft must be restrained regardless.
     pub leash_kp: f32,
     /// Leash damping (N·m·s/rad). Pairs with [`Self::leash_kp`].
     pub leash_kd: f32,
@@ -659,6 +678,20 @@ impl Thermal {
             .filter(|t| t.is_finite())
             .collect();
         (!vals.is_empty()).then(|| vals.iter().sum::<f32>() / vals.len() as f32)
+    }
+
+    /// Fraction of the commanded torque the motor actually delivered.
+    ///
+    /// `1.0` means the hold was real. Well below 1 means the shaft was free
+    /// enough that the leash cancelled the feed-forward (see
+    /// [`ThermalSpec::leash_kp`]), so the temperature result describes some
+    /// smaller torque — or none — and must not be read as a rating for the
+    /// torque that was asked for. `None` if nothing was measured or the command
+    /// was zero.
+    pub fn delivered_fraction(&self) -> Option<f32> {
+        let mean = self.mean_torque_nm()?;
+        (self.spec.hold_torque_nm.abs() > 1e-6)
+            .then(|| (mean / self.spec.hold_torque_nm).abs())
     }
 
     /// Seconds until `limit_c` at the measured rise rate, from the last reading.
@@ -1383,7 +1416,7 @@ mod tests {
         };
         let map = run_load_map(&mut rig, &spec, roomy(), &no_abort()).unwrap();
         let mut out = Vec::new();
-        write_points_csv(&map.points, &mut out).unwrap();
+        write_points_csv(&map.points, &mut out, true).unwrap();
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 1 + map.points.len());
@@ -1858,5 +1891,109 @@ mod tests {
             "leashed must not drive open-loop torque during the hold, got {}",
             leashed.torque
         );
+    }
+
+    /// Two runs sharing one file must yield one header, not one per run: a
+    /// two-direction breakaway writes both ramps to the same CSV, and a second
+    /// header lands as a text row in the middle of the data.
+    #[test]
+    fn appending_a_second_run_does_not_repeat_the_header() {
+        let mut rig = Rig::new(0.0, 2.0, 0.0, 0.5);
+        let spec = LoadMapSpec {
+            settle_s: 0.0,
+            travel_timeout_s: 0.0,
+            return_sweep: false,
+            ..LoadMapSpec::symmetric(0.1, 3)
+        };
+        let map = run_load_map(&mut rig, &spec, roomy(), &no_abort()).unwrap();
+
+        let mut out = Vec::new();
+        write_points_csv(&map.points, &mut out, true).unwrap();
+        write_points_csv(&map.points, &mut out, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let headers = text.lines().filter(|l| *l == POINTS_CSV_HEADER).count();
+        assert_eq!(headers, 1, "expected exactly one header row");
+        assert_eq!(text.lines().count(), 1 + 2 * map.points.len());
+    }
+
+    /// A hold that never delivered its commanded torque must be visible as
+    /// such. Measured on a free-shafted RS04: commanding 2.0 N·m delivered
+    /// 0.14, and without this the run reported "sustainable" about a torque the
+    /// motor never produced.
+    #[test]
+    fn thermal_reports_how_much_torque_actually_arrived() {
+        // Rig reports a fixed small torque regardless of command — the shape a
+        // leash-cancelled hold produces.
+        let mut rig = Rig::new(0.0, 0.0, 0.0, 0.5);
+        let spec = ThermalSpec {
+            hold_torque_nm: 2.0,
+            duration_s: 0.05,
+            rate_hz: 500.0,
+            leash_kp: 0.0,
+            leash_kd: 0.0,
+        };
+        let t = run_thermal(&mut rig, &spec, roomy(), &no_abort()).unwrap();
+        // This rig echoes the command, so the fraction is ~1: the honest case.
+        let f = t.delivered_fraction().expect("fraction");
+        assert!((f - 1.0).abs() < 1e-3, "echoing rig should deliver ~100%, got {f}");
+
+        // Now a rig that swallows most of the command.
+        struct Weak;
+        impl Actuator for Weak {
+            fn motor_id(&self) -> u8 {
+                1
+            }
+            fn enable(&mut self) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn disable(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_zero(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_run_mode(&mut self, _m: RunMode) -> Result<()> {
+                Ok(())
+            }
+            fn set_position(&mut self, _p: f32, _v: f32) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn set_velocity(&mut self, _v: f32) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn set_torque(&mut self, _t: f32) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn mit_control(
+                &mut self,
+                _p: f32,
+                _v: f32,
+                _kp: f32,
+                _kd: f32,
+                _t: f32,
+            ) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn measure(&mut self) -> Result<MotorFeedback> {
+                Ok(MotorFeedback {
+                    position_rad: 0.0,
+                    velocity_rad_per_s: 0.0,
+                    torque_nm: 0.25, // regardless of the 2.0 asked for
+                    current_a: f32::NAN,
+                    temperature_c: 30.0,
+                })
+            }
+            fn read_status(&mut self) -> Result<misa_actuator::MotorStatus> {
+                Ok(misa_actuator::MotorStatus {
+                    voltage_v: 24.0,
+                    temperature_c: 30.0,
+                    error: Default::default(),
+                })
+            }
+        }
+        let t = run_thermal(&mut Weak, &spec, roomy(), &no_abort()).unwrap();
+        let f = t.delivered_fraction().expect("fraction");
+        assert!((f - 0.125).abs() < 1e-3, "expected ~12.5%, got {f}");
+        assert!(f < 0.5, "must fall below the CLI's validity threshold");
     }
 }

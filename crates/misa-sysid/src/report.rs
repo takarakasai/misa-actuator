@@ -5,6 +5,10 @@
 //! only argument parsing and a `println!` rather than its own copy of the
 //! analysis. Every wrapper writes the CSV *before* inspecting the abort reason,
 //! so an aborted run still leaves its data on disk.
+//!
+//! `write_header` is passed through so several runs can share one file — a
+//! two-direction breakaway is two ramps in one CSV, and only the first should
+//! emit the header row.
 
 use std::io::Write;
 use std::sync::atomic::AtomicBool;
@@ -46,9 +50,10 @@ pub fn run_load_map_to_csv(
     limits: SafetyLimits,
     abort: &AtomicBool,
     csv: &mut dyn Write,
+    write_header: bool,
 ) -> Result<LoadMapReport> {
     let map = run_load_map(act, spec, limits, abort)?;
-    write_points_csv(&map.points, csv)?;
+    write_points_csv(&map.points, csv, write_header)?;
     Ok(LoadMapReport {
         n_points: map.points.len(),
         equilibrium_position_rad: map.equilibrium_position_rad(),
@@ -86,9 +91,10 @@ pub fn run_breakaway_to_csv(
     limits: SafetyLimits,
     abort: &AtomicBool,
     csv: &mut dyn Write,
+    write_header: bool,
 ) -> Result<BreakawayReport> {
     let r = run_breakaway(act, spec, limits, abort)?;
-    write_points_csv(&r.points, csv)?;
+    write_points_csv(&r.points, csv, write_header)?;
     Ok(BreakawayReport {
         n_points: r.points.len(),
         breakaway_torque_nm: r.breakaway_torque_nm,
@@ -110,8 +116,12 @@ pub struct ThermalReport {
     /// temperature.
     pub rise_rate_c_per_s: Option<f32>,
     /// Seconds from the last reading to the envelope's temperature limit at the
-    /// measured rate. `None` when not warming — i.e. thermally sustainable.
+    /// measured rate. `None` when not warming.
     pub seconds_to_limit: Option<f32>,
+    /// Fraction of the commanded torque actually delivered. Well below 1 means
+    /// the shaft was not restrained and the leash cancelled the feed-forward,
+    /// so the thermal numbers do not describe the requested torque.
+    pub delivered_fraction: Option<f32>,
     pub abort: Option<AbortReason>,
 }
 
@@ -122,14 +132,16 @@ pub fn run_thermal_to_csv(
     limits: SafetyLimits,
     abort: &AtomicBool,
     csv: &mut dyn Write,
+    write_header: bool,
 ) -> Result<ThermalReport> {
     let t = run_thermal(act, spec, limits, abort)?;
-    write_points_csv(&t.points, csv)?;
+    write_points_csv(&t.points, csv, write_header)?;
     Ok(ThermalReport {
         n_points: t.points.len(),
         mean_torque_nm: t.mean_torque_nm(),
         rise_rate_c_per_s: t.rise_rate_c_per_s(),
         seconds_to_limit: t.seconds_to_limit(limits.max_temperature_c),
+        delivered_fraction: t.delivered_fraction(),
         abort: t.abort,
     })
 }
@@ -158,9 +170,10 @@ pub fn run_kt_to_csv(
     limits: SafetyLimits,
     abort: &AtomicBool,
     csv: &mut dyn Write,
+    write_header: bool,
 ) -> Result<KtReport> {
     let s = run_kt(act, spec, limits, abort)?;
-    write_points_csv(&s.points, csv)?;
+    write_points_csv(&s.points, csv, write_header)?;
     Ok(KtReport {
         n_points: s.points.len(),
         kt_nm_per_a: s.kt_nm_per_a(),

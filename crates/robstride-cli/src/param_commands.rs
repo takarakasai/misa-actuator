@@ -34,7 +34,14 @@ pub fn run_read_param(motor: &mut Motor, function_code: u16, timeout_ms: u64) ->
     // that's not fully reliable on every firmware build.
     match lookup_param_type(function_code) {
         Some(info) => {
-            print!("  {} ({:?}) = ", info.name, info.ty);
+            // Label it as coming from the manual, not from the motor. Measured
+            // on an RS04 (AppCodeVersion 0.4.1.32): 32 of its 84 rows disagree
+            // with the manual's table, which is shifted by one or more places
+            // across 0x2006-0x2021 and 0x3010-0x301C. That makes the name and
+            // the decode width below a guess on this firmware — 0x2009 reads
+            // back the motor's CAN_ID while the table calls it `motor_baud`.
+            // See doc/param-table-firmware-divergence.md.
+            print!("  per the manual's table: {} ({:?}) = ", info.name, info.ty);
             match info.ty {
                 ParamType::String => println!("{as_string:?}"),
                 ParamType::U8 => println!("{:?}", raw.first().copied()),
@@ -66,6 +73,13 @@ pub fn run_read_param(motor: &mut Motor, function_code: u16, timeout_ms: u64) ->
         None => println!(
             "  as string = {as_string:?}  (unknown type — not in the manual's table; every plausible width shown below)"
         ),
+    }
+    if lookup_param_type(function_code).is_some() {
+        println!(
+            "  NOTE: that name/type is the manual's, not the motor's. This firmware may lay the \
+             table out differently (measured: RS04 0.4.1.32 disagrees on 32 rows). Run \
+             `param-table` for the names the motor reports itself, and prefer the raw widths below."
+        );
     }
 
     // Numeric single-frame reply (4 bytes): CurrentValue only, at offset 0

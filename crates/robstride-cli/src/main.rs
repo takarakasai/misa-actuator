@@ -41,6 +41,14 @@ struct Cli {
     #[arg(long, default_value = "Edulite05")]
     model: String,
 
+    /// Also report current in feedback, at one extra bus round-trip per sample.
+    ///
+    /// RobStride's feedback frame has no current field, so current otherwise
+    /// reads NaN. Needed for `characterize kt`; avoid it for `chirp`, where the
+    /// halved loop rate shrinks the usable identification band.
+    #[arg(long)]
+    report_current: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -337,8 +345,10 @@ fn parse_function_code(s: &str) -> std::result::Result<u16, String> {
 
 fn open_motor(cli: &Cli) -> Result<Motor> {
     let model = parse_model(&cli.model)?;
-    Motor::open_with_host(&cli.interface, cli.motor_id, cli.host_id, model)
-        .with_context(|| format!("failed to open {} for motor {}", cli.interface, cli.motor_id))
+    let mut motor = Motor::open_with_host(&cli.interface, cli.motor_id, cli.host_id, model)
+        .with_context(|| format!("failed to open {} for motor {}", cli.interface, cli.motor_id))?;
+    motor.set_report_current(cli.report_current);
+    Ok(motor)
 }
 
 fn print_feedback(label: &str, fb: &robstride_driver::MotorFeedback) {

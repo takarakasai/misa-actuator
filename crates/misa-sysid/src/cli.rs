@@ -114,6 +114,15 @@ pub enum CharacterizeCmd {
         /// Dwell per level (s), so the current reading is steady-state.
         #[arg(long, default_value_t = 0.4)]
         settle: f32,
+        /// Position-leash stiffness (N·m/rad) holding the shaft while each level
+        /// is applied. 0 commands open-loop torque, which needs a mechanically
+        /// restrained shaft — otherwise the level accelerates it out of the
+        /// safety window before any steady-state current is reached.
+        #[arg(long, default_value_t = 8.0)]
+        leash_kp: f32,
+        /// Leash damping (N·m·s/rad).
+        #[arg(long, default_value_t = 0.5)]
+        leash_kd: f32,
     },
 }
 
@@ -292,11 +301,15 @@ pub fn run_characterize(
             amplitude,
             steps,
             settle,
+            leash_kp,
+            leash_kd,
         } => {
             let spec = KtSpec {
                 max_torque_nm: *amplitude,
                 steps: *steps,
                 settle_s: *settle,
+                leash_kp: *leash_kp,
+                leash_kd: *leash_kd,
                 ..KtSpec::bipolar(*amplitude)
             };
             println!("Kt sweep: ±{amplitude} N·m in {steps} levels, {settle}s dwell ...");
@@ -309,9 +322,9 @@ pub fn run_characterize(
                     print_opt("fit R^2", r.r_squared, "");
                 }
                 None => println!(
-                    "  Kt                     : <no current reported> — DAMIAO's feedback frame \
-                     carries no current field; set KT_Value on the motor (see `params`) so the \
-                     driver can derive it"
+                    "  Kt                     : <no current reported by this driver>. RobStride: \
+                     pass --report-current (its feedback frame has no current field). DAMIAO: \
+                     pass --refresh-kt so current can be derived from torque/Kt."
                 ),
             }
             report_abort(r.abort);

@@ -36,6 +36,9 @@ pub struct Motor<B: RobstrideBus = SocketCanBus> {
     /// Cached `LimitSpd` value (rad/s). Used by [`Self::set_position_with_speed`]
     /// to avoid redundant `LimitSpd` writes when the same speed is repeated.
     cached_speed_limit: Option<f32>,
+    /// Whether feedback should also carry current, at the cost of one extra
+    /// parameter read per sample. See [`Self::set_report_current`].
+    report_current: bool,
 }
 
 impl Motor<SocketCanBus> {
@@ -76,6 +79,7 @@ impl<B: RobstrideBus> Motor<B> {
             run_mode: RunMode::Mit,
             timeout: DEFAULT_TIMEOUT,
             cached_speed_limit: None,
+            report_current: false,
         }
     }
 
@@ -396,6 +400,30 @@ impl<B: RobstrideBus> Motor<B> {
 
     pub fn read_current(&mut self) -> Result<f32> {
         self.read_param(ParamIndex::IqFilt)
+    }
+
+    /// Whether feedback carries current. See [`Self::set_report_current`].
+    pub fn reports_current(&self) -> bool {
+        self.report_current
+    }
+
+    /// Make [`misa_actuator::Actuator`] feedback report current as well as
+    /// torque, at the cost of **one extra bus round-trip per sample**.
+    ///
+    /// Off by default. RobStride's feedback frame carries position, velocity,
+    /// torque and temperature but *no current*, so the only way to get it is a
+    /// separate `IqFilt` (`0x701A`) parameter read — which is what
+    /// [`Self::read_current`] and the CLI's `info` do. Paying that on every
+    /// sample roughly halves the achievable loop rate, which would quietly
+    /// shrink the usable identification band of a chirp, so control and
+    /// identification paths leave it off.
+    ///
+    /// Turn it on for quasi-static measurements that dwell anyway — a Kt sweep
+    /// holds each level for hundreds of milliseconds, so an extra read costs
+    /// nothing and is the difference between measuring a torque constant and
+    /// reporting `NaN`.
+    pub fn set_report_current(&mut self, on: bool) {
+        self.report_current = on;
     }
 
     pub fn read_vbus(&mut self) -> Result<f32> {

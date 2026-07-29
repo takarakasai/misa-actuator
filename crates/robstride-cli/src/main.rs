@@ -245,6 +245,37 @@ enum Command {
         #[arg(long, default_value_t = 5.0)]
         torque_vel_limit: f32,
     },
+    /// Quasi-static characterization: load map, breakaway torque, thermal, Kt
+    ///
+    /// These deliberately hold torque against a loaded or stalled shaft, so
+    /// every run is bounded by a safety envelope and aborts on the first breach,
+    /// keeping whatever it collected. Ctrl-C also aborts.
+    ///
+    /// Run `load-map` first: its equilibrium position and peak holding torque
+    /// tell you where to sit and what torque budget the other runs may use.
+    Characterize {
+        #[command(subcommand)]
+        what: misa_sysid::CharacterizeCmd,
+
+        /// Abort once |measured torque| exceeds this (N·m).
+        #[arg(long, default_value_t = 1.0, global = true)]
+        max_torque: f32,
+        /// Abort once temperature exceeds this (°C).
+        #[arg(long, default_value_t = 60.0, global = true)]
+        max_temp: f32,
+        /// Abort once temperature climbs faster than this (°C/s).
+        #[arg(long, default_value_t = 2.0, global = true)]
+        max_temp_rate: f32,
+        /// Abort once position leaves start ± this (rad).
+        #[arg(long, default_value_t = 0.5, global = true)]
+        window: f32,
+        /// Abort after this long (s), whatever else is happening.
+        #[arg(long, default_value_t = 30.0, global = true)]
+        max_duration: f32,
+        /// Raw sample CSV path.
+        #[arg(long, default_value = "characterize.csv", global = true)]
+        out: PathBuf,
+    },
     /// Chirp-excitation system identification → CSV log + Bode (frequency
     /// response). Position channel is safest (bounded around current pos).
     Chirp {
@@ -672,6 +703,25 @@ fn run(cli: Cli) -> Result<()> {
                     torque_vel_limit: *torque_vel_limit,
                 },
             )?;
+        }
+        Command::Characterize {
+            what,
+            max_torque,
+            max_temp,
+            max_temp_rate,
+            window,
+            max_duration,
+            out,
+        } => {
+            let limits = misa_sysid::SafetyLimits {
+                max_torque_nm: *max_torque,
+                max_temperature_c: *max_temp,
+                max_temperature_rise_c_per_s: *max_temp_rate,
+                position_window_rad: *window,
+                max_duration_s: *max_duration,
+            };
+            let mut motor = open_motor(&cli)?;
+            misa_sysid::run_characterize(&mut motor, what, limits, out)?;
         }
         Command::Chirp {
             channel,

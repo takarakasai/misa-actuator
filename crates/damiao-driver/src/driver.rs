@@ -58,6 +58,11 @@ pub struct DamiaoMotor<B: DamiaoBus = SocketCanBus> {
     /// Last control frame sent (id, payload), re-issued by `measure()` to read
     /// state without disturbing the active setpoint.
     last_cmd: Option<(u16, [u8; DATA_LEN])>,
+    /// Torque constant (N·m/A) for deriving current from reported torque, or
+    /// `None` while unknown. Populated by
+    /// [`DamiaoMotor::refresh_torque_constant`]; see that method for why it is
+    /// not read eagerly.
+    torque_constant: Option<f32>,
 }
 
 impl DamiaoMotor<SocketCanBus> {
@@ -124,6 +129,7 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
             timeout: DEFAULT_TIMEOUT,
             soft_zero: 0.0,
             last_cmd: None,
+            torque_constant: None,
         }
     }
 
@@ -150,6 +156,53 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
     /// The quantization limits in effect.
     pub fn limits(&self) -> Limits {
         self.limits
+    }
+
+    /// The torque constant in effect (N·m/A), or `None` while unknown.
+    ///
+    /// Used to derive `current_a` in [`misa_actuator::MotorFeedback`], which is
+    /// otherwise `NaN` on this family: the DAMIAO feedback frame reports torque
+    /// but carries no current field.
+    pub fn torque_constant(&self) -> Option<f32> {
+        self.torque_constant
+    }
+
+    /// Set the torque constant used to derive current (N·m/A).
+    ///
+    /// Prefer [`Self::refresh_torque_constant`], which reads the motor's own
+    /// value. Use this when the motor's `KT_Value` register is unset — a bench
+    /// DM-J4310 reports `0` — and you have the figure from elsewhere (the
+    /// datasheet, or a `misa_sysid::run_kt` sweep on a motor that does
+    /// report current). Values that are not finite and positive are rejected,
+    /// leaving the constant unknown rather than poisoning every later reading.
+    pub fn set_torque_constant(&mut self, kt_nm_per_a: f32) {
+        self.torque_constant = (kt_nm_per_a.is_finite() && kt_nm_per_a > 0.0).then_some(kt_nm_per_a);
+    }
+
+    /// Read the motor's `KT_Value` register (RID `0x01`) and adopt it as the
+    /// torque constant, returning what was decided.
+    ///
+    /// `Ok(None)` means the motor answered but the value is unusable — a bench
+    /// DM-J4310 reports `0.0`, i.e. the constant was never identified on that
+    /// unit. That is reported rather than treated as an error, because the read
+    /// itself succeeded and the caller may legitimately continue without
+    /// current readings (or supply one via [`Self::set_torque_constant`]).
+    ///
+    /// Not read during construction on purpose: it costs a bus round-trip, and
+    /// a driver that cannot be built without one would be unusable for the
+    /// scan/probe paths that run before a motor is known to be present.
+    pub fn refresh_torque_constant(&mut self) -> Result<Option<f32>> {
+        let kt = self.read_register(Rid::KT_VALUE)?.as_f32();
+        self.set_torque_constant(kt);
+        if self.torque_constant.is_none() {
+            log::warn!(
+                "damiao motor {}: KT_Value reads {} — current cannot be derived from torque; \
+                 set it explicitly if you know it",
+                self.can_id,
+                kt
+            );
+        }
+        Ok(self.torque_constant)
     }
 
     /// Overwrite the MIT quantization limits in effect.

@@ -213,10 +213,21 @@ impl<B: RobstrideBus> Actuator for Motor<B> {
 
     fn set_torque(&mut self, torque_nm: f32) -> MisaResult<MisaFeedback> {
         require_mode(self, RunMode::Torque, "set_torque")?;
-        // Robstride's torque-mode parameter is `IqRef` — quadrature current.
-        // Without a Kt-aware mapping this is approximate; for accurate Nm
-        // command use `set_run_mode(Mit)` + `mit_control` with `torque_ff`.
-        Motor::set_torque(self, torque_nm)?;
+        // Robstride's torque-mode parameter is `IqRef` — a quadrature *current*,
+        // in amps. So the trait's N·m must be divided by the torque constant;
+        // passing it through raw silently commands amps and understates the
+        // torque by a factor of Kt (1.5093 on an RS04, i.e. a third of what was
+        // asked for). Verified on hardware: commanded IqRef tracks measured
+        // current to within 0.0001 A, so this conversion is the whole story.
+        //
+        // Without a Kt there is nothing to convert with, so the old raw
+        // behaviour stands — see `Motor::set_torque_constant`. For an exact N·m
+        // command regardless, use MIT mode with `torque_ff`.
+        let iq = match self.torque_constant() {
+            Some(kt) => torque_nm / kt,
+            None => torque_nm,
+        };
+        Motor::set_torque(self, iq)?;
         let fb = Motor::measure_safe(self)?;
         let current = optional_current(self);
         let kt = self.torque_constant();

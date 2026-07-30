@@ -175,6 +175,39 @@ enum Command {
         #[arg(long, default_value_t = 2.0)]
         duration: f32,
     },
+    /// Quasi-static characterization: load map, breakaway torque, thermal, Kt
+    ///
+    /// These deliberately hold torque against a loaded or stalled shaft, so every
+    /// run is bounded by a safety envelope and aborts on the first breach,
+    /// keeping whatever it collected. Ctrl-C also aborts.
+    ///
+    /// Release the holding brake first — measuring against an engaged brake
+    /// reports the brake, not the mechanism.
+    ///
+    /// Pass `--kt` so torque is in N·m; without it the figures are amps.
+    Characterize {
+        #[command(subcommand)]
+        what: misa_sysid::CharacterizeCmd,
+
+        /// Abort once |measured torque| exceeds this (N·m, or A without --kt).
+        #[arg(long, default_value_t = 1.0, global = true)]
+        max_torque: f32,
+        /// Abort once temperature exceeds this (°C).
+        #[arg(long, default_value_t = 60.0, global = true)]
+        max_temp: f32,
+        /// Abort once temperature climbs faster than this (°C/s).
+        #[arg(long, default_value_t = 2.0, global = true)]
+        max_temp_rate: f32,
+        /// Abort once position leaves start ± this (rad).
+        #[arg(long, default_value_t = 0.5, global = true)]
+        window: f32,
+        /// Abort after this long (s), whatever else is happening.
+        #[arg(long, default_value_t = 30.0, global = true)]
+        max_duration: f32,
+        /// Raw sample CSV path.
+        #[arg(long, default_value = "characterize.csv", global = true)]
+        out: PathBuf,
+    },
     /// Motion-mode (MIT) control loop on the 0x400 channel (RMD-X V3 only).
     Mit {
         #[arg(long, allow_hyphen_values = true, default_value_t = 0.0)]
@@ -400,6 +433,24 @@ fn main() -> Result<()> {
             let r = control_loop(Some(*duration), || motor.set_torque(*value));
             motor.stop()?;
             r?;
+        }
+        Command::Characterize {
+            what,
+            max_torque,
+            max_temp,
+            max_temp_rate,
+            window,
+            max_duration,
+            out,
+        } => {
+            let limits = misa_sysid::SafetyLimits {
+                max_torque_nm: *max_torque,
+                max_temperature_c: *max_temp,
+                max_temperature_rise_c_per_s: *max_temp_rate,
+                position_window_rad: *window,
+                max_duration_s: *max_duration,
+            };
+            misa_sysid::run_characterize(&mut motor, what, limits, out)?;
         }
         Command::Mit {
             pos,

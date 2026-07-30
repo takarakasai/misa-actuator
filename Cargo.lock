@@ -731,6 +731,7 @@ dependencies = [
  "env_logger",
  "log",
  "misa-actuator",
+ "misa-sysid",
  "myactuator-driver",
  "myactuator-protocol",
  "serde",

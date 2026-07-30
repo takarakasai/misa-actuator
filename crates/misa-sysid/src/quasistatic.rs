@@ -1515,6 +1515,27 @@ pub fn run_velocity_sweep(
         stop = leg(act, &mut points, &mut guard, -speed, &|p| p <= lo, true)?;
     }
 
+    // Return to where the sweep began, unlogged. Without this each run ends at
+    // `lo` and a repeated series walks one span per repetition in that
+    // direction — a DM-J4310 marched from -0.42 to roughly -1.17 rad over three
+    // repetitions and hit its end stop, aborting the series on torque.
+    let back_toward_start: &dyn Fn(f32) -> bool = if start >= lo {
+        &|p| p >= start
+    } else {
+        &|p| p <= start
+    };
+    let toward = if start >= lo { speed } else { -speed };
+    if stop.is_none() {
+        stop = leg(
+            act,
+            &mut points,
+            &mut guard,
+            toward,
+            back_toward_start,
+            false,
+        )?;
+    }
+
     let _ = act.set_velocity(0.0);
     quiet(act);
 
@@ -3011,5 +3032,98 @@ mod tests {
             "with a hold it must wait for sustained motion (>= {sustain_above}), got {real}"
         );
         assert!(real > early, "the hold must raise the estimate");
+    }
+
+    /// A sweep must finish where it started, or a repeated series walks one span
+    /// per repetition until it hits something. A DM-J4310 did exactly that.
+    #[test]
+    fn velocity_sweep_returns_to_its_starting_position() {
+        let mut rig = Traverse2 {
+            pos: 0.0,
+            vel: 0.0,
+            dt: 0.002,
+        };
+        let spec = VelocitySweepSpec {
+            speed_rad_s: 1.0,
+            half_span_rad: 0.2,
+            rate_hz: 5000.0,
+            return_sweep: true,
+        };
+        let start = 0.0;
+        for rep in 0..3 {
+            let sweep = run_velocity_sweep(&mut rig, &spec, roomy(), &no_abort()).unwrap();
+            assert_eq!(sweep.abort, None, "rep {rep}");
+            assert!(
+                (rig.pos - start).abs() < 0.05,
+                "after rep {rep} the shaft sits at {} instead of near {start}",
+                rig.pos
+            );
+        }
+    }
+
+    /// Minimal traverse rig for the walk test: moves at the commanded speed.
+    struct Traverse2 {
+        pos: f32,
+        vel: f32,
+        dt: f32,
+    }
+    impl Traverse2 {
+        fn fb(&self) -> MotorFeedback {
+            MotorFeedback {
+                position_rad: self.pos,
+                velocity_rad_per_s: self.vel,
+                torque_nm: 0.1 * self.vel.signum(),
+                current_a: f32::NAN,
+                temperature_c: 30.0,
+            }
+        }
+    }
+    impl Actuator for Traverse2 {
+        fn motor_id(&self) -> u8 {
+            1
+        }
+        fn enable(&mut self) -> Result<MotorFeedback> {
+            Ok(self.fb())
+        }
+        fn disable(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn set_zero(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn set_run_mode(&mut self, _m: RunMode) -> Result<()> {
+            Ok(())
+        }
+        fn set_position(&mut self, _p: f32, _v: f32) -> Result<MotorFeedback> {
+            Ok(self.fb())
+        }
+        fn set_velocity(&mut self, v: f32) -> Result<MotorFeedback> {
+            self.vel = v;
+            self.pos += v * self.dt;
+            Ok(self.fb())
+        }
+        fn set_torque(&mut self, _t: f32) -> Result<MotorFeedback> {
+            Ok(self.fb())
+        }
+        fn mit_control(
+            &mut self,
+            _p: f32,
+            _v: f32,
+            _kp: f32,
+            _kd: f32,
+            _t: f32,
+        ) -> Result<MotorFeedback> {
+            Ok(self.fb())
+        }
+        fn measure(&mut self) -> Result<MotorFeedback> {
+            Ok(self.fb())
+        }
+        fn read_status(&mut self) -> Result<misa_actuator::MotorStatus> {
+            Ok(misa_actuator::MotorStatus {
+                voltage_v: 24.0,
+                temperature_c: 30.0,
+                error: Default::default(),
+            })
+        }
     }
 }

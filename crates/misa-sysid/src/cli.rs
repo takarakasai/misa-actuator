@@ -15,9 +15,13 @@ use clap::Subcommand;
 use misa_actuator::{Actuator, Result};
 
 use crate::limits::{AbortReason, SafetyLimits};
-use crate::quasistatic::{BreakawaySpec, Direction, KtSpec, LoadMapSpec, ThermalSpec};
+use crate::quasistatic::{
+    BreakawayMapSpec, BreakawaySpec, Direction, KtSpec, LoadMapSpec, ThermalSpec,
+    VelocitySweepSpec,
+};
 use crate::report::{
-    run_breakaway_to_csv, run_kt_to_csv, run_load_map_to_csv, run_thermal_to_csv,
+    run_breakaway_map_to_csv, run_breakaway_to_csv, run_kt_to_csv, run_load_map_to_csv,
+    run_thermal_to_csv, run_velocity_sweep_to_csv,
 };
 
 /// Which quasi-static measurement to run.
@@ -69,6 +73,69 @@ pub enum CharacterizeCmd {
         /// the static load.
         #[arg(long)]
         both: bool,
+    },
+    /// Load and stiction vs position, measured under **torque** control
+    ///
+    /// Use instead of `load-map` when the position loop cannot hold still.
+    /// `load-map` reads the torque a position loop emits to hold a setpoint, so
+    /// a loop that hunts corrupts the measurement (seen on an RS04). Here the
+    /// position loop only travels between points and its behaviour is discarded;
+    /// each measurement is a torque ramp judged by velocity, needing no torque
+    /// feedback at all.
+    ///
+    /// Slower than `load-map` — every position pays a ramp per direction — and
+    /// it measures *static* friction where a `velocity-sweep` measures kinetic.
+    BreakawayMap {
+        /// Sweep +/- this far around the current position (rad).
+        #[arg(long, default_value_t = 0.2)]
+        span: f32,
+        /// Positions visited.
+        #[arg(long, default_value_t = 5)]
+        steps: usize,
+        /// Torque ramp rate at each position (N·m/s).
+        #[arg(long, default_value_t = 0.2)]
+        ramp: f32,
+        /// Ramp ceiling (N·m). Clamped to --max-torque.
+        #[arg(long, default_value_t = 1.0)]
+        ceiling: f32,
+        /// Speed above which the shaft counts as moving (rad/s).
+        #[arg(long, default_value_t = 0.05)]
+        motion_speed: f32,
+        /// Displacement that also counts as motion (rad).
+        #[arg(long, default_value_t = 0.02)]
+        motion_travel: f32,
+        /// Speed cap while travelling between positions (rad/s).
+        #[arg(long, default_value_t = 0.3)]
+        travel_speed: f32,
+        /// Only ramp one direction, which forgoes the load/stiction split.
+        #[arg(long)]
+        single_direction: bool,
+    },
+    /// Load and kinetic friction vs position, from a slow constant-speed traverse
+    ///
+    /// The other way to keep a hunting position loop out of the measurement:
+    /// keep the shaft moving instead of holding it. A velocity loop is naturally
+    /// damped, and in steady motion torque splits into load +/- kinetic friction
+    /// by direction, densely and with no settling.
+    ///
+    /// Needs working torque feedback (unlike `breakaway-map`) — on RobStride
+    /// firmware whose `MeasuredTorque` reads 0, pass `--kt`.
+    VelocitySweep {
+        /// Traverse +/- this far around the current position (rad).
+        #[arg(long, default_value_t = 0.2)]
+        span: f32,
+        /// Traverse speed (rad/s). Slow keeps inertia out of it.
+        #[arg(long, default_value_t = 0.05)]
+        speed: f32,
+        /// Log rate (Hz).
+        #[arg(long, default_value_t = 200.0)]
+        rate: f32,
+        /// Position bins the two passes are averaged into.
+        #[arg(long, default_value_t = 20)]
+        bins: usize,
+        /// Only traverse one way, which forgoes the load/friction split.
+        #[arg(long)]
+        single_pass: bool,
     },
     /// Temperature rise while holding a fixed torque — turns "this got hot" into
     /// a continuous-rating number.
@@ -268,6 +335,97 @@ pub fn run_characterize(
                     println!("  friction (half-spread) : {:.4} N·m", (ta - tb).abs() / 2.0);
                 }
             }
+        }
+        CharacterizeCmd::BreakawayMap {
+            span,
+            steps,
+            ramp,
+            ceiling,
+            motion_speed,
+            motion_travel,
+            travel_speed,
+            single_direction,
+        } => {
+            let ramp_spec = BreakawaySpec {
+                ramp_nm_per_s: *ramp,
+                max_torque_nm: *ceiling,
+                motion_threshold_rad_per_s: *motion_speed,
+                motion_threshold_rad: *motion_travel,
+                ..BreakawaySpec::slow(*ceiling, Direction::Positive)
+            };
+            let spec = BreakawayMapSpec {
+                travel_speed_rad_s: *travel_speed,
+                both_directions: !*single_direction,
+                ..BreakawayMapSpec::symmetric(*span, *steps, ramp_spec)
+            };
+            println!(
+                "breakaway map: ±{span} rad in {steps} positions, ramping {ramp} N·m/s to \
+                 {ceiling} N·m ..."
+            );
+            let r = run_breakaway_map_to_csv(act, &spec, limits, &abort, &mut csv, true)?;
+            println!("  positions measured     : {}", r.n_positions);
+            print_opt("mean stiction", r.mean_stiction_nm, "N·m");
+            print_opt("peak static load", r.peak_static_load_nm, "N·m");
+            print_opt("equilibrium position", r.equilibrium_position_rad, "rad");
+            if let (Some(load), Some(stic)) = (r.peak_static_load_nm, r.mean_stiction_nm) {
+                if load < stic {
+                    println!(
+                        "  note: peak static load ({load:.4} N·m) is below the stiction \
+                         ({stic:.4} N·m) — friction-dominated over this span"
+                    );
+                }
+            }
+            if !r.unrested_positions.is_empty() {
+                eprintln!(
+                    "  WARNING: {} position(s) ramped without settling first; their figures may \
+                     be pre-existing motion",
+                    r.unrested_positions.len()
+                );
+            }
+            if !r.curve.is_empty() {
+                println!("  position      static load   stiction");
+                for (pos, load, stic) in &r.curve {
+                    println!("  {pos:+10.4} {load:+13.4} {stic:10.4}");
+                }
+            }
+            report_abort(r.abort);
+        }
+        CharacterizeCmd::VelocitySweep {
+            span,
+            speed,
+            rate,
+            bins,
+            single_pass,
+        } => {
+            let spec = VelocitySweepSpec {
+                speed_rad_s: *speed,
+                half_span_rad: *span,
+                rate_hz: *rate,
+                return_sweep: !*single_pass,
+            };
+            println!("velocity sweep: ±{span} rad at {speed} rad/s, logging at {rate} Hz ...");
+            let r =
+                run_velocity_sweep_to_csv(act, &spec, limits, &abort, &mut csv, true, *bins)?;
+            println!("  samples                : {}", r.n_samples);
+            print_opt("mean speed achieved", r.mean_speed_rad_s, "rad/s");
+            print_opt("mean kinetic friction", r.mean_kinetic_friction_nm, "N·m");
+            print_opt("peak static load", r.peak_static_load_nm, "N·m");
+            // A traverse that stalled is not steady motion, so the split is void.
+            if let Some(achieved) = r.mean_speed_rad_s {
+                if achieved < speed * 0.5 {
+                    println!(
+                        "  note: achieved only {achieved:.4} of {speed} rad/s — the traverse \
+                         stalled, so load and friction cannot be separated from this log"
+                    );
+                }
+            }
+            if !r.curve.is_empty() {
+                println!("  position      static load   kinetic friction");
+                for (pos, load, fric) in &r.curve {
+                    println!("  {pos:+10.4} {load:+13.4} {fric:18.4}");
+                }
+            }
+            report_abort(r.abort);
         }
         CharacterizeCmd::Thermal {
             torque,

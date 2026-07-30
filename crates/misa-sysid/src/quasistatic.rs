@@ -1042,6 +1042,463 @@ pub fn run_kt(
     })
 }
 
+// ------------------------------------------------------- breakaway map (C)
+
+/// How to run a breakaway ramp at each of several positions.
+///
+/// This is the load map done entirely under **torque** control. `load-map`
+/// measures the torque a *position loop* emits to hold a setpoint, so the
+/// reading is the controller's own output and inherits its dynamics — on a rig
+/// that damps poorly the loop hunts and the measurement becomes the phase of a
+/// limit cycle (seen on an RS04: `loc_kp` 80 against 0.054 N·m of friction).
+///
+/// Here the position loop is only a *means of travel*; whatever it does while
+/// getting there is discarded. The measurement itself is a torque ramp judged by
+/// velocity, which needs no torque feedback at all — so it also works on
+/// firmware whose `MeasuredTorque` is broken.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BreakawayMapSpec {
+    /// First position, relative to the position at enable (rad).
+    pub from_rad: f32,
+    /// Last position, relative to the position at enable (rad).
+    pub to_rad: f32,
+    /// Positions visited (>= 1).
+    pub steps: usize,
+    /// Speed cap while travelling between positions (rad/s).
+    pub travel_speed_rad_s: f32,
+    /// How close counts as arrived (rad).
+    pub arrive_tolerance_rad: f32,
+    /// Give up travelling after this long and ramp anyway (s).
+    pub travel_timeout_s: f32,
+    /// The ramp performed at each position. Its `direction` is overridden per
+    /// pass when [`Self::both_directions`] is set.
+    pub ramp: BreakawaySpec,
+    /// Ramp both ways at each position, which is what separates the static load
+    /// (their mean) from the stiction (half their spread).
+    pub both_directions: bool,
+}
+
+impl BreakawayMapSpec {
+    /// A symmetric span of `+/- half_span_rad` around the start position.
+    pub fn symmetric(half_span_rad: f32, steps: usize, ramp: BreakawaySpec) -> Self {
+        Self {
+            from_rad: -half_span_rad,
+            to_rad: half_span_rad,
+            steps: steps.max(1),
+            travel_speed_rad_s: 0.3,
+            arrive_tolerance_rad: 0.01,
+            travel_timeout_s: 3.0,
+            ramp,
+            both_directions: true,
+        }
+    }
+
+    fn offsets(&self) -> Vec<f32> {
+        let n = self.steps.max(1);
+        if n == 1 {
+            return vec![self.from_rad];
+        }
+        (0..n)
+            .map(|i| self.from_rad + (self.to_rad - self.from_rad) * i as f32 / (n - 1) as f32)
+            .collect()
+    }
+}
+
+/// One position's worth of breakaway measurements.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BreakawayMapPoint {
+    /// Position the ramps started from, as measured (rad).
+    pub position_rad: f32,
+    /// Breakaway torque pushing positive (N·m). `None` if it never moved.
+    pub positive_nm: Option<f32>,
+    /// Breakaway torque pushing negative (N·m). `None` if it never moved, or if
+    /// only one direction was requested.
+    pub negative_nm: Option<f32>,
+    /// Whether every ramp at this position started from rest. `false` makes the
+    /// figures suspect — see [`BreakawaySpec::rest_window_s`].
+    pub rested: bool,
+}
+
+impl BreakawayMapPoint {
+    /// Conservative (gravity/spring) load: the mean of the two directions, in
+    /// which stiction cancels. `None` without both directions.
+    pub fn static_load_nm(&self) -> Option<f32> {
+        Some((self.positive_nm? + self.negative_nm?) / 2.0)
+    }
+
+    /// Stiction: half the spread between the directions, in which the static
+    /// load cancels. `None` without both directions.
+    pub fn stiction_nm(&self) -> Option<f32> {
+        Some((self.positive_nm? - self.negative_nm?).abs() / 2.0)
+    }
+}
+
+/// Load and stiction against position, measured under torque control.
+#[derive(Debug, Clone)]
+pub struct BreakawayMap {
+    pub points: Vec<BreakawayMapPoint>,
+    /// Every ramp sample, concatenated in visit order, for the raw log.
+    pub samples: Vec<Point>,
+    pub start_position_rad: f32,
+    pub spec: BreakawayMapSpec,
+    pub abort: Option<AbortReason>,
+}
+
+impl BreakawayMap {
+    /// Mean stiction across the positions that yielded one (N·m).
+    pub fn mean_stiction_nm(&self) -> Option<f32> {
+        let v: Vec<f32> = self.points.iter().filter_map(|p| p.stiction_nm()).collect();
+        (!v.is_empty()).then(|| v.iter().sum::<f32>() / v.len() as f32)
+    }
+
+    /// Largest |static load| across the positions (N·m).
+    ///
+    /// Compare against [`Self::mean_stiction_nm`]: well below it means this span
+    /// has no meaningful gravity/spring term, so the rig is friction-dominated.
+    pub fn peak_static_load_nm(&self) -> Option<f32> {
+        self.points
+            .iter()
+            .filter_map(|p| p.static_load_nm())
+            .map(f32::abs)
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal))
+    }
+
+    /// Position whose |static load| is smallest — the load's equilibrium.
+    pub fn equilibrium_position_rad(&self) -> Option<f32> {
+        self.points
+            .iter()
+            .filter(|p| p.static_load_nm().is_some())
+            .min_by(|a, b| {
+                a.static_load_nm()
+                    .unwrap()
+                    .abs()
+                    .partial_cmp(&b.static_load_nm().unwrap().abs())
+                    .unwrap_or(core::cmp::Ordering::Equal)
+            })
+            .map(|p| p.position_rad)
+    }
+
+    /// Positions where a ramp did not start from rest, so their figures are
+    /// suspect.
+    pub fn unrested_positions(&self) -> Vec<f32> {
+        self.points
+            .iter()
+            .filter(|p| !p.rested)
+            .map(|p| p.position_rad)
+            .collect()
+    }
+}
+
+/// Ramp torque to breakaway at each of several positions.
+///
+/// Prefer this over [`run_load_map`] when the position loop cannot hold still —
+/// it needs neither a settled dwell nor working torque feedback. The cost is
+/// time: every position pays a full ramp per direction.
+pub fn run_breakaway_map(
+    act: &mut dyn Actuator,
+    spec: &BreakawayMapSpec,
+    limits: SafetyLimits,
+    abort: &AtomicBool,
+) -> Result<BreakawayMap> {
+    let start = {
+        act.set_run_mode(RunMode::Position)?;
+        act.enable()?.position_rad
+    };
+    let mut points = Vec::with_capacity(spec.steps);
+    let mut samples = Vec::new();
+    let mut stop = None;
+
+    for offset in spec.offsets() {
+        if abort.load(Ordering::Relaxed) {
+            stop = Some(AbortReason::Cancelled);
+            break;
+        }
+        let target = start + offset;
+
+        // Travel under position control. Hunting here is irrelevant: nothing is
+        // recorded until the ramp begins, and the ramp is torque-controlled.
+        //
+        // Re-enable first: each `run_breakaway` ends by commanding zero torque
+        // and disabling, so without this the second position onward would issue
+        // position commands to a de-energised motor and never travel. Measured
+        // on an RS04, where all five positions came back within 0.003 rad of the
+        // first.
+        act.set_run_mode(RunMode::Position)?;
+        act.enable()?;
+        let travel_deadline =
+            Instant::now() + Duration::from_secs_f32(spec.travel_timeout_s.max(0.0));
+        let mut fb = act.set_position(target, spec.travel_speed_rad_s)?;
+        while (fb.position_rad - target).abs() > spec.arrive_tolerance_rad {
+            if Instant::now() >= travel_deadline || abort.load(Ordering::Relaxed) {
+                break;
+            }
+            fb = act.set_position(target, spec.travel_speed_rad_s)?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let dirs: Vec<Direction> = if spec.both_directions {
+            vec![spec.ramp.direction, spec.ramp.direction.flipped()]
+        } else {
+            vec![spec.ramp.direction]
+        };
+
+        let mut positive_nm = None;
+        let mut negative_nm = None;
+        let mut rested = true;
+        let mut measured_at = fb.position_rad;
+
+        for d in dirs {
+            let ramp_spec = BreakawaySpec {
+                direction: d,
+                ..spec.ramp
+            };
+            let r = run_breakaway(act, &ramp_spec, limits, abort)?;
+            rested &= r.rested;
+            if let Some(p) = r.points.first() {
+                measured_at = p.position_rad;
+            }
+            samples.extend(r.points);
+            match d {
+                Direction::Positive => positive_nm = r.breakaway_torque_nm,
+                Direction::Negative => negative_nm = r.breakaway_torque_nm,
+            }
+            if let Some(reason) = r.abort {
+                stop = Some(reason);
+                break;
+            }
+        }
+
+        points.push(BreakawayMapPoint {
+            position_rad: measured_at,
+            positive_nm,
+            negative_nm,
+            rested,
+        });
+        if stop.is_some() {
+            break;
+        }
+    }
+
+    // Leave the rig where it began.
+    let _ = act.set_run_mode(RunMode::Position);
+    let _ = act.set_position(start, spec.travel_speed_rad_s);
+    quiet(act);
+
+    Ok(BreakawayMap {
+        points,
+        samples,
+        start_position_rad: start,
+        spec: *spec,
+        abort: stop,
+    })
+}
+
+// ------------------------------------------------------- velocity sweep (B)
+
+/// How to traverse at constant speed while logging torque.
+///
+/// The other way to keep a hunting position loop out of the measurement: rather
+/// than holding setpoints, keep the shaft *moving* slowly and record torque
+/// continuously. A velocity loop is naturally damped, and in steady motion
+///
+/// ```text
+/// moving + : tau = load(theta) + kinetic friction
+/// moving - : tau = load(theta) - kinetic friction
+/// ```
+///
+/// so the same mean/half-difference decomposition applies, densely and without
+/// any settling. This measures **kinetic** friction, where
+/// [`run_breakaway_map`] measures **static** — running both is how the two are
+/// compared (a DM-J4310 showed 0.126 against 0.175).
+///
+/// Needs working torque feedback, unlike the breakaway map.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VelocitySweepSpec {
+    /// Traverse speed (rad/s). Slow enough that inertia does not contribute.
+    pub speed_rad_s: f32,
+    /// Sweep `start +/- this` (rad).
+    pub half_span_rad: f32,
+    /// Log rate (Hz).
+    pub rate_hz: f32,
+    /// Also sweep back, which is what makes the friction separable.
+    pub return_sweep: bool,
+}
+
+impl VelocitySweepSpec {
+    /// A slow symmetric traverse: 0.05 rad/s at 200 Hz, both directions.
+    pub fn slow(half_span_rad: f32) -> Self {
+        Self {
+            speed_rad_s: 0.05,
+            half_span_rad,
+            rate_hz: 200.0,
+            return_sweep: true,
+        }
+    }
+}
+
+/// Continuous torque-vs-position log from a constant-speed traverse.
+#[derive(Debug, Clone)]
+pub struct VelocitySweep {
+    /// Samples in order. `cmd` is the commanded velocity, so its sign says which
+    /// pass a sample belongs to.
+    pub points: Vec<Point>,
+    pub start_position_rad: f32,
+    pub spec: VelocitySweepSpec,
+    pub abort: Option<AbortReason>,
+}
+
+impl VelocitySweep {
+    /// Load and kinetic friction against position, from binning the two passes.
+    ///
+    /// Returns `(position, static_load, kinetic_friction)` per bin that both
+    /// passes visited. Bins are uniform over the swept range; `bins` below 2 is
+    /// treated as 2.
+    pub fn friction_curve(&self, bins: usize) -> Vec<(f32, f32, f32)> {
+        let n = bins.max(2);
+        let usable: Vec<&Point> = self
+            .points
+            .iter()
+            .filter(|p| p.position_rad.is_finite() && p.torque_nm.is_finite() && p.cmd != 0.0)
+            .collect();
+        let (Some(lo), Some(hi)) = (
+            usable
+                .iter()
+                .map(|p| p.position_rad)
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal)),
+            usable
+                .iter()
+                .map(|p| p.position_rad)
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal)),
+        ) else {
+            return Vec::new();
+        };
+        // A degenerate range means the shaft never traversed, so there is
+        // nothing to bin. `<=` rather than `!(>)` so NaN also bails out.
+        if hi <= lo || !(hi - lo).is_finite() {
+            return Vec::new();
+        }
+        // (sum, count) per direction per bin.
+        let mut fwd = vec![(0.0f32, 0u32); n];
+        let mut rev = vec![(0.0f32, 0u32); n];
+        for p in &usable {
+            let t = ((p.position_rad - lo) / (hi - lo) * n as f32) as usize;
+            let idx = t.min(n - 1);
+            let slot = if p.cmd > 0.0 { &mut fwd } else { &mut rev };
+            slot[idx].0 += p.torque_nm;
+            slot[idx].1 += 1;
+        }
+        (0..n)
+            .filter_map(|i| {
+                let (fs, fc) = fwd[i];
+                let (rs, rc) = rev[i];
+                if fc == 0 || rc == 0 {
+                    return None;
+                }
+                let (f, r) = (fs / fc as f32, rs / rc as f32);
+                let pos = lo + (hi - lo) * (i as f32 + 0.5) / n as f32;
+                Some((pos, (f + r) / 2.0, (f - r).abs() / 2.0))
+            })
+            .collect()
+    }
+
+    /// Mean kinetic friction over the curve (N·m).
+    pub fn mean_kinetic_friction_nm(&self, bins: usize) -> Option<f32> {
+        let c = self.friction_curve(bins);
+        (!c.is_empty()).then(|| c.iter().map(|&(_, _, f)| f).sum::<f32>() / c.len() as f32)
+    }
+
+    /// Largest |static load| over the curve (N·m).
+    pub fn peak_static_load_nm(&self, bins: usize) -> Option<f32> {
+        self.friction_curve(bins)
+            .iter()
+            .map(|&(_, l, _)| l.abs())
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal))
+    }
+
+    /// Mean speed actually achieved while commanded to move (rad/s).
+    ///
+    /// Far below [`VelocitySweepSpec::speed_rad_s`] means the traverse stalled,
+    /// so the log is not steady motion and the decomposition does not hold.
+    pub fn mean_speed_rad_s(&self) -> Option<f32> {
+        let v: Vec<f32> = self
+            .points
+            .iter()
+            .filter(|p| p.cmd != 0.0 && p.velocity_rad_per_s.is_finite())
+            .map(|p| p.velocity_rad_per_s.abs())
+            .collect();
+        (!v.is_empty()).then(|| v.iter().sum::<f32>() / v.len() as f32)
+    }
+}
+
+/// Traverse at constant speed in each direction, logging torque throughout.
+pub fn run_velocity_sweep(
+    act: &mut dyn Actuator,
+    spec: &VelocitySweepSpec,
+    limits: SafetyLimits,
+    abort: &AtomicBool,
+) -> Result<VelocitySweep> {
+    act.set_run_mode(RunMode::Velocity)?;
+    let start = act.enable()?.position_rad;
+    let mut guard = Guard::new(limits, start);
+
+    let period = Duration::from_secs_f32(1.0 / spec.rate_hz.max(1.0));
+    let speed = spec.speed_rad_s.abs().max(1e-4);
+    let (lo, hi) = (start - spec.half_span_rad, start + spec.half_span_rad);
+    let mut points = Vec::new();
+    let t0 = Instant::now();
+
+    // Each leg drives until the bound is crossed. `log` marks whether the leg's
+    // samples are part of the measurement or just positioning.
+    let leg = |act: &mut dyn Actuator,
+                   points: &mut Vec<Point>,
+                   guard: &mut Guard,
+                   vel: f32,
+                   done: &dyn Fn(f32) -> bool,
+                   log: bool|
+     -> Result<Option<AbortReason>> {
+        loop {
+            let t = t0.elapsed().as_secs_f32();
+            if abort.load(Ordering::Relaxed) {
+                return Ok(Some(AbortReason::Cancelled));
+            }
+            let iter_start = Instant::now();
+            let fb = act.set_velocity(vel)?;
+            if log {
+                points.push(Point::from(t, vel, &fb));
+            }
+            if let Some(r) = guard.check(t, &fb) {
+                return Ok(Some(r));
+            }
+            if done(fb.position_rad) {
+                return Ok(None);
+            }
+            if let Some(rem) = period.checked_sub(iter_start.elapsed()) {
+                std::thread::sleep(rem);
+            }
+        }
+    };
+
+    // Positioning leg to the low end (not logged), then the two measured legs so
+    // both directions cover the same range.
+    let mut stop = leg(act, &mut points, &mut guard, -speed, &|p| p <= lo, false)?;
+    if stop.is_none() {
+        stop = leg(act, &mut points, &mut guard, speed, &|p| p >= hi, true)?;
+    }
+    if stop.is_none() && spec.return_sweep {
+        stop = leg(act, &mut points, &mut guard, -speed, &|p| p <= lo, true)?;
+    }
+
+    let _ = act.set_velocity(0.0);
+    quiet(act);
+
+    Ok(VelocitySweep {
+        points,
+        start_position_rad: start,
+        spec: *spec,
+        abort: stop,
+    })
+}
+
 // ------------------------------------------------------------------ shared
 
 /// Command zero torque, then disable.
@@ -2085,5 +2542,301 @@ mod tests {
         let f = t.delivered_fraction().expect("fraction");
         assert!((f - 0.125).abs() < 1e-3, "expected ~12.5%, got {f}");
         assert!(f < 0.5, "must fall below the CLI's validity threshold");
+    }
+
+    /// The breakaway map must recover the planted friction at every position,
+    /// and — crucially — do so **without depending on torque feedback**, since
+    /// that is why it exists.
+    #[test]
+    fn breakaway_map_recovers_friction_without_torque_feedback() {
+        /// Reports NaN torque throughout, like RobStride firmware whose
+        /// `MeasuredTorque` is broken. Motion still gates on velocity.
+        struct NoTorque {
+            mu: f32,
+            pos: f32,
+            vel: f32,
+            cmd: f32,
+        }
+        impl NoTorque {
+            fn fb(&self) -> MotorFeedback {
+                MotorFeedback {
+                    position_rad: self.pos,
+                    velocity_rad_per_s: self.vel,
+                    torque_nm: f32::NAN, // the whole point
+                    current_a: f32::NAN,
+                    temperature_c: f32::NAN,
+                }
+            }
+        }
+        impl Actuator for NoTorque {
+            fn motor_id(&self) -> u8 {
+                1
+            }
+            fn enable(&mut self) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn disable(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_zero(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_run_mode(&mut self, _m: RunMode) -> Result<()> {
+                Ok(())
+            }
+            fn set_position(&mut self, p: f32, _v: f32) -> Result<MotorFeedback> {
+                self.pos = p;
+                self.vel = 0.0;
+                self.cmd = 0.0;
+                Ok(self.fb())
+            }
+            fn set_velocity(&mut self, _v: f32) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn set_torque(&mut self, t: f32) -> Result<MotorFeedback> {
+                self.cmd = t;
+                // Moves only once the command clears friction.
+                self.vel = if t.abs() > self.mu { t.signum() } else { 0.0 };
+                Ok(self.fb())
+            }
+            fn mit_control(
+                &mut self,
+                _p: f32,
+                _v: f32,
+                _kp: f32,
+                _kd: f32,
+                t: f32,
+            ) -> Result<MotorFeedback> {
+                self.set_torque(t)
+            }
+            fn measure(&mut self) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn read_status(&mut self) -> Result<misa_actuator::MotorStatus> {
+                Ok(misa_actuator::MotorStatus {
+                    voltage_v: 24.0,
+                    temperature_c: f32::NAN,
+                    error: Default::default(),
+                })
+            }
+        }
+
+        let mu = 0.3;
+        let mut rig = NoTorque {
+            mu,
+            pos: 0.0,
+            vel: 0.0,
+            cmd: 0.0,
+        };
+        let ramp = BreakawaySpec {
+            ramp_nm_per_s: 20.0,
+            rate_hz: 2000.0,
+            rest_window_s: 0.0,
+            rest_timeout_s: 0.2,
+            motion_threshold_rad: 1e9, // gate on velocity only
+            ..BreakawaySpec::slow(2.0, Direction::Positive)
+        };
+        let spec = BreakawayMapSpec {
+            travel_timeout_s: 0.0,
+            ..BreakawayMapSpec::symmetric(0.2, 3, ramp)
+        };
+        let m = run_breakaway_map(&mut rig, &spec, roomy(), &no_abort()).unwrap();
+        assert_eq!(m.points.len(), 3);
+        assert_eq!(m.abort, None);
+
+        // Friction recovered at every position, static load ~0.
+        let stic = m.mean_stiction_nm().expect("stiction");
+        assert!((stic - mu).abs() < 0.1, "stiction {stic} vs planted {mu}");
+        assert!(
+            m.peak_static_load_nm().unwrap() < 0.1,
+            "static load should vanish, got {:?}",
+            m.peak_static_load_nm()
+        );
+        // And it worked despite torque never being reported.
+        assert!(m.samples.iter().all(|p| p.torque_nm.is_nan()));
+    }
+
+    /// The velocity sweep must split a planted spring load from kinetic friction
+    /// by binning the two passes.
+    #[test]
+    fn velocity_sweep_separates_a_spring_load_from_friction() {
+        /// Moves at the commanded speed and reports `k*pos + mu*dir` — a spring
+        /// plus direction-dependent friction, which is exactly what the
+        /// decomposition should pull apart.
+        struct Traverse {
+            k: f32,
+            mu: f32,
+            pos: f32,
+            vel: f32,
+            dt: f32,
+        }
+        impl Traverse {
+            fn fb(&self) -> MotorFeedback {
+                MotorFeedback {
+                    position_rad: self.pos,
+                    velocity_rad_per_s: self.vel,
+                    torque_nm: self.k * self.pos + self.mu * self.vel.signum(),
+                    current_a: f32::NAN,
+                    temperature_c: 30.0,
+                }
+            }
+        }
+        impl Actuator for Traverse {
+            fn motor_id(&self) -> u8 {
+                1
+            }
+            fn enable(&mut self) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn disable(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_zero(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_run_mode(&mut self, _m: RunMode) -> Result<()> {
+                Ok(())
+            }
+            fn set_position(&mut self, _p: f32, _v: f32) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn set_velocity(&mut self, v: f32) -> Result<MotorFeedback> {
+                self.vel = v;
+                self.pos += v * self.dt;
+                Ok(self.fb())
+            }
+            fn set_torque(&mut self, _t: f32) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn mit_control(
+                &mut self,
+                _p: f32,
+                _v: f32,
+                _kp: f32,
+                _kd: f32,
+                _t: f32,
+            ) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn measure(&mut self) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn read_status(&mut self) -> Result<misa_actuator::MotorStatus> {
+                Ok(misa_actuator::MotorStatus {
+                    voltage_v: 24.0,
+                    temperature_c: 30.0,
+                    error: Default::default(),
+                })
+            }
+        }
+
+        let (k, mu) = (2.0f32, 0.15f32);
+        let mut rig = Traverse {
+            k,
+            mu,
+            pos: 0.0,
+            vel: 0.0,
+            dt: 0.01,
+        };
+        let spec = VelocitySweepSpec {
+            speed_rad_s: 1.0,
+            half_span_rad: 0.3,
+            rate_hz: 5000.0,
+            return_sweep: true,
+        };
+        let sweep = run_velocity_sweep(&mut rig, &spec, roomy(), &no_abort()).unwrap();
+        assert_eq!(sweep.abort, None);
+
+        let fric = sweep.mean_kinetic_friction_nm(10).expect("friction");
+        assert!((fric - mu).abs() < 0.02, "friction {fric} vs planted {mu}");
+
+        // The spring shows up as a static load rising with |position|.
+        let curve = sweep.friction_curve(10);
+        assert!(curve.len() >= 5, "expected a populated curve");
+        for (pos, load, _) in &curve {
+            assert!(
+                (load - k * pos).abs() < 0.05,
+                "at {pos}: load {load} vs expected {}",
+                k * pos
+            );
+        }
+    }
+
+    /// A traverse that never moves must be reported as stalled rather than
+    /// yielding a bogus split.
+    #[test]
+    fn velocity_sweep_flags_a_stalled_traverse() {
+        struct Stalled;
+        impl Actuator for Stalled {
+            fn motor_id(&self) -> u8 {
+                1
+            }
+            fn enable(&mut self) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn disable(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_zero(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_run_mode(&mut self, _m: RunMode) -> Result<()> {
+                Ok(())
+            }
+            fn set_position(&mut self, _p: f32, _v: f32) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn set_velocity(&mut self, _v: f32) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn set_torque(&mut self, _t: f32) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn mit_control(
+                &mut self,
+                _p: f32,
+                _v: f32,
+                _kp: f32,
+                _kd: f32,
+                _t: f32,
+            ) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn measure(&mut self) -> Result<MotorFeedback> {
+                Ok(MotorFeedback {
+                    position_rad: 0.0, // never advances
+                    velocity_rad_per_s: 0.0,
+                    torque_nm: 0.1,
+                    current_a: f32::NAN,
+                    temperature_c: 30.0,
+                })
+            }
+            fn read_status(&mut self) -> Result<misa_actuator::MotorStatus> {
+                Ok(misa_actuator::MotorStatus {
+                    voltage_v: 24.0,
+                    temperature_c: 30.0,
+                    error: Default::default(),
+                })
+            }
+        }
+        let limits = SafetyLimits {
+            max_duration_s: 0.05, // the run can only end on the time budget
+            ..roomy()
+        };
+        let spec = VelocitySweepSpec {
+            speed_rad_s: 0.5,
+            half_span_rad: 0.3,
+            rate_hz: 2000.0,
+            return_sweep: true,
+        };
+        let sweep = run_velocity_sweep(&mut Stalled, &spec, limits, &no_abort()).unwrap();
+        // The unlogged positioning leg never reaches its bound, so the time
+        // budget ends the run before any measured leg starts. Zero samples plus a
+        // Timeout is the honest report — better than a curve built from a shaft
+        // that never moved.
+        assert_eq!(sweep.abort, Some(AbortReason::Timeout));
+        assert!(sweep.points.is_empty(), "nothing should have been measured");
+        assert_eq!(sweep.mean_speed_rad_s(), None);
+        assert!(sweep.friction_curve(10).is_empty());
     }
 }

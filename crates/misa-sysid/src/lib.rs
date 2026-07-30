@@ -49,8 +49,15 @@ pub use limits::{AbortReason, Guard, SafetyLimits};
 #[cfg(feature = "cli")]
 pub use cli::{run_characterize, CharacterizeCmd};
 pub use report::{
+    run_breakaway_map_to_csv, run_velocity_sweep_to_csv, BreakawayMapReport, VelocitySweepReport,
+};
+pub use report::{
     run_breakaway_to_csv, run_kt_to_csv, run_load_map_to_csv, run_thermal_to_csv, BreakawayReport,
     KtReport, LoadMapReport, ThermalReport,
+};
+pub use quasistatic::{
+    run_breakaway_map, run_velocity_sweep, BreakawayMap, BreakawayMapPoint, BreakawayMapSpec,
+    VelocitySweep, VelocitySweepSpec,
 };
 pub use quasistatic::{
     run_breakaway, run_kt, run_load_map, run_thermal, Breakaway, BreakawaySpec, Direction, KtSpec,

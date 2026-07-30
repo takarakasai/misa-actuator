@@ -17,8 +17,9 @@ use misa_actuator::{Actuator, Result};
 
 use crate::limits::{AbortReason, SafetyLimits};
 use crate::quasistatic::{
-    run_breakaway, run_kt, run_load_map, run_thermal, write_points_csv, BreakawaySpec, KtSpec,
-    LoadMapSpec, ThermalSpec,
+    run_breakaway, run_breakaway_map, run_kt, run_load_map, run_thermal, run_velocity_sweep,
+    write_points_csv, BreakawayMapSpec, BreakawaySpec, KtSpec, LoadMapSpec, ThermalSpec,
+    VelocitySweepSpec,
 };
 
 /// Derived results of a load-map run.
@@ -185,5 +186,90 @@ pub fn run_kt_to_csv(
         pointwise_kt_nm_per_a: s.pointwise_kt_nm_per_a(),
         r_squared: s.r_squared(),
         abort: s.abort,
+    })
+}
+
+/// Derived results of a breakaway map.
+#[derive(Debug, Clone)]
+pub struct BreakawayMapReport {
+    pub n_positions: usize,
+    /// Mean stiction across positions (N·m).
+    pub mean_stiction_nm: Option<f32>,
+    /// Peak |static load| across positions (N·m). Well below the stiction means
+    /// the span has no meaningful gravity/spring term.
+    pub peak_static_load_nm: Option<f32>,
+    /// Position whose |static load| is smallest.
+    pub equilibrium_position_rad: Option<f32>,
+    /// Positions where a ramp did not start from rest, so their figures are
+    /// suspect.
+    pub unrested_positions: Vec<f32>,
+    /// `(position, static_load, stiction)` per position that yielded both
+    /// directions.
+    pub curve: Vec<(f32, f32, f32)>,
+    pub abort: Option<AbortReason>,
+}
+
+/// Ramp to breakaway at each of several positions, and write every ramp as CSV.
+pub fn run_breakaway_map_to_csv(
+    act: &mut dyn Actuator,
+    spec: &BreakawayMapSpec,
+    limits: SafetyLimits,
+    abort: &AtomicBool,
+    csv: &mut dyn Write,
+    write_header: bool,
+) -> Result<BreakawayMapReport> {
+    let m = run_breakaway_map(act, spec, limits, abort)?;
+    write_points_csv(&m.samples, csv, write_header)?;
+    Ok(BreakawayMapReport {
+        n_positions: m.points.len(),
+        mean_stiction_nm: m.mean_stiction_nm(),
+        peak_static_load_nm: m.peak_static_load_nm(),
+        equilibrium_position_rad: m.equilibrium_position_rad(),
+        unrested_positions: m.unrested_positions(),
+        curve: m
+            .points
+            .iter()
+            .filter_map(|p| Some((p.position_rad, p.static_load_nm()?, p.stiction_nm()?)))
+            .collect(),
+        abort: m.abort,
+    })
+}
+
+/// Derived results of a constant-speed sweep.
+#[derive(Debug, Clone)]
+pub struct VelocitySweepReport {
+    pub n_samples: usize,
+    /// Mean speed achieved while commanded to move (rad/s). Far below the
+    /// command means the traverse stalled and the decomposition does not hold.
+    pub mean_speed_rad_s: Option<f32>,
+    /// Mean kinetic friction over the binned curve (N·m).
+    pub mean_kinetic_friction_nm: Option<f32>,
+    /// Peak |static load| over the binned curve (N·m).
+    pub peak_static_load_nm: Option<f32>,
+    /// `(position, static_load, kinetic_friction)` per bin both passes visited.
+    pub curve: Vec<(f32, f32, f32)>,
+    pub abort: Option<AbortReason>,
+}
+
+/// Traverse at constant speed both ways, write the log, and bin it into a
+/// load/friction curve.
+pub fn run_velocity_sweep_to_csv(
+    act: &mut dyn Actuator,
+    spec: &VelocitySweepSpec,
+    limits: SafetyLimits,
+    abort: &AtomicBool,
+    csv: &mut dyn Write,
+    write_header: bool,
+    bins: usize,
+) -> Result<VelocitySweepReport> {
+    let sweep = run_velocity_sweep(act, spec, limits, abort)?;
+    write_points_csv(&sweep.points, csv, write_header)?;
+    Ok(VelocitySweepReport {
+        n_samples: sweep.points.len(),
+        mean_speed_rad_s: sweep.mean_speed_rad_s(),
+        mean_kinetic_friction_nm: sweep.mean_kinetic_friction_nm(bins),
+        peak_static_load_nm: sweep.peak_static_load_nm(bins),
+        curve: sweep.friction_curve(bins),
+        abort: sweep.abort,
     })
 }

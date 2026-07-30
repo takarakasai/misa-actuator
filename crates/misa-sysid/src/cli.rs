@@ -23,6 +23,7 @@ use crate::report::{
     run_breakaway_map_to_csv, run_breakaway_to_csv, run_kt_to_csv, run_load_map_to_csv,
     run_thermal_to_csv, run_velocity_sweep_to_csv,
 };
+use crate::series::{run_breakaway_series, run_velocity_sweep_series, FrictionSeries};
 
 /// Which quasi-static measurement to run.
 #[derive(Subcommand, Debug, Clone)]
@@ -78,6 +79,14 @@ pub enum CharacterizeCmd {
         /// the static load.
         #[arg(long)]
         both: bool,
+        /// Repeat the both-direction measurement this many times and report the
+        /// distribution instead of a single figure. Implies --both.
+        ///
+        /// One ramp says little: five positions of an RS04 breakaway map spanned
+        /// 0.042 to 0.166 N·m. Repetition also logs temperature per rep, since a
+        /// warming motor makes the spread partly drift rather than noise.
+        #[arg(long, default_value_t = 1)]
+        reps: u32,
     },
     /// Load and stiction vs position, measured under **torque** control
     ///
@@ -144,6 +153,9 @@ pub enum CharacterizeCmd {
         /// Only traverse one way, which forgoes the load/friction split.
         #[arg(long)]
         single_pass: bool,
+        /// Repeat the sweep this many times and report the distribution.
+        #[arg(long, default_value_t = 1)]
+        reps: u32,
     },
     /// Temperature rise while holding a fixed torque — turns "this got hot" into
     /// a continuous-rating number.
@@ -292,7 +304,24 @@ pub fn run_characterize(
             motion_hold,
             negative,
             both,
+            reps,
         } => {
+            if *reps > 1 {
+                let spec = BreakawaySpec {
+                    ramp_nm_per_s: *ramp,
+                    max_torque_nm: *ceiling,
+                    motion_threshold_rad_per_s: *motion_speed,
+                    motion_threshold_rad: *motion_travel,
+                    motion_hold_s: *motion_hold,
+                    ..BreakawaySpec::slow(*ceiling, Direction::Positive)
+                };
+                println!("breakaway x{reps}: ramping {ramp} N·m/s to {ceiling} N·m each way ...");
+                let series = run_breakaway_series(act, &spec, limits, &abort, *reps)?;
+                series.write_csv(&mut csv)?;
+                report_series(&series);
+                println!("wrote per-repetition CSV to {}", out.display());
+                return Ok(());
+            }
             let first = if *negative {
                 Direction::Negative
             } else {
@@ -408,7 +437,23 @@ pub fn run_characterize(
             rate,
             bins,
             single_pass,
+            reps,
         } => {
+            if *reps > 1 {
+                let spec = VelocitySweepSpec {
+                    speed_rad_s: *speed,
+                    half_span_rad: *span,
+                    rate_hz: *rate,
+                    return_sweep: !*single_pass,
+                };
+                println!("velocity sweep x{reps}: ±{span} rad at {speed} rad/s ...");
+                let series =
+                    run_velocity_sweep_series(act, &spec, limits, &abort, *reps, *bins)?;
+                series.write_csv(&mut csv)?;
+                report_series(&series);
+                println!("wrote per-repetition CSV to {}", out.display());
+                return Ok(());
+            }
             let spec = VelocitySweepSpec {
                 speed_rad_s: *speed,
                 half_span_rad: *span,
@@ -535,6 +580,64 @@ pub fn run_characterize(
 
     println!("wrote raw samples to {}", out.display());
     Ok(())
+}
+
+/// Print a repeated series: distribution, histogram, and whether it drifted.
+fn report_series(series: &FrictionSeries) {
+    let kind = series.kind.label();
+    println!("  repetitions            : {}", series.samples.len());
+    if series.failed_repetitions() > 0 {
+        println!(
+            "  failed to measure      : {} (excluded from the statistics)",
+            series.failed_repetitions()
+        );
+    }
+    match series.friction_stats() {
+        Some(st) => {
+            println!(
+                "  {kind} friction        : mean {:.4}  sd {:.4}  median {:.4} N·m",
+                st.mean, st.sd, st.median
+            );
+            println!(
+                "  {:<22} : min {:.4}  p10 {:.4}  p90 {:.4}  max {:.4} N·m",
+                "spread", st.min, st.p10, st.p90, st.max
+            );
+            match st.cv() {
+                Some(cv) => println!("  {:<22} : {:.1}% of the mean", "scatter (sd/mean)", cv * 100.0),
+                None => println!("  {:<22} : mean is ~0, ratio withheld", "scatter (sd/mean)"),
+            }
+            println!("\n  histogram of {kind} friction (N·m):");
+            print!("{}", series.histogram_text(12, 40));
+        }
+        None => println!("  {kind} friction        : no repetition produced an estimate"),
+    }
+    if let Some(st) = series.static_load_stats() {
+        println!(
+            "  static load            : mean {:+.4}  sd {:.4} N·m",
+            st.mean, st.sd
+        );
+    }
+    // Drift matters more than the spread: a warming motor is not one process.
+    match (series.temperature_trend(), series.friction_vs_temperature()) {
+        (Some(dt), Some(df)) if dt.abs() > 0.02 => {
+            println!(
+                "\n  temperature drifted {dt:+.3} °C/rep, and {kind} friction moved \
+                 {df:+.4} N·m/°C with it"
+            );
+            println!(
+                "  => part of the spread above is drift, not scatter. Let the motor settle \
+                 between repetitions to separate them."
+            );
+        }
+        (Some(dt), _) => println!("\n  temperature drift      : {dt:+.3} °C/rep (negligible)"),
+        _ => println!("\n  temperature drift      : not reported by this driver"),
+    }
+    if let Some(tr) = series.friction_trend() {
+        println!("  {kind} friction trend   : {tr:+.4} N·m/rep");
+    }
+    if let Some(r) = series.abort {
+        eprintln!("  ABORTED: {} ({r:?})", r.describe());
+    }
 }
 
 fn print_opt(label: &str, v: Option<f32>, unit: &str) {

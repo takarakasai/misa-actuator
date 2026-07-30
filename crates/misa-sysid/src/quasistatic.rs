@@ -2892,7 +2892,7 @@ mod tests {
                 // Judder: alternate between a threshold-clearing spike and rest.
                 let v = if sustained {
                     1.0
-                } else if self.n % 2 == 0 {
+                } else if self.n.is_multiple_of(2) {
                     0.5
                 } else {
                     0.0

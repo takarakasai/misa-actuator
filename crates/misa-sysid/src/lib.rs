@@ -42,10 +42,15 @@ pub mod limits;
 pub mod quasistatic;
 pub mod report;
 pub mod runner;
+pub mod series;
 
 pub use chirp::{Chirp, Sweep};
 pub use frf::{estimate_frf, FreqResponse, FrfOptions};
 pub use limits::{AbortReason, Guard, SafetyLimits};
+pub use series::{
+    run_breakaway_series, run_velocity_sweep_series, FrictionKind, FrictionSample, FrictionSeries,
+    Stats,
+};
 #[cfg(feature = "cli")]
 pub use cli::{run_characterize, CharacterizeCmd};
 pub use report::{

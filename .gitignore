@@ -3,6 +3,9 @@
 *.bak
 # chirp / sysid run outputs
 *.csv
+# ...except curated bench data referenced by doc/, which is the record of a
+# measurement session and cannot be regenerated without the hardware.
+!doc/data/*.csv
 # scripts/hw_check.sh run logs
 /hw_check_logs/
 

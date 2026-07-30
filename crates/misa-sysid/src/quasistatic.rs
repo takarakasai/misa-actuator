@@ -558,6 +558,21 @@ pub struct BreakawaySpec {
     /// second ramp began while the shaft was still coasting from the first and
     /// duly reported -0.0000 N·m.
     pub rest_window_s: f32,
+    /// How long motion must persist before it counts as breakaway (s).
+    ///
+    /// A single threshold crossing is not breakaway. A rig that judders creeps
+    /// back and forth at low torque, and the velocity threshold catches one of
+    /// those spikes long before the shaft can actually be driven — measured on
+    /// an RS04, where velocity crossed +/-0.08 rad/s in *both* directions while
+    /// the command was only 0.12 A, and the reported figure came out three times
+    /// below the torque a constant-speed traverse actually needed. Requiring the
+    /// motion to hold rejects judder; `0.0` restores the single-crossing
+    /// behaviour.
+    ///
+    /// Keep it short relative to the ramp's own duration
+    /// (`max_torque_nm / ramp_nm_per_s`): a hold longer than the ramp means the
+    /// ceiling arrives first and no breakaway is ever confirmed.
+    pub motion_hold_s: f32,
     /// Give up waiting for stillness after this long and ramp anyway (s).
     ///
     /// A shaft that never settles — a live load, or a rig being touched — still
@@ -577,6 +592,7 @@ impl BreakawaySpec {
             motion_threshold_rad: 0.02,
             direction,
             rate_hz: 200.0,
+            motion_hold_s: 0.1,
             rest_window_s: 0.3,
             rest_timeout_s: 3.0,
         }
@@ -650,6 +666,8 @@ pub fn run_breakaway(
     let mut points = Vec::new();
     let mut stop = None;
     let (mut torque_at_motion, mut position_at_motion) = (None, None);
+    // When the current run of motion began: (instant, commanded torque, position).
+    let mut motion_since: Option<(Instant, f32, f32)> = None;
 
     let t0 = Instant::now();
     loop {
@@ -668,12 +686,21 @@ pub fn run_breakaway(
         let fb = act.set_torque(cmd)?;
         points.push(Point::from(t, cmd, &fb));
 
+        // Motion must persist: a lone threshold crossing is judder, not
+        // breakaway. The torque recorded is the one from when motion *started*,
+        // not from when it was confirmed, so the hold does not inflate it.
         let moving = fb.velocity_rad_per_s.abs() > spec.motion_threshold_rad_per_s
             || (fb.position_rad - start).abs() > spec.motion_threshold_rad;
         if moving {
-            torque_at_motion = Some(cmd);
-            position_at_motion = Some(fb.position_rad);
-            break;
+            let (since, at_cmd, at_pos) =
+                *motion_since.get_or_insert((Instant::now(), cmd, fb.position_rad));
+            if since.elapsed() >= Duration::from_secs_f32(spec.motion_hold_s.max(0.0)) {
+                torque_at_motion = Some(at_cmd);
+                position_at_motion = Some(at_pos);
+                break;
+            }
+        } else {
+            motion_since = None;
         }
         if let Some(r) = guard.check(t, &fb) {
             stop = Some(r);
@@ -1738,6 +1765,10 @@ mod tests {
         let spec = BreakawaySpec {
             ramp_nm_per_s: 20.0, // fast, to keep the test short
             rate_hz: 2000.0,
+            // This rig breaks away cleanly, so the sustained-motion hold is not
+            // what is under test — and at 20 N·m/s the ramp would end before the
+            // default hold elapsed.
+            motion_hold_s: 0.0,
             ..BreakawaySpec::slow(2.0, Direction::Positive)
         };
         let r = run_breakaway(&mut rig, &spec, roomy(), &no_abort()).unwrap();
@@ -1757,6 +1788,7 @@ mod tests {
         let spec = BreakawaySpec {
             ramp_nm_per_s: 20.0,
             rate_hz: 2000.0,
+            motion_hold_s: 0.0, // clean breakaway; see the positive-direction test
             ..BreakawaySpec::slow(2.0, Direction::Negative)
         };
         let r = run_breakaway(&mut rig, &spec, roomy(), &no_abort()).unwrap();
@@ -2634,6 +2666,7 @@ mod tests {
             rest_window_s: 0.0,
             rest_timeout_s: 0.2,
             motion_threshold_rad: 1e9, // gate on velocity only
+            motion_hold_s: 0.0,        // clean breakaway, and the ramp is short
             ..BreakawaySpec::slow(2.0, Direction::Positive)
         };
         let spec = BreakawayMapSpec {
@@ -2838,5 +2871,145 @@ mod tests {
         assert!(sweep.points.is_empty(), "nothing should have been measured");
         assert_eq!(sweep.mean_speed_rad_s(), None);
         assert!(sweep.friction_curve(10).is_empty());
+    }
+
+    /// Judder must not register as breakaway. A rig that crosses the velocity
+    /// threshold in brief spikes at low torque, then sticks again, previously
+    /// reported the torque of the first spike — three times below what a
+    /// constant-speed traverse of the same RS04 actually needed.
+    #[test]
+    fn breakaway_ignores_judder_and_waits_for_sustained_motion() {
+        /// Spikes above the threshold every other command until `sustain_above`,
+        /// then moves continuously.
+        struct Juddering {
+            n: u32,
+            sustain_above: f32,
+            cmd: f32,
+        }
+        impl Juddering {
+            fn fb(&self) -> MotorFeedback {
+                let sustained = self.cmd.abs() >= self.sustain_above;
+                // Judder: alternate between a threshold-clearing spike and rest.
+                let v = if sustained {
+                    1.0
+                } else if self.n % 2 == 0 {
+                    0.5
+                } else {
+                    0.0
+                };
+                MotorFeedback {
+                    position_rad: 0.0,
+                    velocity_rad_per_s: v,
+                    torque_nm: f32::NAN,
+                    current_a: f32::NAN,
+                    temperature_c: f32::NAN,
+                }
+            }
+        }
+        impl Actuator for Juddering {
+            fn motor_id(&self) -> u8 {
+                1
+            }
+            fn enable(&mut self) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn disable(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_zero(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_run_mode(&mut self, _m: RunMode) -> Result<()> {
+                Ok(())
+            }
+            fn set_position(&mut self, _p: f32, _v: f32) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn set_velocity(&mut self, _v: f32) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn set_torque(&mut self, t: f32) -> Result<MotorFeedback> {
+                self.n += 1;
+                self.cmd = t;
+                Ok(self.fb())
+            }
+            fn mit_control(
+                &mut self,
+                _p: f32,
+                _v: f32,
+                _kp: f32,
+                _kd: f32,
+                t: f32,
+            ) -> Result<MotorFeedback> {
+                self.set_torque(t)
+            }
+            fn measure(&mut self) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn read_status(&mut self) -> Result<misa_actuator::MotorStatus> {
+                Ok(misa_actuator::MotorStatus {
+                    voltage_v: 24.0,
+                    temperature_c: f32::NAN,
+                    error: Default::default(),
+                })
+            }
+        }
+
+        let sustain_above = 0.5;
+        let base = BreakawaySpec {
+            ramp_nm_per_s: 5.0,
+            rate_hz: 2000.0,
+            motion_threshold_rad_per_s: 0.2, // both the spike and the sustain clear it
+            motion_threshold_rad: 1e9,
+            rest_window_s: 0.0,
+            rest_timeout_s: 0.2,
+            ..BreakawaySpec::slow(2.0, Direction::Positive)
+        };
+
+        // Single-crossing: fires on the first judder spike, far too early.
+        let mut rig = Juddering {
+            n: 0,
+            sustain_above,
+            cmd: 0.0,
+        };
+        let lax = run_breakaway(
+            &mut rig,
+            &BreakawaySpec {
+                motion_hold_s: 0.0,
+                ..base
+            },
+            roomy(),
+            &no_abort(),
+        )
+        .unwrap();
+        let early = lax.breakaway_torque_nm.expect("should trigger");
+        assert!(
+            early < sustain_above,
+            "single-crossing should fire before {sustain_above}, got {early}"
+        );
+
+        // Requiring the motion to hold rejects the spikes and waits for real
+        // motion.
+        let mut rig = Juddering {
+            n: 0,
+            sustain_above,
+            cmd: 0.0,
+        };
+        let strict = run_breakaway(
+            &mut rig,
+            &BreakawaySpec {
+                motion_hold_s: 0.02,
+                ..base
+            },
+            roomy(),
+            &no_abort(),
+        )
+        .unwrap();
+        let real = strict.breakaway_torque_nm.expect("should still trigger");
+        assert!(
+            real >= sustain_above,
+            "with a hold it must wait for sustained motion (>= {sustain_above}), got {real}"
+        );
+        assert!(real > early, "the hold must raise the estimate");
     }
 }

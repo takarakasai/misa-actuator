@@ -66,6 +66,11 @@ pub enum CharacterizeCmd {
         /// creeps below the speed threshold.
         #[arg(long, default_value_t = 0.02)]
         motion_travel: f32,
+        /// How long motion must persist to count as breakaway (s). Rejects
+        /// judder, which otherwise trips the threshold far below the torque
+        /// needed to actually drive the shaft. 0 restores single-crossing.
+        #[arg(long, default_value_t = 0.1)]
+        motion_hold: f32,
         /// Push negative instead of positive.
         #[arg(long)]
         negative: bool,
@@ -104,6 +109,9 @@ pub enum CharacterizeCmd {
         /// Displacement that also counts as motion (rad).
         #[arg(long, default_value_t = 0.02)]
         motion_travel: f32,
+        /// How long motion must persist to count as breakaway (s).
+        #[arg(long, default_value_t = 0.1)]
+        motion_hold: f32,
         /// Speed cap while travelling between positions (rad/s).
         #[arg(long, default_value_t = 0.3)]
         travel_speed: f32,
@@ -281,6 +289,7 @@ pub fn run_characterize(
             ceiling,
             motion_speed,
             motion_travel,
+            motion_hold,
             negative,
             both,
         } => {
@@ -301,6 +310,7 @@ pub fn run_characterize(
                     max_torque_nm: *ceiling,
                     motion_threshold_rad_per_s: *motion_speed,
                     motion_threshold_rad: *motion_travel,
+                    motion_hold_s: *motion_hold,
                     direction: d,
                     ..BreakawaySpec::slow(*ceiling, d)
                 };
@@ -343,6 +353,7 @@ pub fn run_characterize(
             ceiling,
             motion_speed,
             motion_travel,
+            motion_hold,
             travel_speed,
             single_direction,
         } => {
@@ -351,6 +362,7 @@ pub fn run_characterize(
                 max_torque_nm: *ceiling,
                 motion_threshold_rad_per_s: *motion_speed,
                 motion_threshold_rad: *motion_travel,
+                motion_hold_s: *motion_hold,
                 ..BreakawaySpec::slow(*ceiling, Direction::Positive)
             };
             let spec = BreakawayMapSpec {

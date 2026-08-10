@@ -156,12 +156,23 @@ What it cannot do:
 Verified against an RS-04 on 2026-08-05: `scan` and `identify` return the same
 answers as the PEAK adapter does, extended ids and all.
 
-**If nothing is received or sent, check the three wires and the 120R jumper
-first** — an hour went into a loose connection whose symptom was silence in both
-directions, and which also made the *PEAK* adapter lose sight of the motor twice.
-The protocol has no acknowledgement, not even for its settings command, so a wiring
-fault, a wrong serial framing and a dead unit all look identical from this side.
-Diagnose with a PEAK adapter alongside: send on one, listen on the other.
+**If nothing comes back, test the adapter first:**
+
+```powershell
+robstride-cli.exe interfaces --selftest usbcan:COM1
+```
+
+That puts it in loopback, where a frame comes straight back and the bus is not
+involved. A pass means the adapter, the serial link, the settings command and the
+packet format are all fine, so the fault is on the CAN side — wiring, termination,
+bitrate, or no motor at the ids being probed. A fail means stop looking at the
+wiring and look at `?serial-baud=` / `?stop-bits=`.
+
+Worth having because **this protocol acknowledges nothing, not even its settings
+command**: a loose wire, the wrong serial framing, a dead unit and an empty id
+range all produce the same silence. Two evenings went into that — one on a loose
+connection that also made the *PEAK* adapter lose the motor twice, one on a motor
+sitting at id 96 while the scan looked at 1..32.
 
 **Serial framing: 2 Mbaud, 8 data bits, 2 stop bits** — the reference's values, and
 the ones that work. The vendor's note says 1,228,800 and one stop bit, which does

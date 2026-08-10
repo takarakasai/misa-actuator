@@ -124,6 +124,14 @@ pub struct InterfaceSpec {
     /// backend — see [`DEFAULT_SLCAN_SERIAL_BAUD`] and
     /// [`DEFAULT_USBCAN_SERIAL_BAUD`].
     pub serial_baud: u32,
+    /// USB-CAN Analyzer only: put the adapter in loopback, where it hands
+    /// transmitted frames straight back and **nothing reaches the bus**.
+    ///
+    /// For [`crate::loopback_selftest`], which is the only way to tell a live
+    /// adapter from a dead one where there is no second adapter to compare
+    /// against — this protocol acknowledges nothing, so silence otherwise has too
+    /// many explanations.
+    pub loopback: bool,
     /// Serial backends only: stop bits on the host↔adapter link.
     ///
     /// Two by default for the USB-CAN Analyzer, because the working reference
@@ -188,6 +196,7 @@ impl InterfaceSpec {
             Backend::UsbCan => 2,
             _ => 1,
         };
+        let mut loopback = false;
         if let Some(query) = query {
             for pair in query.split('&').filter(|p| !p.is_empty()) {
                 let (key, value) = pair
@@ -198,6 +207,18 @@ impl InterfaceSpec {
                         serial_baud = value.parse().map_err(|_| {
                             Error::bad_spec(raw, format!("bad serial baud {value:?}"))
                         })?;
+                    }
+                    "loopback" => {
+                        loopback = match value {
+                            "1" | "on" | "true" => true,
+                            "0" | "off" | "false" => false,
+                            other => {
+                                return Err(Error::bad_spec(
+                                    raw,
+                                    format!("loopback must be 1 or 0, not {other:?}"),
+                                ))
+                            }
+                        };
                     }
                     "stop-bits" | "stop_bits" => {
                         stop_bits = match value {
@@ -224,6 +245,7 @@ impl InterfaceSpec {
             bitrate,
             data_bitrate,
             serial_baud,
+            loopback,
             stop_bits,
             raw: raw.to_string(),
         })

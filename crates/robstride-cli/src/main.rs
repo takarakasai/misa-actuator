@@ -191,7 +191,17 @@ enum Command {
     ///
     /// Opens nothing and puts no frame on any wire. A typed `-i` still works for
     /// anything this misses.
-    Interfaces,
+    Interfaces {
+        /// Test one adapter instead of listing: put it in loopback, send a frame,
+        /// and check the same frame comes back.
+        ///
+        /// For the USB-CAN Analyzer, which acknowledges nothing — so silence
+        /// could be a loose wire, the wrong serial framing, a dead unit, or no
+        /// motor at the ids probed. Loopback does not use the bus, so a pass
+        /// narrows the fault to the CAN side and a fail rules the wiring out.
+        #[arg(long, value_name = "INTERFACE")]
+        selftest: Option<String>,
+    },
     /// Probe each motor id in the range and print responders.
     Scan {
         #[arg(long, default_value_t = 1)]
@@ -787,9 +797,10 @@ fn run(cli: Cli) -> Result<()> {
                 "\nNEXT: use  -m {new_id}  for all further commands on this motor."
             );
         }
-        Command::Interfaces => {
-            print!("{}", misa_can::format_list(&misa_can::list_interfaces()));
-        }
+        Command::Interfaces { selftest } => match selftest {
+            Some(spec) => println!("{}", misa_can::loopback_selftest(spec)?),
+            None => print!("{}", misa_can::format_list(&misa_can::list_interfaces())),
+        },
         Command::Scan { from, to, timeout } => {
             let timeout_per_id = Duration::from_millis(*timeout);
             let mut last_id: u8 = 0;

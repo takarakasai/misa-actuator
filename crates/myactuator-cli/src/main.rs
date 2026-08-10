@@ -96,7 +96,12 @@ enum Command {
     ///
     /// Opens nothing and puts no frame on any wire. A typed `-i` still works for
     /// anything this misses.
-    Interfaces,
+    Interfaces {
+        /// Test one adapter instead of listing: put it in loopback, send a frame,
+        /// and check the same frame comes back. See the usbcan backend docs.
+        #[arg(long, value_name = "INTERFACE")]
+        selftest: Option<String>,
+    },
     /// Probe a range of motor ids for responding motors (0x9A read — no motion).
     Scan {
         /// First id to probe.
@@ -366,9 +371,10 @@ fn main() -> Result<()> {
             )?;
             eprintln!("captured {n} frame(s)");
         }
-        Command::Interfaces => {
-            print!("{}", misa_can::format_list(&misa_can::list_interfaces()));
-        }
+        Command::Interfaces { selftest } => match selftest {
+            Some(spec) => println!("{}", misa_can::loopback_selftest(spec)?),
+            None => print!("{}", misa_can::format_list(&misa_can::list_interfaces())),
+        },
         Command::Scan { from, to } => {
             if to < from {
                 bail!("--to must be >= --from");

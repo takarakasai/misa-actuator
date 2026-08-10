@@ -137,7 +137,12 @@ enum Command {
     ///
     /// Opens nothing and puts no frame on any wire. A typed `-i` still works for
     /// anything this misses.
-    Interfaces,
+    Interfaces {
+        /// Test one adapter instead of listing: put it in loopback, send a frame,
+        /// and check the same frame comes back. See the usbcan backend docs.
+        #[arg(long, value_name = "INTERFACE")]
+        selftest: Option<String>,
+    },
     /// Probe a range of CAN_IDs for responding motors.
     Scan {
         /// First CAN_ID to probe.
@@ -480,8 +485,11 @@ fn main() -> Result<()> {
     // Before anything is opened: listing what is attached must not need one of
     // the things it is listing. Going through the normal path would fail on
     // `-i`'s default before printing a word.
-    if matches!(cli.command, Command::Interfaces) {
-        print!("{}", misa_can::format_list(&misa_can::list_interfaces()));
+    if let Command::Interfaces { selftest } = &cli.command {
+        match selftest {
+            Some(spec) => println!("{}", misa_can::loopback_selftest(spec)?),
+            None => print!("{}", misa_can::format_list(&misa_can::list_interfaces())),
+        }
         return Ok(());
     }
 
@@ -712,8 +720,10 @@ fn run<B: DamiaoBus>(motor: &mut DamiaoMotor<B>, cli: &Cli) -> Result<()> {
         // Handled in `main` before a motor is bound, because binding one
         // transmits and this command must not.
         Command::Dump { .. } => unreachable!("dump is dispatched before the motor is opened"),
-        Command::Interfaces => {
-            print!("{}", misa_can::format_list(&misa_can::list_interfaces()));
+        // Dispatched in `main`, for the same reason as `dump`: it must not need a
+        // motor to exist.
+        Command::Interfaces { .. } => {
+            unreachable!("interfaces is dispatched before the motor is opened")
         }
         Command::Scan { from, to } => {
             if to < from {

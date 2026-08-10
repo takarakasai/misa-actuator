@@ -124,7 +124,10 @@ const INFO_EXTENDED: u8 = 0x20;
 const INFO_REMOTE: u8 = 0x10;
 const INFO_DLC: u8 = 0x0F;
 
+/// The mode byte is two independent bits, so all four documented modes fall out
+/// of `loopback` and `listen_only` rather than needing an enum of their own.
 const MODE_NORMAL: u8 = 0x00;
+const MODE_LOOPBACK: u8 = 0x01;
 const MODE_SILENT: u8 = 0x02;
 
 /// Byte 4 of the settings command.
@@ -233,20 +236,32 @@ impl UsbCanBackend {
             warned_about_skips: false,
         };
 
-        let mode = if opts.listen_only {
-            MODE_SILENT
-        } else {
-            MODE_NORMAL
-        };
+        let mut mode = MODE_NORMAL;
+        if opts.listen_only {
+            mode |= MODE_SILENT;
+        }
+        if spec.loopback {
+            mode |= MODE_LOOPBACK;
+        }
         bus.send_settings(speed, mode)?;
 
+        if spec.loopback {
+            // Loud, because in this mode the wire is not involved at all: a motor
+            // that does not move would be the expected result, not a fault.
+            log::warn!(
+                "USB-CAN Analyzer {}: LOOPBACK — frames come straight back and \
+                 nothing reaches the bus",
+                bus.port_name
+            );
+        }
         log::info!(
-            "USB-CAN Analyzer {} up at {} bit/s ({} baud, {} stop bit(s){})",
+            "USB-CAN Analyzer {} up at {} bit/s ({} baud, {} stop bit(s){}{})",
             bus.port_name,
             bus.bitrate,
             bus.serial_baud,
             spec.stop_bits,
-            if opts.listen_only { ", silent" } else { "" }
+            if opts.listen_only { ", silent" } else { "" },
+            if spec.loopback { ", loopback" } else { "" }
         );
         Ok(bus)
     }
@@ -642,8 +657,16 @@ mod tests {
         assert_eq!(p[19], checksum(&p[2..=18]), "checksum over bytes 2..=18");
         assert_eq!(p.len(), 20);
 
-        // Silent mode is what makes listen-only possible on this adapter.
+        // Silent mode is what makes listen-only possible on this adapter, and
+        // loopback is what makes a self-test possible. The two are independent
+        // bits, so all four modes are reachable.
         assert_eq!(settings_packet(0x01, MODE_SILENT)[13], 0x02);
+        assert_eq!(settings_packet(0x01, MODE_LOOPBACK)[13], 0x01);
+        assert_eq!(
+            settings_packet(0x01, MODE_LOOPBACK | MODE_SILENT)[13],
+            0x03,
+            "loopback and silent together"
+        );
     }
 
     #[test]

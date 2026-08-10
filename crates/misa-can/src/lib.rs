@@ -289,6 +289,72 @@ pub fn open_spec(spec: &InterfaceSpec, opts: &OpenOptions) -> Result<Box<dyn Can
     }
 }
 
+/// **Is this adapter alive?** Send a frame in loopback and check it comes back.
+///
+/// The USB-CAN Analyzer acknowledges nothing — not even its settings command — so
+/// silence has too many explanations: a loose wire, the wrong serial framing, a
+/// wrong bitrate, a dead unit, or simply no motor at the id being probed. All of
+/// those cost an evening on 2026-08-05/06.
+///
+/// This separates the adapter from everything beyond it. In loopback the frame
+/// never reaches the bus, so a pass proves the serial link in both directions, the
+/// baud and stop bits, that the settings command was understood, and that the
+/// packet format is right — leaving only the CAN side to blame. A fail means stop
+/// looking at the wiring.
+///
+/// One process, because one serial port has one owner: send and read here rather
+/// than in two terminals.
+pub fn loopback_selftest(spec: &str) -> Result<String> {
+    let mut parsed = InterfaceSpec::parse(spec)?;
+    if parsed.backend != Backend::UsbCan {
+        return Err(Error::bad_spec(
+            spec,
+            format!(
+                "only the usbcan backend has a loopback mode; {} would have to be \
+                 tested against a second adapter",
+                parsed.backend.name()
+            ),
+        ));
+    }
+    parsed.loopback = true;
+
+    let mut bus = open_spec(&parsed, &OpenOptions::classic().with_timeout(DEFAULT_TIMEOUT))?;
+    // Deliberately awkward values: an id and payload that no motor family uses,
+    // so a genuine bus frame arriving mid-test cannot be mistaken for the echo.
+    let sent = Frame::new(StandardId::new(0x123).expect("0x123 is 11-bit"), &[0xDE, 0xAD, 0xBE])?;
+    bus.send(&sent)?;
+
+    let got = bus.recv().map_err(|e| match e {
+        Error::Timeout => Error::Config(format!(
+            "{spec}: nothing came back in loopback. The adapter is not \
+             understanding what it is being sent — check the serial framing \
+             (`?serial-baud=`, `?stop-bits=`) before suspecting the wiring, which \
+             loopback does not use."
+        )),
+        other => other,
+    })?;
+
+    if got.raw_id() != sent.raw_id() || got.data() != sent.data() {
+        return Err(Error::Config(format!(
+            "{spec}: loopback returned a different frame (sent id 0x{:X} {:02X?}, \
+             got id 0x{:X} {:02X?}) — the packet format is wrong, not the wiring",
+            sent.raw_id(),
+            sent.data(),
+            got.raw_id(),
+            got.data()
+        )));
+    }
+
+    Ok(format!(
+        "{spec}: loopback returned the frame unchanged (id 0x{:X}, {} byte(s)). \
+         The adapter, the serial link and the packet format are all good, so \
+         anything still wrong is on the CAN side: wiring, termination, bitrate, \
+         or no motor at the ids being probed.",
+        got.raw_id(),
+        got.len()
+    ))
+}
+
 /// The `--interface` default that makes sense on this platform. Linux keeps
 /// `can0`; Windows has no kernel CAN stack, so the first PEAK channel is the
 /// closest thing to a conventional default.

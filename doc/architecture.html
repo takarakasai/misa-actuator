@@ -9,7 +9,7 @@
 
   Source : doc/architecture.md
   Command: node scripts/md2html.js doc/architecture.md
-  Built  : 2026-08-02 15:27 UTC
+  Built  : 2026-08-04 07:57 UTC
 
   Every edit made here is destroyed the next time the command above runs.
   Change the markdown instead.
@@ -183,6 +183,8 @@ pre.mermaid svg { max-width: 100%; height: auto; }
 </tbody>
 </table></div>
 
+<p><strong>1 バスに複数モータのときも 2 本のまま。</strong> <code>MultiSession</code>（<code>multi_session.rs</code>）は <code>motors</code> / <code>motors-watchdog</code> の 2 本で <strong>N モータを順に回す</strong>。モータ毎スレッドには <strong>しない</strong> — ベンダーのバストレイトは send と recv が別呼び出しで、共有バスでは同時に 1 交換しか許されないため、<strong>1 台ずつ回すことが安全の根拠</strong>になっている。バスは <code>SharedCanBus</code>（<code>Arc&lt;Mutex&lt;Box&lt;dyn CanBus&gt;&gt;&gt;</code> 自身が <code>CanBus</code>）で共有するので、 4 ベンダーのアダプタは無改造で乗る。</p>
+
 <p><strong>なぜ watchdog を worker のループ内チェックにしないか。</strong> これは整理の問題ではなく、ループ内では<strong>成立しない</strong>。<code>misa-sysid</code> の測定ジョブは worker のループを数十秒占有するので、ループ内チェックは<strong>一番危険な時間帯にちょうど動かない</strong> （<a href="../crates/misa-actuator-core/src/worker.rs#L163-L170">worker.rs:163-170</a>）。別スレッドなら worker が何をしていようが検査が続く。</p>
 
 <p><strong>なぜ worker がバスを単独所有するか</strong>（<a href="../crates/misa-actuator-core/src/worker.rs#L1-L9">worker.rs:1-9</a>）:</p>
@@ -271,7 +273,7 @@ pre.mermaid svg { max-width: 100%; height: auto; }
 
     subgraph L2[&quot;セッション・測定層&quot;]
         direction LR
-        S1[&quot;misa-actuator-core&lt;br/&gt;Session / Worker&lt;br/&gt;Watchdog&quot;] ~~~ S2[&quot;factory&lt;br/&gt;DriverConfig を&lt;br/&gt;dyn Actuator に&quot;] ~~~ S3[&quot;protocol&lt;br/&gt;UI との&lt;br/&gt;配線契約&quot;] ~~~ S4[&quot;misa-sysid&lt;br/&gt;chirp / FRF&lt;br/&gt;SafetyLimits&quot;]
+        S1[&quot;Session / Worker&lt;br/&gt;Watchdog&lt;br/&gt;1 モータ&quot;] ~~~ S1B[&quot;MultiSession&lt;br/&gt;1 バス N モータ&lt;br/&gt;SharedCanBus&quot;] ~~~ S2[&quot;factory&lt;br/&gt;DriverConfig を&lt;br/&gt;dyn Actuator に&quot;] ~~~ S3[&quot;protocol&lt;br/&gt;UI との&lt;br/&gt;配線契約&quot;] ~~~ S4[&quot;misa-sysid&lt;br/&gt;chirp / FRF&lt;br/&gt;SafetyLimits&quot;]
     end
 
     subgraph L3[&quot;共通抽象  misa-actuator&quot;]
@@ -306,7 +308,7 @@ pre.mermaid svg { max-width: 100%; height: auto; }
 
     L1 ~~~ L2 ~~~ L3 ~~~ L4 ~~~ L5 ~~~ L6 ~~~ L7
 
-    class A1,A2,A3,S1,S2,S3,S4,T1,T2,T3,T4 unit
+    class A1,A2,A3,S1,S1B,S2,S3,S4,T1,T2,T3,T4 unit
     class D1,D2,D3,D4,D5,B1,B2,B3,B4,C1,K1,K2,K3,O1,O2,O3 unit
     class L1,L2,L3,L4,L5,L6,L6B,L7 tier</pre>
 
@@ -405,7 +407,9 @@ pre.mermaid svg { max-width: 100%; height: auto; }
 <p>正直に書いておく。設計上そうなっているだけで、直せないものではない。</p>
 
 <ul>
-<li><strong>GUI は同時に 1 モータ。</strong> <code>AppState</code> が <code>Mutex&lt;Option&lt;Session&gt;&gt;</code> を 1 つ持つだけ。タブ構成は増やせる形にしてあるが、2 セッション目には worker がもう 1 本と全コマンドへのセッション ID が要る（<a href="../crates/misa-actuator-gui/src/lib.rs#L43-L49">lib.rs:43-49</a>）</li>
+<li><strong>GUI は同時に 1 モータ</strong>（既存 5 タブ）。<code>AppState</code> が <code>Mutex&lt;Option&lt;Session&gt;&gt;</code> を 1 つ持つだけ（<a href="../crates/misa-actuator-gui/src/lib.rs#L43-L49">lib.rs:43-49</a>）。 <strong>core 側は既に N モータに対応している</strong>（<code>MultiSession</code>）が、<strong>GUI からは未接続</strong> — Tauri コマンドとタブが未実装</li>
+<li><strong><code>Session</code> と <code>MultiSession</code> は別実装で、worker / watchdog / 停止経路が二重にある。</strong> 既存 5 タブの配線契約を守るための意図的な判断だが、<strong>安全に関わる部分が 2 箇所にある</strong>のは重複の中でも最悪の種類。出口は <code>build_actuator</code> の「開く」と「束ねる」の分離と、worker の 1..N 対応で、単体を N=1 の薄いラッパにすること</li>
+<li><strong>1 バスに複数モータでも、同時に 1 交換しか流せない。</strong> 逐次に回すのが安全の根拠なので、レートは台数で割られる（4 台なら 1 台あたり約 1/4）</li>
 <li><strong>測定ジョブは worker のループを占有する。</strong> 数十秒間、通常の制御ティックは回らない。<code>job_active</code> フラグはそれを外から知るための手段</li>
 <li><strong><code>Shared&lt;T&gt;</code> の要求と応答は原子的ではない。</strong> 同一バスでモータごとにスレッドを立てることは可能だが推奨しない</li>
 <li><strong>停止は「ソフトウェアが指令を出すのをやめる」までを保証する。</strong> 無励磁のラッチではない（handover §2）</li>

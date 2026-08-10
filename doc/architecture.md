@@ -83,6 +83,13 @@ flowchart TB
 | `motor-N` (worker) | [session.rs:75](../crates/misa-actuator-core/src/session.rs#L75) | 既定 200 Hz（1〜2000 Hz） | **バスに触る唯一の場所**。`Box<dyn Actuator + Send>` を単独所有 |
 | `motor-N-watchdog` | [session.rs:85](../crates/misa-actuator-core/src/session.rs#L85) | 50 ms 固定 | 心拍が途絶えたら stop フラグを立てる |
 
+**1 バスに複数モータのときも 2 本のまま。** `MultiSession`（`multi_session.rs`）は
+`motors` / `motors-watchdog` の 2 本で **N モータを順に回す**。モータ毎スレッドには
+**しない** — ベンダーのバストレイトは send と recv が別呼び出しで、共有バスでは
+同時に 1 交換しか許されないため、**1 台ずつ回すことが安全の根拠**になっている。
+バスは `SharedCanBus`（`Arc<Mutex<Box<dyn CanBus>>>` 自身が `CanBus`）で共有するので、
+4 ベンダーのアダプタは無改造で乗る。
+
 **なぜ watchdog を worker のループ内チェックにしないか。** これは整理の問題ではなく、
 ループ内では**成立しない**。`misa-sysid` の測定ジョブは worker のループを数十秒
 占有するので、ループ内チェックは**一番危険な時間帯にちょうど動かない**
@@ -198,7 +205,7 @@ flowchart TB
 
     subgraph L2["セッション・測定層"]
         direction LR
-        S1["misa-actuator-core<br/>Session / Worker<br/>Watchdog"] ~~~ S2["factory<br/>DriverConfig を<br/>dyn Actuator に"] ~~~ S3["protocol<br/>UI との<br/>配線契約"] ~~~ S4["misa-sysid<br/>chirp / FRF<br/>SafetyLimits"]
+        S1["Session / Worker<br/>Watchdog<br/>1 モータ"] ~~~ S1B["MultiSession<br/>1 バス N モータ<br/>SharedCanBus"] ~~~ S2["factory<br/>DriverConfig を<br/>dyn Actuator に"] ~~~ S3["protocol<br/>UI との<br/>配線契約"] ~~~ S4["misa-sysid<br/>chirp / FRF<br/>SafetyLimits"]
     end
 
     subgraph L3["共通抽象  misa-actuator"]
@@ -233,7 +240,7 @@ flowchart TB
 
     L1 ~~~ L2 ~~~ L3 ~~~ L4 ~~~ L5 ~~~ L6 ~~~ L7
 
-    class A1,A2,A3,S1,S2,S3,S4,T1,T2,T3,T4 unit
+    class A1,A2,A3,S1,S1B,S2,S3,S4,T1,T2,T3,T4 unit
     class D1,D2,D3,D4,D5,B1,B2,B3,B4,C1,K1,K2,K3,O1,O2,O3 unit
     class L1,L2,L3,L4,L5,L6,L6B,L7 tier
 ```
@@ -346,9 +353,16 @@ sequenceDiagram
 
 正直に書いておく。設計上そうなっているだけで、直せないものではない。
 
-- **GUI は同時に 1 モータ。** `AppState` が `Mutex<Option<Session>>` を 1 つ持つだけ。
-  タブ構成は増やせる形にしてあるが、2 セッション目には worker がもう 1 本と
-  全コマンドへのセッション ID が要る（[lib.rs:43-49](../crates/misa-actuator-gui/src/lib.rs#L43-L49)）
+- **GUI は同時に 1 モータ**（既存 5 タブ）。`AppState` が `Mutex<Option<Session>>` を
+  1 つ持つだけ（[lib.rs:43-49](../crates/misa-actuator-gui/src/lib.rs#L43-L49)）。
+  **core 側は既に N モータに対応している**（`MultiSession`）が、**GUI からは未接続** —
+  Tauri コマンドとタブが未実装
+- **`Session` と `MultiSession` は別実装で、worker / watchdog / 停止経路が二重にある。**
+  既存 5 タブの配線契約を守るための意図的な判断だが、**安全に関わる部分が 2 箇所に
+  ある**のは重複の中でも最悪の種類。出口は `build_actuator` の「開く」と「束ねる」の
+  分離と、worker の 1..N 対応で、単体を N=1 の薄いラッパにすること
+- **1 バスに複数モータでも、同時に 1 交換しか流せない。** 逐次に回すのが安全の
+  根拠なので、レートは台数で割られる（4 台なら 1 台あたり約 1/4）
 - **測定ジョブは worker のループを占有する。** 数十秒間、通常の制御ティックは
   回らない。`job_active` フラグはそれを外から知るための手段
 - **`Shared<T>` の要求と応答は原子的ではない。** 同一バスでモータごとに

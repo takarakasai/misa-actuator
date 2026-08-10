@@ -1144,6 +1144,83 @@ mod tests {
         );
     }
 
+    /// The TypeScript side depends on these shapes, so a rename here fails a
+    /// test rather than a running app.
+    ///
+    /// Both rename attributes matter on the enums. `rename_all` covers variant
+    /// names, `rename_all_fields` covers the fields inside them, and omitting
+    /// the second sends `motorId` as `motor_id` — which arrives as `undefined`
+    /// rather than as a parse error. That has produced a black screen twice
+    /// (`doc/handover.md` section 5).
+    #[test]
+    fn the_wire_format_is_stable_enough_to_hand_to_a_ui() {
+        let json = serde_json::to_string(&MultiCommand::Enable { motor_id: 3 }).unwrap();
+        assert!(json.contains("\"kind\":\"enable\""), "{json}");
+        assert!(json.contains("\"motorId\":3"), "{json}");
+
+        let json = serde_json::to_string(&MultiCommand::EnableAll).unwrap();
+        assert!(json.contains("\"kind\":\"enable-all\""), "{json}");
+
+        let json = serde_json::to_string(&MultiCommand::SetStreaming { on: true }).unwrap();
+        assert!(json.contains("\"kind\":\"set-streaming\""), "{json}");
+        assert!(json.contains("\"on\":true"), "{json}");
+
+        let json = serde_json::to_string(&MultiEvent::MotorState {
+            motor_id: 7,
+            enabled: true,
+        })
+        .unwrap();
+        assert!(json.contains("\"event\":\"motor-state\""), "{json}");
+        assert!(json.contains("\"motorId\":7"), "{json}");
+
+        let json = serde_json::to_string(&MultiEvent::Stopped {
+            reason: StopReason::Watchdog,
+        })
+        .unwrap();
+        assert!(json.contains("\"event\":\"stopped\""), "{json}");
+        assert!(json.contains("\"reason\":\"watchdog\""), "{json}");
+
+        let snapshot = MultiSnapshot {
+            t_s: 1.5,
+            motors: vec![MotorReading {
+                motor_id: 16,
+                driver: crate::factory::DriverKind::Damiao,
+                label: "id 16".into(),
+                position_rad: 0.25,
+                velocity_rad_s: 0.0,
+                torque_nm: 0.1,
+                current_a: f32::NAN,
+                temperature_c: f32::NAN,
+                voltage_v: 24.0,
+                error_bits: 0,
+                error_raw: 0,
+                age_ms: Some(12),
+                enabled: true,
+                misses: 0,
+                error: None,
+            }],
+            achieved_rate_hz: 50.0,
+            dropped: 0,
+            starved_passes: 0,
+            drained_frames: 0,
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(json.contains("\"motorId\":16"), "{json}");
+        assert!(json.contains("\"driver\":\"damiao\""), "{json}");
+        assert!(json.contains("\"positionRad\":0.25"), "{json}");
+        assert!(json.contains("\"ageMs\":12"), "{json}");
+        assert!(json.contains("\"achievedRateHz\":50"), "{json}");
+        assert!(json.contains("\"starvedPasses\":0"), "{json}");
+        assert!(json.contains("\"drainedFrames\":0"), "{json}");
+        // A NaN has no JSON literal and serde writes `null`. The UI has to render
+        // that as "not reported" rather than as a number, so pin it: silently
+        // becoming 0 here would turn an absent temperature into a plausible one.
+        assert!(json.contains("\"temperatureC\":null"), "{json}");
+        assert!(json.contains("\"currentA\":null"), "{json}");
+        // Absent rather than null, so the frontend's optional check works.
+        assert!(!json.contains("\"error\":\"") && json.contains("\"error\":null"), "{json}");
+    }
+
     /// A simulated set has no wire, so nothing can be drained and nothing can
     /// be starved. Pins that both counters mean "this happened" rather than
     /// carrying a default that looks like a measurement.

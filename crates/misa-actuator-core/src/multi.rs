@@ -43,7 +43,9 @@ use anyhow::{bail, Context, Result};
 use misa_actuator::Actuator;
 use serde::{Deserialize, Serialize};
 
-use crate::factory::{BusKind, DriverKind, IdentityReport, MODEL_UNSPECIFIED};
+use crate::factory::{
+    BusKind, DriverKind, IdentityReport, DEFAULT_SIM_BUS_IDS, MODEL_UNSPECIFIED,
+};
 
 /// One [`misa_can::CanBus`] shared by several drivers.
 ///
@@ -380,12 +382,18 @@ pub fn probe_energises_motor(driver: DriverKind) -> bool {
     matches!(driver, DriverKind::Damiao)
 }
 
-/// Every CAN family, in probe order: the read-only ones first.
+/// Everything a scan can offer, in probe order: harmless first.
 ///
-/// Order matters for a mixed bus. Doing the harmless probes first means a scan
-/// that is interrupted, or that the operator stops after seeing enough, has
-/// energised nothing.
+/// Order matters on a mixed bus. Doing the probes that touch nothing first means
+/// a scan that is interrupted, or that the operator stops after seeing enough,
+/// has energised nothing.
+///
+/// The simulator is first because it opens no bus at all. It is here so the
+/// multi-motor UI has a way in without hardware — the alternative was a tab that
+/// could only be exercised by energising somebody's motors, which is a poor way
+/// to develop one.
 pub const SCANNABLE: &[DriverKind] = &[
+    DriverKind::Sim,
     DriverKind::Robstride,
     DriverKind::Myactuator,
     DriverKind::Damiao,
@@ -418,6 +426,28 @@ pub fn scan_for_motors(req: &ScanRequest) -> Result<Vec<ScanHit>> {
         bail!("no scannable families were selected (LK Motor is RS485, not CAN)");
     }
 
+    let mut hits = Vec::new();
+
+    // The simulator answers without a wire, so it is handled before anything is
+    // opened — and a simulator-only scan opens nothing at all.
+    if drivers.contains(&DriverKind::Sim) {
+        for &id in DEFAULT_SIM_BUS_IDS.iter().filter(|&&id| (req.from..=req.to).contains(&id)) {
+            hits.push(ScanHit {
+                driver: DriverKind::Sim,
+                motor_id: id,
+                model: Some("ideal".into()),
+                evidence: Some("simulated; no bus was opened".into()),
+            });
+        }
+    }
+    let can: Vec<DriverKind> = drivers
+        .into_iter()
+        .filter(|&d| d != DriverKind::Sim)
+        .collect();
+    if can.is_empty() {
+        return Ok(hits);
+    }
+
     let opts = match req.bus {
         BusKind::Can => misa_can::OpenOptions::classic(),
         BusKind::CanFd => misa_can::OpenOptions::fd(),
@@ -429,8 +459,7 @@ pub fn scan_for_motors(req: &ScanRequest) -> Result<Vec<ScanHit>> {
     let timeout = Duration::from_millis(req.timeout_ms);
     let range = req.from..=req.to;
 
-    let mut hits = Vec::new();
-    for driver in drivers {
+    for driver in can {
         match driver {
             DriverKind::Robstride => {
                 let mut adapter = robstride_driver::CanBus::new(shared.clone());
@@ -951,13 +980,55 @@ mod tests {
         assert!(probe_energises_motor(DriverKind::Damiao));
     }
 
-    /// LK Motor is RS485 and the simulator has no wire, so neither is scannable
-    /// here. Worth pinning: silently including them would produce a scan that
-    /// cannot work.
+    /// LK Motor speaks RS485 and cannot be found on a CAN wire, so offering it
+    /// would produce a scan that cannot work.
     #[test]
-    fn only_can_families_are_scannable() {
+    fn lkmotor_is_not_scannable() {
         assert!(!SCANNABLE.contains(&DriverKind::Lkmotor));
-        assert!(!SCANNABLE.contains(&DriverKind::Sim));
+    }
+
+    /// A simulator-only scan opens nothing, which is what makes the multi-motor
+    /// UI developable without hardware — and without energising anybody's motor
+    /// to see a table.
+    #[test]
+    fn a_simulated_scan_needs_no_interface() {
+        let req = ScanRequest {
+            interface: String::new(),
+            bus: BusKind::Can,
+            drivers: vec![DriverKind::Sim],
+            from: 1,
+            to: 32,
+            timeout_ms: 10,
+        };
+        let hits = scan_for_motors(&req).expect("a simulated scan cannot fail on a missing bus");
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|h| h.driver == DriverKind::Sim));
+        // Every simulated hit is usable as-is: a preset is named, so the model
+        // box is not left for the operator to guess at.
+        assert!(hits.iter().all(|h| h.model.is_some()));
+    }
+
+    /// The range still applies to simulated ids, or the from/to boxes would
+    /// silently mean nothing for the one driver you can try without hardware.
+    #[test]
+    fn a_simulated_scan_respects_the_range() {
+        let req = ScanRequest {
+            interface: String::new(),
+            bus: BusKind::Can,
+            drivers: vec![DriverKind::Sim],
+            from: 1,
+            to: 2,
+            timeout_ms: 10,
+        };
+        let hits = scan_for_motors(&req).unwrap();
+        assert!(hits.iter().all(|h| h.motor_id <= 2), "{hits:?}");
+    }
+
+    /// The simulator must not be listed as energising: it has no motor to
+    /// energise, and a spurious warning trains people to ignore the real one.
+    #[test]
+    fn the_simulator_does_not_warn_about_energising() {
+        assert!(!probe_energises_motor(DriverKind::Sim));
     }
 
     /// Selecting nothing scannable is refused rather than returning an empty

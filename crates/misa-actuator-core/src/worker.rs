@@ -42,6 +42,15 @@ fn excitation_of(job: &ChirpJob) -> misa_sysid::Excitation {
     }
 }
 
+/// How much of the safety envelope's position window a Kt run's leash may use
+/// up when it is holding the largest torque level in the sweep.
+///
+/// Well under 1.0, because the deflection this bounds is the *steady-state* one:
+/// the shaft overshoots on the way there, the window is measured from wherever
+/// the run began, and a run that just fits at equilibrium is a run that trips on
+/// the way to it.
+const KT_LEASH_DEFLECTION: f32 = 0.4;
+
 /// State shared between the session handle, the watchdog and the worker.
 ///
 /// The stop flag, watchdog, heartbeat and rate clamp are in
@@ -660,9 +669,9 @@ impl Worker {
         // short still hands over what it measured — which makes this the only
         // place the reason is visible.
         let mut fitted_kt: Option<f32> = None;
-        let mut hit_torque_limit = false;
+        let mut abort_reason: Option<misa_sysid::AbortReason> = None;
         let mut note_abort = |abort: Option<misa_sysid::AbortReason>| {
-            hit_torque_limit = abort == Some(misa_sysid::AbortReason::TorqueLimit);
+            abort_reason = abort;
         };
 
         let outcome = match run {
@@ -743,6 +752,30 @@ impl Worker {
                 leash_kp,
                 leash_kd,
             } => {
+                // A leash too soft for the amplitude deflects straight out of
+                // the position window, and the run dies at its first level with
+                // a single point — which `kt_nm_per_a` then reports as "torque
+                // and current did not vary enough to fit a slope", describing
+                // the symptom and not the cause. Measured on an RS-04 on
+                // 2026-08-06: 7.2 N·m against kp 8 settles at 0.9 rad, and the
+                // window is ±0.5.
+                //
+                // The rule lives here rather than in the caller because it is
+                // the window that decides it, and the window is this crate's.
+                // kp 0 is left alone: it means "the shaft is already
+                // restrained", which is a claim about the rig, not an omission.
+                let asked_kp = leash_kp;
+                let (leash_kp, leash_kd) =
+                    kt_leash(max_torque_nm, leash_kp, leash_kd, limits.position_window_rad);
+                if leash_kp > asked_kp {
+                    self.log(
+                        LogLevel::Warn,
+                        format!(
+                            "kt: leash stiffened from kp {asked_kp:.1} to {leash_kp:.1} so {max_torque_nm:.2} N·m stays inside the ±{:.2} rad window",
+                            limits.position_window_rad
+                        ),
+                    );
+                }
                 let spec = misa_sysid::KtSpec {
                     max_torque_nm,
                     steps: (steps as usize).max(2),
@@ -772,10 +805,24 @@ impl Worker {
         self.actuator.set_torque_constant(0.0);
         self.actuator.set_report_current(false);
 
+        // Which limit stopped the run, named. Without this the operator sees
+        // only the consequence — "torque and current did not vary enough to fit
+        // a slope" is what a Kt run reports after the position window cut it off
+        // at the first level, and that describes the symptom while saying
+        // nothing about the cause (2026-08-06, an RS-04 whose leash deflected
+        // 0.9 rad against a ±0.5 rad window).
+        if let Some(r) = abort_reason {
+            self.log(
+                LogLevel::Warn,
+                format!("{}: the safety envelope stopped it — {}", run.name(), r.describe()),
+            );
+        }
+
         // Only worth suggesting when the ceiling is what stopped the run.
         // Doubling it is a starting point, not a finding — see the field's
         // docs for why the samples cannot say more than this.
-        let suggested_torque_limit_nm = hit_torque_limit.then(|| (ceiling_nm * 2.0).max(0.5));
+        let suggested_torque_limit_nm = (abort_reason == Some(misa_sysid::AbortReason::TorqueLimit))
+            .then(|| (ceiling_nm * 2.0).max(0.5));
         if let Some(t) = suggested_torque_limit_nm {
             self.log(
                 LogLevel::Warn,
@@ -1214,6 +1261,31 @@ fn breakaway_data(b: misa_sysid::Breakaway) -> (CharacterizeData, String) {
     )
 }
 
+/// Leash gains for a Kt sweep of `max_torque_nm`, stiffened if the requested
+/// ones would push the shaft out of the safety envelope's position window.
+///
+/// Returns `(kp, kd)`. `kp` is only ever raised, never lowered — a caller
+/// asking for a stiffer hold than the window needs is entitled to it.
+///
+/// `kp == 0.0` passes through untouched: it means "the shaft is already
+/// restrained, do not hold it", which is a claim about the rig rather than an
+/// omission to correct.
+fn kt_leash(max_torque_nm: f32, kp: f32, kd: f32, position_window_rad: f32) -> (f32, f32) {
+    let allowance = position_window_rad * KT_LEASH_DEFLECTION;
+    if kp <= 0.0 || !allowance.is_finite() || allowance <= 0.0 {
+        return (kp, kd);
+    }
+    let needed = max_torque_nm.abs() / allowance;
+    if needed <= kp {
+        return (kp, kd);
+    }
+    // Damping raised in proportion to stiffness rather than to its square root:
+    // the critical value needs an inertia nobody here knows, and erring
+    // over-damped only costs settling time, while erring under puts an
+    // oscillation inside the dwell the fit assumes is steady.
+    (needed, kd * needed / kp)
+}
+
 /// Torque against current, plus the fitted constant for the UI to apply.
 ///
 /// Returns the Kt separately from the summary rather than only as a display
@@ -1288,5 +1360,53 @@ fn peak_to_peak(values: impl Iterator<Item = f32>) -> f32 {
         0.0
     } else {
         hi - lo
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The failure this rule exists for, as it happened: an RS-04 with the
+    /// ceiling at 12 N·m, a sweep asking for 60% of it, and the stock leash.
+    #[test]
+    fn a_kt_sweep_too_big_for_its_leash_is_held_inside_the_position_window() {
+        let window = 0.5;
+
+        // What shipped: kp 8 against 7.2 N·m settles at 0.9 rad, well outside a
+        // ±0.5 rad window, so the run died at its first level with one point.
+        assert!(7.2 / 8.0 > window, "the case under test must actually escape");
+
+        let (kp, kd) = kt_leash(7.2, 8.0, 0.5, window);
+        assert!(
+            7.2 / kp <= window * KT_LEASH_DEFLECTION + f32::EPSILON,
+            "deflection {} rad should fit the allowance",
+            7.2 / kp
+        );
+        assert!(kd > 0.5, "damping should rise with stiffness, got {kd}");
+    }
+
+    #[test]
+    fn a_leash_already_stiff_enough_is_left_alone() {
+        // 1.2 N·m against kp 8 deflects 0.15 rad — inside 0.4 × 0.5 = 0.2.
+        assert_eq!(kt_leash(1.2, 8.0, 0.5, 0.5), (8.0, 0.5));
+        // And a caller who wants it stiffer than necessary keeps that.
+        assert_eq!(kt_leash(1.2, 500.0, 5.0, 0.5), (500.0, 5.0));
+    }
+
+    /// `kp == 0` is the caller saying the shaft is restrained already. Raising
+    /// it would energise a leash against a clamped joint.
+    #[test]
+    fn no_leash_stays_no_leash() {
+        assert_eq!(kt_leash(7.2, 0.0, 0.0, 0.5), (0.0, 0.0));
+    }
+
+    /// A window of zero or a non-finite one would otherwise divide into an
+    /// infinite kp and command a MIT frame full of garbage.
+    #[test]
+    fn a_degenerate_window_cannot_produce_an_infinite_gain() {
+        assert_eq!(kt_leash(7.2, 8.0, 0.5, 0.0), (8.0, 0.5));
+        assert_eq!(kt_leash(7.2, 8.0, 0.5, f32::NAN), (8.0, 0.5));
+        assert!(kt_leash(7.2, 8.0, 0.5, f32::INFINITY).0.is_finite());
     }
 }

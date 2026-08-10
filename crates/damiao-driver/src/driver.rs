@@ -315,6 +315,15 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
         &mut self.bus
     }
 
+    /// Frames the transport reported as lost before this process read them.
+    ///
+    /// Read this after a run that saw timeouts: a non-zero count means at
+    /// least some of those replies existed and were dropped here, not that
+    /// the motor stayed silent. `0` on transports that cannot report it.
+    pub fn rx_overruns(&self) -> u64 {
+        self.bus.rx_overruns()
+    }
+
     /// Set the per-request timeout.
     pub fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
         self.bus.set_timeout(timeout)?;

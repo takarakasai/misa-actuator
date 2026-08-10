@@ -45,6 +45,21 @@ pub trait DamiaoBus {
 
     /// Set the per-receive timeout.
     fn set_timeout(&mut self, timeout: Duration) -> Result<()>;
+
+    /// How many times the transport reported frames lost before this process
+    /// could read them.
+    ///
+    /// `0` where the transport cannot tell, which is every backend except
+    /// PCAN — so **`0` means "none reported", not "none happened"**. See
+    /// [`misa_can::CanBus::rx_overruns`].
+    ///
+    /// Carried up to here so a diagnostic run can separate "the motor did not
+    /// answer" from "the answer was dropped on this side of the wire". Those
+    /// look identical from a timeout, and telling them apart is the open
+    /// question in the CAN-FD investigation (`doc/handover.md` §4).
+    fn rx_overruns(&self) -> u64 {
+        0
+    }
 }
 
 /// Share one DAMIAO bus across several [`crate::DamiaoMotor`] handles on the
@@ -65,6 +80,10 @@ impl<B: DamiaoBus> DamiaoBus for Shared<B> {
 
     fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
         self.lock().set_timeout(timeout)
+    }
+
+    fn rx_overruns(&self) -> u64 {
+        self.lock().rx_overruns()
     }
 }
 
@@ -189,6 +208,10 @@ impl<T: misa_can::CanBus> DamiaoBus for CanBus<T> {
 
     fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
         self.inner.set_timeout(timeout).map_err(map_err)
+    }
+
+    fn rx_overruns(&self) -> u64 {
+        self.inner.rx_overruns()
     }
 }
 

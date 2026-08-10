@@ -270,10 +270,12 @@ enum Command {
     },
     /// Write a register (RID). Float by default; pass --int for an integer.
     ///
-    /// The value is written as given — nothing range-checks it. Registers that
-    /// can make the motor unreachable (ids, bitrate, timeout), silently
-    /// mis-scale every command (PMAX/VMAX/TMAX), weaken a protection threshold,
-    /// or overwrite a read-only calibration value print a warning first.
+    /// The value is written as given. Nothing here refuses a write, but two
+    /// warnings come first: one when the register can make the motor
+    /// unreachable (ids, bitrate, timeout), silently mis-scale every command
+    /// (PMAX/VMAX/TMAX), weaken a protection threshold or overwrite a
+    /// read-only calibration value; and one when the value falls outside the
+    /// range the manual documents for it.
     RegWrite {
         rid: u8,
         #[arg(allow_hyphen_values = true)]
@@ -431,18 +433,41 @@ fn main() -> Result<()> {
              fine and the motor is not configured for CAN-FD."
         );
         configure(&mut motor, &cli, timeout)?;
-        run(&mut motor, &cli)
+        run_and_report(&mut motor, &cli)
     } else if cli.fd {
         let mut motor = DamiaoMotor::open_fd(&cli.interface, cli.motor_id, model)
             .with_context(|| format!("failed to open CAN-FD interface {}", cli.interface))?;
         configure(&mut motor, &cli, timeout)?;
-        run(&mut motor, &cli)
+        run_and_report(&mut motor, &cli)
     } else {
         let mut motor = DamiaoMotor::open(&cli.interface, cli.motor_id, model)
             .with_context(|| format!("failed to open CAN interface {}", cli.interface))?;
         configure(&mut motor, &cli, timeout)?;
-        run(&mut motor, &cli)
+        run_and_report(&mut motor, &cli)
     }
+}
+
+/// Run the command, then say whether the transport lost anything on the way.
+///
+/// Reported after every subcommand rather than on request, because at the
+/// moment it matters nobody knows to ask: a reply dropped in the host receive
+/// queue and a motor that never answered produce the same timeout, and the
+/// difference decides whether the bus is even a suspect. `0` is silent, so
+/// ordinary use stays quiet — see `doc/handover.md` §9 for how to read that
+/// during the CAN-FD re-measurement.
+fn run_and_report<B: DamiaoBus>(motor: &mut DamiaoMotor<B>, cli: &Cli) -> Result<()> {
+    let result = run(motor, cli);
+
+    let lost = motor.rx_overruns();
+    if lost > 0 {
+        eprintln!(
+            "\nnote: the transport reported {lost} receive overrun(s) during this run. \
+             That many reads found frames already dropped on this side of the wire, so \
+             any timeout above may be a lost reply rather than a silent motor."
+        );
+    }
+
+    result
 }
 
 fn configure<B: DamiaoBus>(
@@ -524,6 +549,13 @@ fn run<B: DamiaoBus>(motor: &mut DamiaoMotor<B>, cli: &Cli) -> Result<()> {
         }
         Command::Zero { nvm } => {
             if *nvm {
+                // The soft path below is free and reversible; this one is
+                // neither, and the flag that picks it is one character.
+                eprintln!(
+                    "warning: --nvm writes the zero to flash. It survives a power cycle, \
+                     it replaces the previous zero with no way back to it from here, and \
+                     flash wears out. Without --nvm the zero is in memory only."
+                );
                 motor.set_zero_nvm()?;
                 println!("zero written to motor NVM (flash).");
             } else {
@@ -727,6 +759,18 @@ fn run<B: DamiaoBus>(motor: &mut DamiaoMotor<B>, cli: &Cli) -> Result<()> {
             // that says what the RID means.
             if let Some(hazard) = register_risk(*rid).hazard() {
                 eprintln!("warning: RID {rid} {hazard}");
+            }
+            // Warn rather than refuse, for the same reason as the hazard above
+            // and one more: the manuals and the firmware are known to disagree
+            // (handover §8), so a range from the manual is evidence, not
+            // authority. Refusing on it would block writes the motor accepts.
+            if let Some(range) = Rid::documented_range(*rid) {
+                if !range.contains(*value) {
+                    eprintln!(
+                        "warning: {value} is outside the range the manual documents for \
+                         RID {rid} ({range}). Check the value before letting it reach flash."
+                    );
+                }
             }
             if *save {
                 eprintln!(

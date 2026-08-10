@@ -134,11 +134,15 @@ std::mem::forget(motor);
 
 | コマンド | 危険 |
 |---|---|
-| `damiao-cli reg-write RID VALUE --save` | **値の検証は無い**。`PMAX`/`VMAX`/`TMAX`（MIT スケール）、保護閾値、`CAN_BR` まで書けて flash に即確定。2026-08-02 以降、危険レジスタは書き込み前に警告を出す（下記） |
+| `damiao-cli reg-write RID VALUE --save` | 何も**拒否はしない**が、2026-08-02 以降**書き込み前に 2 種類の警告**を出す（危険レジスタか / マニュアルの範囲外か、下記）。`PMAX`/`VMAX`/`TMAX`（MIT スケール）、保護閾値、`CAN_BR` まで書けて flash に即確定する事実は変わらない |
 | `robstride-cli set-id` | ID 変更。**過去に RS-04 が 1 日応答しなくなった実例あり** |
 | `robstride-cli set-zero` | **永続性が不明**。DAMIAO の `--nvm`、MyActuator の `--rom` に相当するフラグも説明も無い。誰も確かめていない |
-| `damiao-cli zero --nvm` / `myactuator-cli zero --rom` | flash 書き込み。摩耗する |
-| `damiao-cli factory-reset` | 校正値ごと消える |
+| `damiao-cli zero --nvm` / `myactuator-cli zero --rom` | flash 書き込み。摩耗する。DAMIAO 側は 2026-08-02 以降警告を出す |
+
+**旧版にあった `damiao-cli factory-reset` の行は削除した。そのコマンドは存在しない。**
+2026-08-02 にワークスペース全体を grep して確認（`factory_reset` / `factory-reset` /
+`FACTORY` とも 0 件）。**危険物リストに実在しない項目が載っていると、実在する項目の
+信頼性まで下がる。**
 
 `lkmotor-cli` には**正しいパターンが既にある** — `is_risky()` で危険パラメータを
 判定し、上記 RS-04 の事故を引用して警告する。**2026-08-02 に `damiao-cli reg-write`

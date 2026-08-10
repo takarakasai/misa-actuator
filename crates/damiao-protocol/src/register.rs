@@ -178,6 +178,149 @@ impl Rid {
     pub const fn is_int(rid: u8) -> bool {
         matches!(rid, 7..=10 | 13..=16 | 35..=37)
     }
+
+    /// The range the manuals state for `rid`, where they state a number.
+    ///
+    /// Transcribed from the same DM-J4310-2EC / DM-J3507-2EC register-map rows
+    /// as the constants above. Three things this cannot do, all of which the
+    /// caller has to keep in mind:
+    ///
+    /// - **`fmax` is not a number.** Several rows bound the top at a symbolic
+    ///   firmware ceiling, so [`RegisterRange::max`] is `None` there. That
+    ///   means "the manual states no figure", not "anything is accepted".
+    /// - **`OV_VALUE` is documented as literally "TBD"**, so it has no range
+    ///   here at all.
+    /// - **The manual is not the firmware.** Elsewhere in this workspace the
+    ///   two disagree on 32 of 84 rows (`doc/handover.md` §8). A value inside
+    ///   this range is not thereby safe, and one outside it is not certainly
+    ///   rejected by the motor.
+    ///
+    /// Returns `None` for registers with no documented numeric range,
+    /// including every read-only one.
+    pub fn documented_range(rid: u8) -> Option<RegisterRange> {
+        use RegisterRange as R;
+        Some(match rid {
+            Self::UV_VALUE => R::above(10.0),
+            Self::KT_VALUE => R::at_least(0.0),
+            Self::OT_VALUE => R::at_least(80.0).below(200.0),
+            Self::OC_VALUE => R::above(0.0).below(1.0),
+            Self::ACC => R::above(0.0),
+            // The manual's range really is negative here, unlike ACC. Getting
+            // the sign wrong is the easy mistake this whole function exists to
+            // catch.
+            // `[-fmax, 0.0)`: the bottom is the symbolic ceiling again, so
+            // only the sign is checkable.
+            Self::DEC => R::OPEN.below(0.0),
+            Self::MAX_SPD => R::above(0.0),
+            Self::MST_ID | Self::ESC_ID => R::at_least(0.0).at_most(0x7FF as f32),
+            Self::TIMEOUT => R::at_least(0.0),
+            Self::CTRL_MODE => R::at_least(0.0).at_most(4.0),
+            Self::PMAX | Self::VMAX | Self::TMAX => R::above(0.0),
+            Self::I_BW | Self::IQ_C1 => R::at_least(100.0).at_most(1.0e4),
+            Self::KP_ASR | Self::KI_ASR | Self::KP_APR | Self::KI_APR => R::at_least(0.0),
+            Self::GREF => R::above(0.0).at_most(1.0),
+            Self::DETA => R::at_least(1.0).at_most(30.0),
+            Self::V_BW => R::above(0.0).below(500.0),
+            Self::VL_C1 => R::above(0.0).at_most(1.0e4),
+            Self::CAN_BR => R::at_least(0.0).at_most(9.0),
+            _ => return None,
+        })
+    }
+}
+
+/// A bound transcribed from a DAMIAO register-map row.
+///
+/// `None` on either end means the manual gives no figure there — most often
+/// because the row bounds it with the symbolic `fmax`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RegisterRange {
+    pub min: Option<f32>,
+    pub min_inclusive: bool,
+    pub max: Option<f32>,
+    pub max_inclusive: bool,
+}
+
+impl RegisterRange {
+    const OPEN: Self = Self {
+        min: None,
+        min_inclusive: false,
+        max: None,
+        max_inclusive: false,
+    };
+
+    /// `[min, ...`
+    pub const fn at_least(min: f32) -> Self {
+        Self {
+            min: Some(min),
+            min_inclusive: true,
+            ..Self::OPEN
+        }
+    }
+
+    /// `(min, ...`
+    pub const fn above(min: f32) -> Self {
+        Self {
+            min: Some(min),
+            min_inclusive: false,
+            ..Self::OPEN
+        }
+    }
+
+    /// `..., max]`
+    pub const fn at_most(self, max: f32) -> Self {
+        Self {
+            max: Some(max),
+            max_inclusive: true,
+            ..self
+        }
+    }
+
+    /// `..., max)`
+    pub const fn below(self, max: f32) -> Self {
+        Self {
+            max: Some(max),
+            max_inclusive: false,
+            ..self
+        }
+    }
+
+    /// Whether `v` falls inside what the manual documents.
+    ///
+    /// A non-finite value is never inside: NaN compares false against every
+    /// bound, and letting it through silently is how a garbage write reaches
+    /// flash looking like a checked one.
+    pub fn contains(&self, v: f32) -> bool {
+        if !v.is_finite() {
+            return false;
+        }
+        let low_ok = match (self.min, self.min_inclusive) {
+            (Some(m), true) => v >= m,
+            (Some(m), false) => v > m,
+            (None, _) => true,
+        };
+        let high_ok = match (self.max, self.max_inclusive) {
+            (Some(m), true) => v <= m,
+            (Some(m), false) => v < m,
+            (None, _) => true,
+        };
+        low_ok && high_ok
+    }
+}
+
+impl core::fmt::Display for RegisterRange {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.min {
+            Some(m) => write!(f, "{}{m}", if self.min_inclusive { '[' } else { '(' })?,
+            None => write!(f, "(unbounded")?,
+        }
+        write!(f, ", ")?;
+        match self.max {
+            Some(m) => write!(f, "{m}{}", if self.max_inclusive { ']' } else { ')' }),
+            // Not "infinity": the manual says fmax, a firmware ceiling nobody
+            // here has a number for.
+            None => write!(f, "fmax)"),
+        }
+    }
 }
 
 /// A register above the common `0x00`–`0x25` block, addressed **by meaning
@@ -522,6 +665,74 @@ pub fn parse_reg_reply(data: &[u8]) -> Option<RegReply> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sign trap: DEC's documented range is negative where ACC's is
+    /// positive, and the two sit next to each other in the register map.
+    #[test]
+    fn deceleration_is_documented_negative() {
+        let dec = Rid::documented_range(Rid::DEC).unwrap();
+        assert!(dec.contains(-1.0));
+        assert!(!dec.contains(1.0), "a positive DEC is outside the manual");
+        assert!(!dec.contains(0.0), "the bound is exclusive");
+
+        let acc = Rid::documented_range(Rid::ACC).unwrap();
+        assert!(acc.contains(1.0));
+        assert!(!acc.contains(-1.0));
+    }
+
+    #[test]
+    fn bounded_registers_reject_values_outside_the_manual() {
+        let ot = Rid::documented_range(Rid::OT_VALUE).unwrap();
+        assert!(ot.contains(80.0), "the lower bound is inclusive");
+        assert!(ot.contains(199.9));
+        assert!(!ot.contains(79.9));
+        assert!(!ot.contains(200.0), "the upper bound is exclusive");
+
+        let br = Rid::documented_range(Rid::CAN_BR).unwrap();
+        assert!(br.contains(0.0) && br.contains(9.0));
+        assert!(!br.contains(10.0));
+
+        let mode = Rid::documented_range(Rid::CTRL_MODE).unwrap();
+        assert!(mode.contains(4.0));
+        assert!(!mode.contains(5.0));
+
+        let gref = Rid::documented_range(Rid::GREF).unwrap();
+        assert!(!gref.contains(0.0), "efficiency of zero is excluded");
+        assert!(gref.contains(1.0), "unity efficiency is allowed");
+        assert!(!gref.contains(1.1));
+    }
+
+    /// An `fmax` upper bound is unknown, not infinite, but the lower bound is
+    /// still worth enforcing.
+    #[test]
+    fn an_fmax_bound_still_checks_the_bottom() {
+        let pmax = Rid::documented_range(Rid::PMAX).unwrap();
+        assert!(!pmax.contains(0.0), "the manual excludes zero");
+        assert!(!pmax.contains(-1.0));
+        assert!(pmax.contains(1.0e9), "no documented ceiling to check against");
+        assert_eq!(pmax.max, None);
+    }
+
+    /// Non-finite values must never read as in range: a NaN written to a
+    /// scaling register would be indistinguishable from a checked value.
+    #[test]
+    fn non_finite_values_are_never_in_range() {
+        for rid in [Rid::PMAX, Rid::OT_VALUE, Rid::KT_VALUE, Rid::DEC] {
+            let r = Rid::documented_range(rid).unwrap();
+            assert!(!r.contains(f32::NAN), "RID {rid}");
+            assert!(!r.contains(f32::INFINITY), "RID {rid}");
+            assert!(!r.contains(f32::NEG_INFINITY), "RID {rid}");
+        }
+    }
+
+    /// Read-only and undocumented rows must report no range rather than a
+    /// made-up one -- OV_VALUE's row literally reads "TBD".
+    #[test]
+    fn undocumented_rows_have_no_range() {
+        for rid in [Rid::OV_VALUE, Rid::GR, Rid::SW_VER, Rid::DAMP, Rid::SN] {
+            assert!(Rid::documented_range(rid).is_none(), "RID {rid}");
+        }
+    }
 
     #[test]
     fn read_frame_layout() {

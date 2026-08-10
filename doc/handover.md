@@ -1212,8 +1212,8 @@ RobStride の param table と MyActuator の `0xC0`。ここにしかない値�
 | LK Motor の実機接続 | RS485 アダプタが `/dev/ttyUSB*` に出るところから |
 | ~~SLCAN 実機検証~~ | **2026-08-06 完了**。WeAct Studio USB2CAN で RS-03 を `scan` / `identify`。§1 |
 | ~~GUI Characterize タブの実機確認~~ | **2026-08-06〜07 完了**（RS-03、RS-04 ×2）。Kt はタブの *Measure Kt* で測れるので手入力は不要になった。読み方は [`friction.md`](friction.md) |
-| `RESTED FIRST: no` の切り分け | RS-04 id 3 のみ。同じバスの id 2 は `yes`。**機械側の振動が疑わしい**が未確認。この状態の破断トルクは信用しない |
-| Kt の pointwise と fit の食い違い | RS-03 で 2.2359 対 1.4746。切片がある証拠。**レベル数を増やして形を見る**のが次の手（GUI に `Kt levels` / `Kt settle` あり） |
+| **`rested` の判定を位置由来にする** | 2026-08-07、RS-04 2 台がどちらも `5 of 5 not at rest`。**「id 3 の機械的振動」という以前の推測は棄却**。判定は `\|velocity\| ≤ 0.05 rad/s` の継続で、**信用できないと文書化した速度フィールドを使っている**。RS-03 は velocity が 0 なので自明に通り、RS-04 はノイズで一度も通らない。Velocity sweep の停止判定を位置由来に直したのと同じ修正が必要 |
+| ~~Kt の pointwise と fit の食い違い~~ | **2026-08-07 に個体差と判明**。RS-04 id 2 は 0.03% 差（切片なし、R² 0.9924）、id 3 は 9% 差（R² 0.9578）。**リーシュ由来の系統誤差ではない** — 系統ならどちらにも出る。差の大きい個体は fit を採る |
 | ~~Scan のキャンセル~~ | **2026-08-07 完了**。停止は進捗コールバックの戻り値に載せた（3 ドライバ）。実行中の 1 id は自分のタイムアウト分だけ走り切る |
 | **Velocity sweep がシミュレータで 0 を返す** | 植えた 0.2〜2.0 N·m すべてで 0.000。等速運動中はモーターが動摩擦を出し続けるので ±μ が出るはずで、**未解明**。実機では同じ run が 0.728 N·m を回収している。実験は `misa-actuator-sim/tests/sysid_recovers_planted_values.rs` に `#[ignore]` で残した。**Load map 側は仕様どおりで、これはシミュレータのバグではない**（§5 の訂正記録を参照） |
 | **不安定テスト 1 本** | `breakaway_map_recovers_friction_without_torque_feedback`。**フルスイート並列時のみ落ちる**（単体では安定）。原因は `run_breakaway_map` が**実時刻**でランプを進めること（`magnitude = ramp_nm_per_s × elapsed`）— 負荷でループ周期が伸びるとランプが粗く跳び、検出値が 0.1 N·m の許容幅を外れる。**許容幅を広げて隠すのではなく、ランプの粒度から期待誤差を導く**のが筋。落ちても再実行で通るので「とりあえず再実行」を覚えさせる前に直すこと |

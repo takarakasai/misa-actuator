@@ -21,11 +21,20 @@
 //! - **The timeout is shared.** It belongs to the transport, so setting it for
 //!   one motor sets it for all.
 //! - **A mixed-vendor wire has no router.** A frame goes to whichever driver is
-//!   reading, and one that does not recognise it discards it. That turns a stray
-//!   or late frame into a timeout rather than into wrong data, because each
-//!   driver checks a reply is addressed to it - but a reply can still be
-//!   consumed by the wrong reader and lost. Sequential access keeps the window
+//!   reading, and one that does not recognise it discards it, so a reply can be
+//!   consumed by the wrong reader and lost. Sequential access keeps that window
 //!   small; it does not close it.
+//! - **Addressing is only as strong as the protocol makes it.** An earlier
+//!   version of this note claimed each driver checks that a reply is addressed
+//!   to it, so the worst case was a timeout rather than wrong data. That was
+//!   wrong on both families checked against hardware:
+//!   - RobStride accepted any status frame of the right kind, ignoring the
+//!     sender id in `extra_data`. Fixed 2026-08-03; it now filters on it.
+//!   - DAMIAO carries the motor id in **four bits** of the feedback payload
+//!     (the high nibble is the status code), so ids agreeing in those bits are
+//!     indistinguishable unless each motor has a unique non-zero `MST_ID`.
+//!     [`build_multi`] refuses such a pair rather than reporting one motor's
+//!     position as another's.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -217,6 +226,7 @@ pub fn build_multi(cfg: &MultiConfig) -> Result<Vec<BuiltMotor>> {
         // and finding it should not require the adapter to be plugged in.
         check_spec(m)?;
     }
+    check_damiao_addressing(&cfg.motors)?;
 
     // Only open the wire if something on it needs one.
     let needs_bus = cfg.motors.iter().any(|m| m.driver != DriverKind::Sim);
@@ -248,6 +258,45 @@ pub fn build_multi(cfg: &MultiConfig) -> Result<Vec<BuiltMotor>> {
         built.push(build_one(spec, cfg, shared.as_ref())?);
     }
     Ok(built)
+}
+
+/// Refuse DAMIAO pairs whose feedback cannot be attributed.
+///
+/// The id in a DAMIAO feedback frame is four bits wide, so two motors agreeing
+/// in those bits are separable only by their Master IDs — and the default Master
+/// ID of `0` means "accept any responder", which switches that check off. Such a
+/// pair does not fail loudly: each driver reports the other's position as its
+/// own. Refusing beats measuring the wrong shaft.
+fn check_damiao_addressing(motors: &[MotorSpec]) -> Result<()> {
+    let damiao: Vec<&MotorSpec> = motors
+        .iter()
+        .filter(|m| m.driver == DriverKind::Damiao)
+        .collect();
+
+    for (i, a) in damiao.iter().enumerate() {
+        for b in &damiao[i + 1..] {
+            // `master_id` is not in `MotorSpec` yet, so every DAMIAO here uses
+            // the driver default of 0. Passing it explicitly keeps this honest
+            // about what is being compared.
+            if !damiao_driver::DamiaoMotor::<damiao_driver::AnyCanBus>::feedback_is_distinguishable(
+                (a.motor_id, 0),
+                (b.motor_id, 0),
+            ) {
+                bail!(
+                    "DAMIAO motors {} and {} cannot be told apart on one bus: the feedback \
+                     frame carries only the low four bits of the id ({:#X} for both), and \
+                     neither has a unique Master ID. Each driver would report the other's \
+                     position as its own. Give them ids that differ in the low nibble, or \
+                     assign a unique MST_ID to each (damiao-cli reg-write 7 <id> --save, \
+                     then power-cycle).",
+                    a.motor_id,
+                    b.motor_id,
+                    a.motor_id & 0x0F
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Everything about one spec that can be judged without a bus.
@@ -467,6 +516,63 @@ mod tests {
         assert!(err.contains("needs a model"), "{err}");
         // Refused before the bus is touched: no interface was configured.
         assert!(!err.contains("failed to open"), "{err}");
+    }
+
+    fn damiao(id: u8) -> MotorSpec {
+        MotorSpec {
+            driver: DriverKind::Damiao,
+            motor_id: id,
+            model: "DM4310".into(),
+            host_id: 0,
+            kt: 0.0,
+            gear_ratio: 0.0,
+            name: String::new(),
+        }
+    }
+
+    /// The id in a DAMIAO feedback frame is four bits wide, so 1 and 17 look
+    /// identical on the wire. Each driver would report the other's position as
+    /// its own, so this has to be refused rather than measured.
+    #[test]
+    fn damiao_ids_that_alias_in_four_bits_are_refused() {
+        let err = build_multi(&cfg(vec![damiao(1), damiao(17)]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be told apart"), "{err}");
+        // Refused before the bus is opened, so no adapter is needed to find it.
+        assert!(!err.contains("failed to open"), "{err}");
+    }
+
+    /// 16 is the id on the bench unit and its low nibble is zero, which collides
+    /// with 32 -- worth pinning, because it is the pair most likely to be hit.
+    #[test]
+    fn sixteen_and_thirty_two_are_refused() {
+        let err = build_multi(&cfg(vec![damiao(16), damiao(32)]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be told apart"), "{err}");
+    }
+
+    /// Ids differing in the low nibble are fine, and must still reach the bus
+    /// rather than being rejected by the addressing check.
+    #[test]
+    fn damiao_ids_differing_in_the_low_nibble_are_allowed() {
+        let err = build_multi(&cfg(vec![damiao(1), damiao(2)]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("cannot be told apart"),
+            "addressing is fine here: {err}"
+        );
+        // It fails for the only remaining reason: there is no interface.
+        assert!(err.contains("failed to open"), "{err}");
+    }
+
+    /// A single DAMIAO has nothing to be confused with.
+    #[test]
+    fn one_damiao_is_never_ambiguous() {
+        let err = build_multi(&cfg(vec![damiao(16)])).unwrap_err().to_string();
+        assert!(!err.contains("cannot be told apart"), "{err}");
     }
 
     #[test]

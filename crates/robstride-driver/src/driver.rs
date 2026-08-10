@@ -140,6 +140,11 @@ impl<B: RobstrideBus> Motor<B> {
 
     /// Receive frames until one matches `accept`, dropping unmatched frames.
     /// Returns timeout error if no accepted frame arrives within `self.timeout`.
+    ///
+    /// Every dropped frame is logged at debug level. On a shared bus most of
+    /// them belong to another motor, and a discard nobody can see is a discard
+    /// nobody can rule out — the CAN-FD investigation lost a day to exactly
+    /// that (`doc/handover.md` section 4).
     fn recv_filtered<F>(&mut self, mut accept: F) -> Result<(u8, u16, u8, Vec<u8>)>
     where
         F: FnMut(u8, u16, u8) -> bool,
@@ -174,9 +179,20 @@ impl<B: RobstrideBus> Motor<B> {
         self.recv_filtered(|_, _, _| true)
     }
 
+    /// Receive this motor's next status frame.
+    ///
+    /// **Filtered on the sending motor's id, not just the frame kind.** In a
+    /// status frame the sender is the low byte of `extra_data` (`device_id` is
+    /// the *host* the reply is addressed to), and until 2026-08-03 this accepted
+    /// any status frame of the right kind. With one motor on the wire that is
+    /// the same thing; with two it is not — motor 1's driver would take motor
+    /// 2's feedback and report it as its own, which is wrong data rather than a
+    /// missing reply. See `doc/handover.md` section 3 on shared buses.
     fn recv_status(&mut self) -> Result<MotorFeedback> {
-        let (comm_type, extra_data, device_id, data) = self.recv_filtered(|ct, _, _| {
-            ct == CommType::OperationStatus as u8 || ct == CommType::FaultReport as u8
+        let mine = self.motor_id;
+        let (comm_type, extra_data, device_id, data) = self.recv_filtered(|ct, extra, _| {
+            (ct == CommType::OperationStatus as u8 || ct == CommType::FaultReport as u8)
+                && (extra & 0xFF) as u8 == mine
         })?;
 
         if comm_type == CommType::FaultReport as u8 {

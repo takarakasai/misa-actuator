@@ -209,8 +209,35 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
         self.can_id
     }
     /// The motor's Master ID (feedback id). `0` means "accept any responder".
+    ///
+    /// **On a shared bus, leaving this at `0` is not safe.** A feedback frame
+    /// carries the motor id in the *low nibble* of byte 0 — four bits, because
+    /// the high nibble is the status code — so ids that agree in those four bits
+    /// (1 and 17, 2 and 18, 16 and 32) are indistinguishable in the payload. The
+    /// only other discriminator is the frame's CAN id, which is this Master ID,
+    /// and `0` disables that check. Two motors like that swap feedback silently.
+    ///
+    /// Give each motor a unique non-zero `MST_ID` (`reg-write 7 <id>`, then
+    /// power-cycle) before putting it on a bus with others.
     pub fn master_id(&self) -> u16 {
         self.master_id
+    }
+
+    /// Whether two motors on one bus can be told apart by their feedback.
+    ///
+    /// `false` when both rely on the four-bit id in the payload and those four
+    /// bits agree. Exposed so a multi-motor session can refuse the configuration
+    /// instead of reporting one motor's position as another's.
+    pub fn feedback_is_distinguishable(
+        (id_a, master_a): (u8, u16),
+        (id_b, master_b): (u8, u16),
+    ) -> bool {
+        // Distinct non-zero Master IDs separate them at the CAN id, whatever the
+        // payload nibble says.
+        if master_a != 0 && master_b != 0 && master_a != master_b {
+            return true;
+        }
+        (id_a & 0x0F) != (id_b & 0x0F)
     }
     /// Set the Master ID this driver matches feedback frames against. Use this
     /// when a motor has been configured with a non-default `MST_ID`. Pass `0`
@@ -417,6 +444,11 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
                     if frame.data.len() < DATA_LEN {
                         continue;
                     }
+                    // Four bits, not eight: the high nibble of byte 0 is the
+                    // status code, so this is the whole id the wire carries.
+                    // Ids agreeing in those bits cannot be separated here —
+                    // `feedback_is_distinguishable` is what refuses such a pair
+                    // before a session starts.
                     if (frame.data[0] & 0x0F) != (self.can_id & 0x0F) {
                         continue;
                     }
@@ -1027,10 +1059,57 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
 /// safe state on a DM-J4310 — the next control frame re-energises it. So the
 /// guarantee here is only "this handle stops commanding and de-energises on
 /// its way out", not "the motor is now inert".
+/// This is what puts a `FF FF FF FF FF FF FF FD` on the wire at the end of a
+/// read-only command such as `damiao-cli info`: the handle goes out of scope and
+/// de-energises the motor. Worth knowing before treating a capture's trailing
+/// disable frame as a mystery, as one investigation briefly did.
 impl<B: DamiaoBus> Drop for DamiaoMotor<B> {
     fn drop(&mut self) {
         if let Err(e) = self.disable() {
             log::warn!("damiao: disable on drop failed for motor {}: {e}", self.can_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod addressing_tests {
+    use super::*;
+    use crate::bus::AnyCanBus;
+
+    type M = DamiaoMotor<AnyCanBus>;
+
+    /// Four bits is all the feedback frame carries, so these pairs alias.
+    #[test]
+    fn ids_agreeing_in_the_low_nibble_are_indistinguishable() {
+        assert!(!M::feedback_is_distinguishable((1, 0), (17, 0)));
+        assert!(!M::feedback_is_distinguishable((16, 0), (32, 0)));
+        assert!(!M::feedback_is_distinguishable((2, 0), (18, 0)));
+    }
+
+    #[test]
+    fn ids_differing_in_the_low_nibble_are_fine() {
+        assert!(M::feedback_is_distinguishable((1, 0), (2, 0)));
+        assert!(M::feedback_is_distinguishable((16, 0), (17, 0)));
+    }
+
+    /// Distinct non-zero Master IDs separate the frames at the CAN id, so the
+    /// payload nibble stops mattering.
+    #[test]
+    fn distinct_master_ids_rescue_an_aliasing_pair() {
+        assert!(M::feedback_is_distinguishable((1, 0x11), (17, 0x21)));
+    }
+
+    /// A Master ID of zero means "accept any responder", so it rescues nothing.
+    #[test]
+    fn a_zero_master_id_does_not_help() {
+        assert!(!M::feedback_is_distinguishable((1, 0), (17, 0x21)));
+        assert!(!M::feedback_is_distinguishable((1, 0x11), (17, 0)));
+    }
+
+    /// Equal Master IDs are no better than none: both drivers accept the same
+    /// CAN id and fall back to the same four bits.
+    #[test]
+    fn equal_master_ids_do_not_help() {
+        assert!(!M::feedback_is_distinguishable((1, 0x11), (17, 0x11)));
     }
 }

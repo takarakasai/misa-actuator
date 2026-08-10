@@ -224,3 +224,80 @@ running candleLight/gs_usb firmware instead of slcan firmware.
 warning about the timer resolution in the log output (`RUST_LOG=warn`, the
 default). If it appears, `winmm.dll` could not be loaded, which is unusual and
 worth investigating before trusting any timing-sensitive result.
+
+## 8. Building and shipping the GUI
+
+The desktop app is a Tauri shell around a React front end. Every other crate
+in the workspace builds with nothing but a Rust toolchain; this one also needs
+Node, because the front end is bundled into the binary at compile time.
+
+```
+cd ui
+npm ci
+npm run app:build
+```
+
+That produces two things:
+
+| artifact | size | what it is |
+|---|---|---|
+| `target/release/misa-actuator-gui.exe` | ~12 MB | the app, runnable as-is |
+| `target/release/bundle/nsis/misa-actuator_0.1.0_x64-setup.exe` | ~2.6 MB | NSIS installer |
+
+The `.exe` is self-contained apart from the WebView2 runtime — the front end
+is embedded, not loaded from disk. A debug build is different: it loads the
+front end from the Vite dev server at `localhost:5173`, so `cargo run` alone
+gives a blank window unless `npm run dev` is already up. Use `npm run app`
+for development and `npm run app:build` for anything you hand to somebody.
+
+### The bundler downloads its own tools
+
+`tauri build` fetches NSIS and `nsis_tauri_utils.dll` from GitHub the first
+time it bundles. On a machine with no outbound network the bundle step fails
+even though the `.exe` builds fine. The downloads are cached under the Tauri
+CLI's data directory afterwards.
+
+### WebView2
+
+The app renders in WebView2, which is preinstalled on Windows 11 and on
+current Windows 10 builds, but not guaranteed on older ones. `tauri.conf.json`
+does not set `bundle.windows.webviewInstallMode`, so the installer uses the
+default: it downloads a bootstrapper at install time, which needs the target
+machine to be online. Set it to `embedBootstrapper` (or `offlineInstaller`) if
+you are shipping into an environment that will not be.
+
+### Machines without a CAN adapter
+
+The app starts fine with no PEAK driver installed — `PCANBasic.dll` is loaded
+lazily, on the first connect, not at startup. Pressing **Connect** on a
+`pcan:` interface then reports:
+
+```
+PCANBasic.dll not found. Install the PEAK-System device driver
+(PCAN-Basic ships with it) and reconnect the adapter.
+```
+
+That surfaces as a banner above the tabs as well as in the Console log. The
+simulator driver needs no adapter at all and is the right way to try the app
+before any hardware arrives.
+
+## 9. Do not build inside a synced OneDrive folder
+
+Observed on 2026-08-02, in `…\OneDrive - Sony\work\…`: after a successful
+`npm run app:build`, every later front-end build failed with
+
+```
+EPERM, Permission denied: …\ui\dist\index.html
+```
+
+`ui/dist/index.html` was held open by another process — not by any of ours
+(no `node`, `vite`, `cargo` or `misa-actuator-gui` was running), and the file
+could be neither deleted nor renamed. The sync client holds handles on files
+it is uploading, and `ui/dist` and `target/` churn constantly.
+
+`tsc --noEmit` still works, since it writes nothing, so type errors are still
+catchable while this is happening.
+
+The fix is to keep the working tree out of the synced tree, or to exclude
+`target/`, `ui/dist/` and `ui/node_modules/` from sync. Beyond the locks,
+syncing a Rust `target/` directory is a large and pointless amount of upload.

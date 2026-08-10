@@ -720,6 +720,15 @@ impl Worker {
         // reconnecting to change a Kt and paying for current reporting on
         // every chirp that followed. Both are no-ops on drivers that do not
         // derive torque from current.
+        // Every quasi-static run reasons about where the shaft is — a load map
+        // steps positions, a breakaway map travels between them, a velocity
+        // sweep judges its own speed from position. On a family whose control
+        // replies inline a 1°/LSB angle that reasoning is done at 0.017 rad
+        // granularity, coarser than the tolerances these runs are written
+        // against. They dwell, so the extra transaction costs nothing here; a
+        // chirp would notice, which is why this is per run rather than always.
+        self.actuator.set_fine_position(true);
+
         if envelope.kt > 0.0 {
             self.actuator.set_report_current(true);
             self.actuator.set_torque_constant(envelope.kt);
@@ -974,6 +983,7 @@ impl Worker {
         // rate of the next chirp.
         self.actuator.set_torque_constant(0.0);
         self.actuator.set_report_current(false);
+        self.actuator.set_fine_position(false);
 
         // Which limit stopped the run, named. Without this the operator sees
         // only the consequence — "torque and current did not vary enough to fit

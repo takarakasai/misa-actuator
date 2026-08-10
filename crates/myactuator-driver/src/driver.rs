@@ -117,6 +117,11 @@ pub struct MyActuatorMotor<B: MyActuatorBus = AnyCanBus> {
     /// Soft zero: the `0x92` multi-turn angle (0.01°/LSB) captured at the last
     /// [`Self::rezero`]. Commanded positions add it, reported ones subtract it.
     zero_centideg: Option<i64>,
+    /// Whether control replies should carry the fine position.
+    ///
+    /// Off by default because it costs a second transaction per command. See
+    /// [`Self::set_fine_position`] for what it buys and when it is worth it.
+    fine_position: bool,
     /// Tracked enable state (see `Actuator::is_enabled_hint`).
     pub(crate) enabled: bool,
 }
@@ -142,6 +147,7 @@ impl<B: MyActuatorBus> MyActuatorMotor<B> {
             config,
             timeout: DEFAULT_TIMEOUT,
             zero_centideg: None,
+            fine_position: false,
             enabled: false,
         })
     }
@@ -739,7 +745,35 @@ impl<B: MyActuatorBus> MyActuatorMotor<B> {
     fn parse_control_reply(&mut self, reply: &[u8]) -> Result<MotorFeedback> {
         let s = parse_status2(reply)
             .ok_or_else(|| Error::InvalidResponse("bad control reply".into()))?;
-        Ok(self.feedback_from_status2(&s))
+        let mut fb = self.feedback_from_status2(&s);
+        if self.fine_position {
+            // Same substitution `measure` makes, on request. A failed read
+            // leaves the coarse value rather than failing the command: the
+            // control itself succeeded, and losing a motion command over a
+            // resolution upgrade would be the worse trade.
+            if let Ok(centideg) = self.read_multi_turn_centideg() {
+                fb.position_rad = self.centideg_to_position_rad(centideg as i64);
+            }
+        }
+        Ok(fb)
+    }
+
+    /// Ask control replies to carry the **fine** position (`0x92`, 0.01°/LSB)
+    /// instead of the coarse one Status2 inlines (1°/LSB).
+    ///
+    /// Off by default: it costs a second transaction per command, halving the
+    /// rate a control loop can reach. Streaming and chirps want the rate and do
+    /// not care about the last degree; quasi-static runs are the opposite, and
+    /// dwell long enough that the extra read is free.
+    ///
+    /// Without it, everything a run learns about position through a control
+    /// reply is quantised to 1° — about 0.017 rad. That is coarser than the
+    /// breakaway map's own 0.01 rad arrival tolerance, so the travel between
+    /// positions could never register as arrived, and it showed on the bench as
+    /// a shaft that appeared to jump a degree the moment streaming started and
+    /// back the moment it stopped (2026-08-08, an RMD-X4-P36-36).
+    pub fn set_fine_position(&mut self, on: bool) {
+        self.fine_position = on;
     }
 
     /// Status2 → SI feedback. The inline angle is a coarse 1°/LSB value, so

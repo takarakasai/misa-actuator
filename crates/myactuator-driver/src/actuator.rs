@@ -92,6 +92,12 @@ impl<B: MyActuatorBus> Actuator for MyActuatorMotor<B> {
         Ok(())
     }
 
+    // This family is why the trait method exists: its control replies inline a
+    // 1°/LSB angle, and the fine one costs a second transaction.
+    fn set_fine_position(&mut self, on: bool) {
+        MyActuatorMotor::set_fine_position(self, on);
+    }
+
     fn set_run_mode(&mut self, _mode: RunMode) -> MisaResult<()> {
         // Each V3 command picks its own controller; nothing to configure.
         Ok(())

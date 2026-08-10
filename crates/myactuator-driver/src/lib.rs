@@ -142,6 +142,55 @@ mod tests {
     }
 
     #[test]
+    /// A control reply's position is 1°/LSB unless the fine reading is asked
+    /// for, and asking for it costs a round trip.
+    ///
+    /// This is what made a shaft appear to jump a degree when streaming started
+    /// and back when it stopped: `measure` substitutes the 0.01° `0x92` value
+    /// and control replies did not, so the same stationary shaft read
+    /// differently depending on which path the caller was on (2026-08-08).
+    #[test]
+    fn fine_position_costs_a_read_and_buys_resolution() {
+        let mut m = motor();
+        m.bus().multi_turn_centideg = 0;
+        m.rezero().unwrap();
+
+        // The multi-turn register says 17.19° (0.3 rad); the synthesized
+        // control reply carries whatever coarse angle the mock inlines, which
+        // is a different number.
+        m.bus().multi_turn_centideg = 1719;
+
+        let coarse = MyActuatorMotor::set_position(&mut m, 0.3, 1.0).unwrap();
+        let sent_before = m.bus().sent.len();
+
+        MyActuatorMotor::set_fine_position(&mut m, true);
+        let fine = MyActuatorMotor::set_position(&mut m, 0.3, 1.0).unwrap();
+        let sent_after = m.bus().sent.len();
+
+        // The fine reading is the multi-turn value: 17.19° = 0.3 rad.
+        assert!(
+            (fine.position_rad - 0.3).abs() < 1e-3,
+            "fine position {} should be the 0x92 reading",
+            fine.position_rad
+        );
+        // And it is not what the control reply alone said.
+        assert!(
+            (fine.position_rad - coarse.position_rad).abs() > 1e-3,
+            "coarse {} and fine {} should differ",
+            coarse.position_rad,
+            fine.position_rad
+        );
+
+        // Two frames for the fine command against one for the coarse: the cost
+        // this is off by default for.
+        assert_eq!(
+            sent_after - sent_before,
+            2,
+            "the fine reading should cost one extra transaction"
+        );
+    }
+
+    #[test]
     fn set_position_requires_anchor_then_offsets_by_zero() {
         let mut m = motor();
         m.bus().multi_turn_centideg = 18_000; // motor sits at +180.00°

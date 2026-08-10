@@ -129,6 +129,22 @@ pub trait Actuator {
     /// bus. Default does nothing.
     fn set_torque_constant(&mut self, _kt_nm_per_a: f32) {}
 
+    /// Ask for the finest position the driver can report, if that costs extra.
+    ///
+    /// Off by default because for at least one family it is a second
+    /// transaction per command, which halves the achievable loop rate. The
+    /// trade is the same shape as [`Self::set_report_current`]: streaming and
+    /// chirps want the rate, quasi-static runs want the resolution and dwell
+    /// long enough not to notice the cost.
+    ///
+    /// The difference it makes is not cosmetic. A MyActuator's control replies
+    /// inline a 1°/LSB angle — about 0.017 rad — which is coarser than the
+    /// tolerances the position-visiting runs are written against.
+    ///
+    /// Default does nothing, which is right for families whose ordinary
+    /// feedback is already at full resolution.
+    fn set_fine_position(&mut self, _on: bool) {}
+
     /// Probe the underlying bus for responding motors in `id_range`.
     ///
     /// Returns the list of motor IDs that responded. Implementations

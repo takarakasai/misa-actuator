@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use crate::multi::{build_multi, MotorSpec, MultiConfig};
 use crate::protocol::{
     ControlMode, LogLevel, Setpoint, StopReason, DEFAULT_RATE_HZ, DEFAULT_WATCHDOG, MAX_RATE_HZ,
-    MIN_RATE_HZ, TELEMETRY_INTERVAL,
+    MIN_RATE_HZ, STATUS_INTERVAL, TELEMETRY_INTERVAL,
 };
 
 /// How many snapshots may be in flight before the worker drops them.
@@ -81,6 +81,19 @@ pub struct MotorReading {
     pub torque_nm: f32,
     pub current_a: f32,
     pub temperature_c: f32,
+    /// Bus voltage, from the slower status read. `NaN` if not reported.
+    pub voltage_v: f32,
+    /// Common fault bits, as `misa_actuator::ErrorFlags::bits`.
+    pub error_bits: u32,
+    /// The driver's native fault word, for diagnostics.
+    pub error_raw: u32,
+    /// How old these numbers are, in ms, or `None` if the motor has never
+    /// answered.
+    ///
+    /// On a shared wire a motor can miss several turns, so "when was this
+    /// measured" is part of the measurement. A table that renders a stale value
+    /// as current is exactly what section 8 of the handover forbids.
+    pub age_ms: Option<u64>,
     /// Whether the worker believes this motor is energised.
     pub enabled: bool,
     /// Consecutive failed transactions. Non-zero means the numbers above are
@@ -103,6 +116,12 @@ pub struct MultiSnapshot {
     pub achieved_rate_hz: f32,
     /// Snapshots dropped because the consumer was behind.
     pub dropped: u64,
+    /// Passes that ran out of budget before reaching every motor.
+    ///
+    /// Non-zero means the wire, not the configured tick, is setting the rate.
+    /// Worth surfacing: the alternative is a rate that quietly stops meaning
+    /// what it says.
+    pub starved_passes: u64,
 }
 
 /// A one-off instruction to the multi-motor worker.
@@ -436,6 +455,41 @@ struct MotorState {
     last_error: Option<String>,
     last: misa_actuator::MotorFeedback,
     last_idle_poll: Instant,
+    /// When this motor last answered. `None` until it has.
+    ///
+    /// Kept so a reading can carry its own age: on a shared wire a motor can go
+    /// several passes without a turn, and a table that shows a stale number as
+    /// though it were current is the kind of display this project treats as a
+    /// bug (`doc/handover.md` section 8).
+    last_ok: Option<Instant>,
+    last_status_poll: Instant,
+    /// From `read_status`, which is a separate transaction on most families.
+    voltage_v: f32,
+    status_temperature_c: f32,
+    error_bits: u32,
+    error_raw: u32,
+    /// Failed status reads, counted apart from control faults.
+    ///
+    /// A driver that cannot report status must not be pushed towards the
+    /// fault cut-off by a diagnostic read: that would silence a motor that is
+    /// controlling perfectly well.
+    status_misses: u32,
+}
+
+impl MotorState {
+    /// The temperature to show, from whichever source reported one.
+    ///
+    /// Neither source is reliable across families: DAMIAO puts temperatures in
+    /// the feedback frame, while a RobStride reports none outside MIT mode
+    /// (`doc/handover.md` section 4). `NaN` when neither answered, which a UI
+    /// must render as "not reported" rather than as zero.
+    fn temperature(&self) -> f32 {
+        if self.last.temperature_c.is_finite() {
+            self.last.temperature_c
+        } else {
+            self.status_temperature_c
+        }
+    }
 }
 
 struct Worker {
@@ -447,6 +501,14 @@ struct Worker {
     dropped: u64,
     passes: u32,
     last_flush: Instant,
+    /// Which motor gets the first turn next pass.
+    ///
+    /// Rotates to whoever was skipped when a pass ran out of budget, so a slow
+    /// motor delays the others once rather than permanently.
+    next_start: usize,
+    /// Passes that ended early on the budget. Reported so a UI can say the rate
+    /// is limited by the wire rather than by the configured tick.
+    starved: u64,
 }
 
 impl Worker {
@@ -470,6 +532,13 @@ impl Worker {
                     last_error: None,
                     last: misa_actuator::MotorFeedback::zero(),
                     last_idle_poll: now,
+                    last_ok: None,
+                    last_status_poll: now,
+                    voltage_v: f32::NAN,
+                    status_temperature_c: f32::NAN,
+                    error_bits: 0,
+                    error_raw: 0,
+                    status_misses: 0,
                 })
                 .collect(),
             shared,
@@ -479,6 +548,8 @@ impl Worker {
             dropped: 0,
             passes: 0,
             last_flush: now,
+            next_start: 0,
+            starved: 0,
         }
     }
 
@@ -516,7 +587,21 @@ impl Worker {
         self.finish(reason);
     }
 
-    /// One visit to every motor.
+    /// One visit to every motor, budgeted.
+    ///
+    /// A pass is given the tick period and no more. Without that, one slow motor
+    /// sets everyone's update rate: a transaction can cost the full bus timeout
+    /// (100 ms by default) and the DAMIAO register path retries three times with
+    /// gaps, so a single bad motor on a four-motor wire would drag the other
+    /// three down with it — which is precisely what was measured on 2026-08-03.
+    ///
+    /// When the budget runs out the remaining motors are skipped and go **first**
+    /// next pass, so being starved is temporary rather than permanent.
+    ///
+    /// The budget bounds how many motors are delayed, not how long one
+    /// transaction takes: the timeout belongs to the shared transport, so a
+    /// single overrun of up to one timeout is still possible. Per-motor timeouts
+    /// need the transport-level change noted in `crate::multi`.
     fn pass(&mut self) {
         let streaming = self.shared.streaming.load(Ordering::Acquire);
         let setpoints = self
@@ -526,61 +611,132 @@ impl Worker {
             .map(|g| g.clone())
             .unwrap_or_default();
 
-        for (i, m) in self.motors.iter_mut().enumerate() {
+        let n = self.motors.len();
+        if n == 0 {
+            return;
+        }
+        let start = self.next_start % n;
+        let deadline = Instant::now() + self.shared.period();
+        let mut serviced = 0usize;
+        let mut resume_at = start;
+
+        for k in 0..n {
+            let i = (start + k) % n;
+            resume_at = i;
+
             // Checked per motor, not per pass: a stop must not wait for the
             // rest of the wire to be serviced first.
             if self.shared.stop.load(Ordering::Acquire) {
                 break;
             }
-            if m.faults >= CONSECUTIVE_FAULT_LIMIT {
-                continue;
+            // At least one motor per pass, or a permanently slow first motor
+            // would starve everyone forever.
+            if serviced > 0 && Instant::now() >= deadline {
+                self.starved += 1;
+                break;
             }
 
             let sp = setpoints.get(i).copied().unwrap_or_default();
-            let outcome = if streaming && m.enabled {
-                if m.active_mode != Some(sp.mode) {
-                    match m.actuator.set_run_mode(sp.mode.into()) {
-                        Ok(()) => m.active_mode = Some(sp.mode),
-                        Err(e) => {
-                            note_fault(m, "set_run_mode", e, &self.events);
-                            continue;
-                        }
-                    }
-                }
-                match sp.mode {
-                    ControlMode::Position => {
-                        m.actuator.set_position(sp.position_rad, sp.max_speed_rad_s)
-                    }
-                    ControlMode::Velocity => m.actuator.set_velocity(sp.velocity_rad_s),
-                    ControlMode::Torque => m.actuator.set_torque(sp.torque_nm),
-                    ControlMode::Mit => m.actuator.mit_control(
-                        sp.position_rad,
-                        sp.velocity_rad_s,
-                        sp.kp,
-                        sp.kd,
-                        sp.torque_ff_nm,
-                    ),
-                }
-            } else if m.last_idle_poll.elapsed() >= IDLE_POLL {
-                m.last_idle_poll = Instant::now();
-                // Reading is not always passive: on DAMIAO `measure` re-issues
-                // the last control frame, so a monitoring table keeps a motor
-                // energised. See doc/handover.md section 2.
-                m.actuator.measure()
-            } else {
-                continue;
-            };
+            self.service(i, sp, streaming);
+            serviced += 1;
+            resume_at = (i + 1) % n;
+        }
 
-            match outcome {
-                Ok(fb) => {
-                    m.faults = 0;
-                    m.last_error = None;
-                    m.last = fb;
+        self.next_start = resume_at;
+        self.passes += 1;
+    }
+
+    /// One motor's turn: a control command or a reading, then status if due.
+    fn service(&mut self, i: usize, sp: Setpoint, streaming: bool) {
+        // Disjoint field borrows: the motor is borrowed mutably while the event
+        // sender is borrowed immutably.
+        let m = &mut self.motors[i];
+        if m.faults >= CONSECUTIVE_FAULT_LIMIT {
+            return;
+        }
+
+        let outcome = if streaming && m.enabled {
+            if m.active_mode != Some(sp.mode) {
+                match m.actuator.set_run_mode(sp.mode.into()) {
+                    Ok(()) => m.active_mode = Some(sp.mode),
+                    Err(e) => {
+                        note_fault(m, "set_run_mode", e, &self.events);
+                        return;
+                    }
                 }
-                Err(e) => note_fault(m, "transaction", e, &self.events),
+            }
+            match sp.mode {
+                ControlMode::Position => {
+                    m.actuator.set_position(sp.position_rad, sp.max_speed_rad_s)
+                }
+                ControlMode::Velocity => m.actuator.set_velocity(sp.velocity_rad_s),
+                ControlMode::Torque => m.actuator.set_torque(sp.torque_nm),
+                ControlMode::Mit => m.actuator.mit_control(
+                    sp.position_rad,
+                    sp.velocity_rad_s,
+                    sp.kp,
+                    sp.kd,
+                    sp.torque_ff_nm,
+                ),
+            }
+        } else if m.last_idle_poll.elapsed() >= IDLE_POLL {
+            m.last_idle_poll = Instant::now();
+            // Reading is not always passive: on DAMIAO `measure` re-issues the
+            // last control frame, so a monitoring table keeps a motor
+            // energised. See doc/handover.md section 2.
+            m.actuator.measure()
+        } else {
+            // Nothing to do this turn, but a status read may still be due.
+            self.status_if_due(i);
+            return;
+        };
+
+        match outcome {
+            Ok(fb) => {
+                m.faults = 0;
+                m.last_error = None;
+                m.last = fb;
+                m.last_ok = Some(Instant::now());
+            }
+            Err(e) => note_fault(m, "transaction", e, &self.events),
+        }
+
+        self.status_if_due(i);
+    }
+
+    /// Voltage, temperature and fault bits, on their own slower cadence.
+    ///
+    /// A separate transaction on most families, and the only source of
+    /// temperature on some: a RobStride reports none in its feedback frame
+    /// outside MIT mode, so without this the temperature column would read "not
+    /// reported" for the whole session.
+    fn status_if_due(&mut self, i: usize) {
+        let m = &mut self.motors[i];
+        if m.last_status_poll.elapsed() < STATUS_INTERVAL {
+            return;
+        }
+        m.last_status_poll = Instant::now();
+        match m.actuator.read_status() {
+            Ok(st) => {
+                m.status_misses = 0;
+                m.voltage_v = st.voltage_v;
+                m.status_temperature_c = st.temperature_c;
+                m.error_bits = st.error.bits();
+                m.error_raw = st.error.raw();
+            }
+            Err(e) => {
+                // Deliberately not a control fault. A driver that cannot report
+                // status must not be pushed towards the cut-off and silenced
+                // while it is controlling perfectly well.
+                m.status_misses += 1;
+                if m.status_misses == 1 {
+                    log::debug!(
+                        "multi: motor {} does not report status: {e}",
+                        m.spec.motor_id
+                    );
+                }
             }
         }
-        self.passes += 1;
     }
 
     fn handle(&mut self, cmd: MultiCommand) {
@@ -716,7 +872,11 @@ impl Worker {
                     velocity_rad_s: m.last.velocity_rad_per_s,
                     torque_nm: m.last.torque_nm,
                     current_a: m.last.current_a,
-                    temperature_c: m.last.temperature_c,
+                    temperature_c: m.temperature(),
+                    voltage_v: m.voltage_v,
+                    error_bits: m.error_bits,
+                    error_raw: m.error_raw,
+                    age_ms: m.last_ok.map(|t| t.elapsed().as_millis() as u64),
                     enabled: m.enabled,
                     misses: m.faults,
                     error: m.last_error.clone(),
@@ -724,6 +884,7 @@ impl Worker {
                 .collect(),
             achieved_rate_hz: self.passes as f32 / elapsed,
             dropped: self.dropped,
+            starved_passes: self.starved,
         };
         self.passes = 0;
         self.last_flush = Instant::now();
@@ -906,6 +1067,52 @@ mod tests {
             s.setpoint(1).unwrap().position_rad,
             0.0,
             "one motor's target must not become another's"
+        );
+    }
+
+    /// A reading has to say how old it is, or a table will render a stale value
+    /// as though it were current.
+    #[test]
+    fn a_reading_carries_its_own_age() {
+        let s = MultiSession::connect(&sim_cfg(&[1, 2])).unwrap();
+        for _ in 0..200 {
+            let snap = wait_for_snapshot(&s);
+            if snap.motors.iter().all(|m| m.age_ms.is_some()) {
+                for m in &snap.motors {
+                    let age = m.age_ms.unwrap();
+                    assert!(age < 5_000, "motor {} reported age {age} ms", m.motor_id);
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no motor ever reported an age");
+    }
+
+    /// Before a motor has answered there is no age to report, and inventing one
+    /// (zero, say) would claim a measurement that never happened.
+    #[test]
+    fn an_age_is_absent_rather_than_zero_before_the_first_reply() {
+        let s = MultiSession::connect(&sim_cfg(&[1])).unwrap();
+        let snap = wait_for_snapshot(&s);
+        // Either it has answered by now, or it has not; both are fine, but an
+        // unanswered motor must report `None` rather than 0.
+        if snap.motors[0].age_ms.is_none() {
+            assert_eq!(snap.motors[0].misses, 0);
+        }
+    }
+
+    /// Temperature is `NaN` when nothing reported one, never zero. The `ideal`
+    /// simulator preset does report temperature, so this checks the value is at
+    /// least not a silently-substituted zero.
+    #[test]
+    fn temperature_is_reported_or_absent_but_never_faked() {
+        let s = MultiSession::connect(&sim_cfg(&[1])).unwrap();
+        let snap = wait_for_snapshot(&s);
+        let t = snap.motors[0].temperature_c;
+        assert!(
+            t.is_nan() || t > -273.15,
+            "temperature was {t}, which is neither a reading nor an absence"
         );
     }
 

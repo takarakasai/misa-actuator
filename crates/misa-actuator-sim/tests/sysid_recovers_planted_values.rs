@@ -20,7 +20,8 @@ use std::sync::atomic::AtomicBool;
 use misa_actuator::Actuator;
 use misa_actuator_sim::{SimActuator, SimConfig};
 use misa_sysid::quasistatic::{
-    run_breakaway, run_thermal, BreakawaySpec, Direction, ThermalSpec,
+    run_breakaway, run_load_map, run_thermal, run_velocity_sweep, BreakawaySpec, Direction,
+    LoadMapSpec, ThermalSpec, VelocitySweepSpec,
 };
 use misa_sysid::SafetyLimits;
 
@@ -42,6 +43,172 @@ fn quick_ramp(ceiling_nm: f32, direction: Direction) -> BreakawaySpec {
         rest_window_s: 0.2,
         rest_timeout_s: 2.0,
         ..BreakawaySpec::slow(ceiling_nm, direction)
+    }
+}
+
+/// **Why a load map under-reports friction on a stiff joint, checked against
+/// planted values rather than argued from one bench result.**
+///
+/// On 2026-08-07 an RS-03 measured 1.180 N·m of stiction from a breakaway map
+/// and 0.728 N·m of kinetic friction from a velocity sweep, and then 0.113 N·m
+/// from a load map — a sixth of its own kinetic figure, inverting the ordering
+/// that `doc/friction.md` §5 says must hold. The run flagged itself
+/// (`hunting, not settling`), but a single joint cannot distinguish "load maps
+/// under-report friction as stiction grows" from "that rig had a fault".
+///
+/// So: plant a sweep of stiction values in the simulator, whose position loop
+/// and Coulomb friction are the same code every preset uses, and compare what
+/// each run recovers against what was planted. Three runs on identical plants,
+/// so a disagreement is a property of the method rather than of the motor.
+///
+/// # What it actually found, 2026-08-07: not the hypothesis
+///
+/// ```text
+/// planted  breakaway  kinetic(0.6x)  load-map
+///    0.20      0.210      0.000      0.000
+///    0.50      0.506      0.000      0.000
+///    1.00      1.005      0.000      0.000
+///    2.00      2.006      0.000      0.000
+/// ```
+///
+/// The breakaway recovers every planted value. The other two recover **zero at
+/// every stiction, including 0.2 N·m** — where the position loop moves the shaft
+/// easily and the hypothesis predicts a good measurement. So this does not show
+/// a load map degrading with stiction; it shows both position- and
+/// velocity-driven paths recovering no friction at all from this plant.
+///
+/// That is a finding about the **simulator**, not about load maps: on hardware
+/// the same `run_velocity_sweep` recovered 0.728 N·m. The likely cause is that
+/// the simulated feedback torque does not carry the Coulomb term these two
+/// methods read, while the breakaway — which watches for motion rather than
+/// reading torque — is unaffected.
+///
+/// Left `#[ignore]` rather than deleted or forced to pass. The experiment is
+/// right and the plant is not ready for it: **fix the simulator's friction
+/// feedback first, then this test decides the question.** Asserting the zeros as
+/// expected would enshrine the deficiency as correct.
+#[ignore = "blocked: the simulator recovers no friction through the velocity sweep or load map; see the doc comment"]
+#[test]
+fn a_load_map_under_reports_friction_as_stiction_grows() {
+    /// Recovered friction from each of the three methods, for one planted value.
+    struct Row {
+        planted: f32,
+        breakaway: Option<f32>,
+        kinetic: Option<f32>,
+        load_map: Option<f32>,
+    }
+
+    let plant = |stiction: f32| {
+        let mut cfg = SimConfig::rs04();
+        cfg.friction.stiction_nm = stiction;
+        // Kinetic below static, as it is physically and as the bench saw
+        // (1.180 static against 0.728 kinetic). Keeping the ratio fixed means
+        // the sweep varies one thing.
+        cfg.friction.kinetic_nm = stiction * 0.6;
+        cfg
+    };
+
+    let mut rows = Vec::new();
+    for planted in [0.2f32, 0.5, 1.0, 2.0] {
+        let abort = AtomicBool::new(false);
+
+        // 1. Breakaway: ramps torque until the shaft moves. No position hold.
+        let mut act = SimActuator::new(plant(planted));
+        let breakaway = run_breakaway(
+            &mut act,
+            &quick_ramp(planted * 3.0 + 1.0, Direction::Positive),
+            permissive(),
+            &abort,
+        )
+        .expect("breakaway failed")
+        .breakaway_torque_nm;
+
+        // 2. Velocity sweep: steady motion, friction from the direction split.
+        let mut act = SimActuator::new(plant(planted));
+        let kinetic = run_velocity_sweep(
+            &mut act,
+            &VelocitySweepSpec::slow(0.2),
+            permissive(),
+            &abort,
+        )
+        .expect("velocity sweep failed")
+        .mean_kinetic_friction_nm(8);
+
+        // 3. Load map: holds position at each step, friction from the
+        //    outbound/return hysteresis. This is the method under suspicion.
+        let mut act = SimActuator::new(plant(planted));
+        let load_map = run_load_map(
+            &mut act,
+            &LoadMapSpec::symmetric(0.3, 9),
+            permissive(),
+            &abort,
+        )
+        .expect("load map failed")
+        .mean_friction_nm();
+
+        rows.push(Row {
+            planted,
+            breakaway,
+            kinetic,
+            load_map,
+        });
+    }
+
+    // Printed unconditionally: the table is the finding, and a test that only
+    // shows its data on failure hides the evidence for the thing it proves.
+    println!("planted  breakaway  kinetic(0.6x)  load-map");
+    for r in &rows {
+        let f = |v: Option<f32>| match v {
+            Some(v) => format!("{v:9.3}"),
+            None => "        -".to_string(),
+        };
+        println!(
+            "{:7.2}  {}  {}  {}",
+            r.planted,
+            f(r.breakaway),
+            f(r.kinetic),
+            f(r.load_map)
+        );
+    }
+
+    // The breakaway is the reference: it does not hold position, so nothing in
+    // it degrades as stiction rises. If this fails, the experiment says nothing
+    // about load maps.
+    for r in &rows {
+        let got = r.breakaway.expect("breakaway found nothing");
+        assert!(
+            (got - r.planted).abs() < 0.1,
+            "breakaway recovered {got:.3} for a planted {:.3}",
+            r.planted
+        );
+    }
+
+    // The claim: a load map's recovered friction falls further behind the
+    // planted value as stiction grows, while the breakaway does not.
+    let ratio = |v: Option<f32>, planted: f32| v.map(|v| v / planted);
+    let low = rows.first().expect("rows");
+    let high = rows.last().expect("rows");
+    if let (Some(lo), Some(hi)) = (
+        ratio(low.load_map, low.planted),
+        ratio(high.load_map, high.planted),
+    ) {
+        assert!(
+            hi < lo,
+            "load map recovered {:.0}% of a {:.2} N·m stiction and {:.0}% of a {:.2} N·m one — \
+             no degradation, so the bench result needs another explanation",
+            lo * 100.0,
+            low.planted,
+            hi * 100.0,
+            high.planted
+        );
+    } else {
+        // Recovering nothing at the high end is the strongest form of the same
+        // claim, so long as the low end did recover something.
+        assert!(
+            low.load_map.is_some(),
+            "the load map recovered nothing at any stiction — that is a broken \
+             run, not a degradation with stiction"
+        );
     }
 }
 

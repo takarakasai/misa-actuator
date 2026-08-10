@@ -253,6 +253,75 @@ impl CharacterizeJob {
         }
     }
 
+    /// Roughly how long the run will take, and whether that is a ceiling.
+    ///
+    /// Returns `(duration, is_upper_bound)`. There is no progress callback out
+    /// of `misa_sysid` — the runs are blocking calls — so a progress bar has to
+    /// divide real elapsed time by a figure derived from the spec. Being
+    /// derived, it is an estimate, and a UI that draws it as certainty will
+    /// eventually draw a bar that sits at 100% while the run continues.
+    ///
+    /// `is_upper_bound` is true for [`Self::Breakaway`], which stops as soon as
+    /// the shaft moves and so normally finishes well before its ramp completes.
+    /// Every other run dwells for a fixed schedule.
+    pub fn expected_duration(&self) -> (Duration, bool) {
+        let secs = match *self {
+            CharacterizeJob::LoadMap {
+                from_rad,
+                to_rad,
+                steps,
+                settle_s,
+                max_speed_rad_s,
+                return_sweep,
+            } => {
+                let steps = steps.max(2) as f32;
+                // Each step dwells, and before dwelling it travels one gap at
+                // the speed limit. Ignoring the travel would under-estimate a
+                // wide slow sweep by more than the dwells themselves.
+                let gap = (to_rad - from_rad).abs() / (steps - 1.0).max(1.0);
+                let travel = if max_speed_rad_s > 0.0 {
+                    gap / max_speed_rad_s
+                } else {
+                    0.0
+                };
+                steps * (settle_s.max(0.0) + travel) * if return_sweep { 2.0 } else { 1.0 }
+            }
+            CharacterizeJob::VelocitySweep {
+                half_span_rad,
+                speed_rad_s,
+                return_sweep,
+                ..
+            } => {
+                if speed_rad_s > 0.0 {
+                    2.0 * half_span_rad.abs() / speed_rad_s * if return_sweep { 2.0 } else { 1.0 }
+                } else {
+                    0.0
+                }
+            }
+            CharacterizeJob::Breakaway {
+                ramp_nm_per_s,
+                max_torque_nm,
+                ..
+            } => {
+                if ramp_nm_per_s > 0.0 {
+                    max_torque_nm.abs() / ramp_nm_per_s
+                } else {
+                    0.0
+                }
+            }
+            CharacterizeJob::Kt {
+                steps, settle_s, ..
+            } => steps.max(2) as f32 * settle_s.max(0.0),
+        };
+        // A non-finite or negative estimate would divide a progress bar into
+        // nonsense; zero is the agreed "no estimate" value.
+        let secs = if secs.is_finite() && secs > 0.0 { secs } else { 0.0 };
+        (
+            Duration::from_secs_f32(secs),
+            matches!(self, CharacterizeJob::Breakaway { .. }),
+        )
+    }
+
     /// Whether the run reads motor current, and so needs current reporting
     /// switched on for its duration.
     ///
@@ -942,5 +1011,96 @@ mod tests {
         })
         .unwrap();
         assert!(json.contains("\"positionRad\""), "{json}");
+    }
+
+    /// The progress bar divides real elapsed time by these, so an estimate that
+    /// is wrong by a factor draws a bar that is wrong by a factor.
+    #[test]
+    fn a_runs_estimated_duration_matches_its_schedule() {
+        // 13 dwells of 0.3 s, plus travel of one 0.05 rad gap at 0.5 rad/s
+        // (0.1 s) before each, both ways: 13 × 0.4 × 2 = 10.4 s.
+        let (d, bound) = CharacterizeJob::LoadMap {
+            from_rad: -0.3,
+            to_rad: 0.3,
+            steps: 13,
+            settle_s: 0.3,
+            max_speed_rad_s: 0.5,
+            return_sweep: true,
+        }
+        .expected_duration();
+        assert!((d.as_secs_f32() - 10.4).abs() < 0.1, "{d:?}");
+        assert!(!bound, "a load map dwells to a fixed schedule");
+
+        // ±0.2 rad at 0.05 rad/s is 8 s one way, 16 s both.
+        let (d, _) = CharacterizeJob::VelocitySweep {
+            half_span_rad: 0.2,
+            speed_rad_s: 0.05,
+            rate_hz: 200.0,
+            return_sweep: true,
+            bins: 12,
+        }
+        .expected_duration();
+        assert!((d.as_secs_f32() - 16.0).abs() < 0.1, "{d:?}");
+
+        // 9 levels × 0.4 s.
+        let (d, _) = CharacterizeJob::Kt {
+            max_torque_nm: 1.2,
+            steps: 9,
+            settle_s: 0.4,
+            rate_hz: 100.0,
+            leash_kp: 8.0,
+            leash_kd: 0.5,
+        }
+        .expected_duration();
+        assert!((d.as_secs_f32() - 3.6).abs() < 0.05, "{d:?}");
+
+        // 1 N·m at 0.2 N·m/s is 5 s of ramp — but only if the shaft never
+        // breaks loose, which is the whole point of the run, so it is a
+        // ceiling and must say so.
+        let (d, bound) = CharacterizeJob::Breakaway {
+            ramp_nm_per_s: 0.2,
+            max_torque_nm: 1.0,
+            positive: true,
+            rate_hz: 200.0,
+        }
+        .expected_duration();
+        assert!((d.as_secs_f32() - 5.0).abs() < 0.05, "{d:?}");
+        assert!(bound, "a breakaway ramp normally ends early");
+    }
+
+    /// A zero or absurd parameter must yield "no estimate" rather than an
+    /// infinity that a progress bar would divide by.
+    #[test]
+    fn a_run_that_cannot_be_estimated_says_zero() {
+        let (d, _) = CharacterizeJob::VelocitySweep {
+            half_span_rad: 0.2,
+            speed_rad_s: 0.0,
+            rate_hz: 200.0,
+            return_sweep: true,
+            bins: 12,
+        }
+        .expected_duration();
+        assert_eq!(d, Duration::ZERO);
+
+        let (d, _) = CharacterizeJob::Breakaway {
+            ramp_nm_per_s: 0.0,
+            max_torque_nm: 1.0,
+            positive: true,
+            rate_hz: 200.0,
+        }
+        .expected_duration();
+        assert_eq!(d, Duration::ZERO);
+
+        // NaN in, zero out — not a panic from `Duration::from_secs_f32`.
+        let (d, _) = CharacterizeJob::Kt {
+            max_torque_nm: 1.2,
+            steps: 9,
+            settle_s: f32::NAN,
+            rate_hz: 100.0,
+            leash_kp: 8.0,
+            leash_kd: 0.5,
+        }
+        .expected_duration();
+        assert_eq!(d, Duration::ZERO);
     }
 }

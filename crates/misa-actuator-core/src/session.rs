@@ -182,6 +182,19 @@ impl Session {
         self.events.try_iter().collect()
     }
 
+    /// How far a running measurement has got: `(elapsed, expected, expected is
+    /// a ceiling, bus transactions)`. `None` when no job is running.
+    ///
+    /// Read from shared state instead of arriving as an event, because a
+    /// quasi-static run blocks the worker for its whole duration — the worker
+    /// physically cannot send a progress event until it has finished, at which
+    /// point progress is not what anyone needs. A zero `expected` means the run
+    /// offered no estimate, and a caller must show elapsed time rather than
+    /// invent a fraction.
+    pub fn job_progress(&self) -> Option<(Duration, Duration, bool, u32)> {
+        self.shared.safety.job_progress()
+    }
+
     /// Take every telemetry batch pending. Batches arrive at roughly frame
     /// rate; a UI that calls this once per frame usually gets one.
     pub fn drain_telemetry(&self) -> Vec<TelemetryBatch> {

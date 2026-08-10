@@ -72,6 +72,24 @@ pub(crate) struct Safety {
     /// jobs today: it is an input to [`Self::watchdog_tripped`], and the point of
     /// this type is that the watchdog has one definition.
     job_active: AtomicBool,
+    /// Session-relative ms at which the running job began.
+    ///
+    /// Progress for a quasi-static run has to be read from outside the worker,
+    /// because the worker is blocked inside a `misa_sysid` call for the whole
+    /// run and cannot send an event until it returns. So it lands here, where
+    /// the session handle can read it on a poll.
+    job_started_ms: AtomicU64,
+    /// What the job expects to take, in ms. 0 means no estimate.
+    job_expected_ms: AtomicU64,
+    /// Whether [`Self::job_expected_ms`] is a ceiling rather than a schedule.
+    job_expected_is_bound: AtomicBool,
+    /// Bus transactions the running job has completed.
+    ///
+    /// The point of counting them is that elapsed time alone cannot tell a run
+    /// in progress from a bus that has gone silent — and a motor going quiet
+    /// mid-operation is a thing that has actually happened here more than once.
+    /// A bar that advances on a dead bus is worse than no bar.
+    job_transactions: AtomicU32,
     stop: AtomicBool,
     stop_reason: AtomicU8,
     rate_millihz: AtomicU32,
@@ -88,6 +106,10 @@ impl Safety {
             started: Instant::now(),
             streaming: AtomicBool::new(false),
             job_active: AtomicBool::new(false),
+            job_started_ms: AtomicU64::new(0),
+            job_expected_ms: AtomicU64::new(0),
+            job_expected_is_bound: AtomicBool::new(false),
+            job_transactions: AtomicU32::new(0),
             stop: AtomicBool::new(false),
             stop_reason: AtomicU8::new(STOP_NONE),
             rate_millihz: AtomicU32::new(rate_to_millihz(rate_hz)),
@@ -178,6 +200,51 @@ impl Safety {
 
     pub(crate) fn job_active(&self) -> bool {
         self.job_active.load(Ordering::Acquire)
+    }
+
+    /// Mark a job as starting now, resetting its progress.
+    ///
+    /// `expected` of `None` (or a zero duration) means "no estimate", which a
+    /// reader must render as elapsed time rather than as a fraction.
+    pub(crate) fn begin_job(&self, expected: Option<(Duration, bool)>) {
+        self.job_transactions.store(0, Ordering::Release);
+        let (ms, bound) = match expected {
+            Some((d, bound)) => (d.as_millis() as u64, bound),
+            None => (0, false),
+        };
+        self.job_expected_ms.store(ms, Ordering::Release);
+        self.job_expected_is_bound.store(bound, Ordering::Release);
+        // Written last, so a reader that sees a start time also sees the
+        // estimate and a zeroed count that belong to the same job.
+        self.job_started_ms
+            .store(self.elapsed().as_millis() as u64, Ordering::Release);
+        self.set_job_active(true);
+    }
+
+    /// Count one completed bus transaction against the running job.
+    pub(crate) fn job_transaction(&self) {
+        self.job_transactions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How far the running job has got: `(elapsed, expected, is_bound, transactions)`.
+    ///
+    /// `None` when no job is running. `expected` is zero when the run gave no
+    /// estimate.
+    pub(crate) fn job_progress(&self) -> Option<(Duration, Duration, bool, u32)> {
+        if !self.job_active() {
+            return None;
+        }
+        let started = self.job_started_ms.load(Ordering::Acquire);
+        let elapsed = self
+            .elapsed()
+            .as_millis()
+            .saturating_sub(started as u128) as u64;
+        Some((
+            Duration::from_millis(elapsed),
+            Duration::from_millis(self.job_expected_ms.load(Ordering::Acquire)),
+            self.job_expected_is_bound.load(Ordering::Acquire),
+            self.job_transactions.load(Ordering::Relaxed),
+        ))
     }
 
     /// Whether anything is actually being driven, and so whether the watchdog

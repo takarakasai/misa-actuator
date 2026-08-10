@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use misa_actuator::realtime::{sleep_until, TimerResolutionGuard};
-use misa_actuator::{Actuator, Error as ActuatorError};
+use misa_actuator::{Actuator, Error as ActuatorError, MotorFeedback, RunMode};
 
 use crate::protocol::*;
 use crate::safety::Safety;
@@ -39,6 +39,99 @@ fn excitation_of(job: &ChirpJob) -> misa_sysid::Excitation {
             kp: job.kp,
             kd: job.kd,
         },
+    }
+}
+
+/// An [`Actuator`] that tallies every command it forwards.
+///
+/// Wrapped around the real one for the duration of a characterization run, so a
+/// progress display can show bus traffic and not only a clock. Nothing in
+/// `misa_sysid` reports progress — its runs are blocking calls that return once
+/// — and rather than thread a callback through four signatures and their tests,
+/// the count comes from the one thing the run cannot avoid touching.
+///
+/// Every method forwards unchanged. Only the ones that put a frame on the bus
+/// count; `motor_id` and the two hints are local reads.
+struct Counting<'a> {
+    inner: &'a mut (dyn Actuator + Send),
+    safety: &'a Safety,
+}
+
+impl Counting<'_> {
+    fn tally<T>(&self, r: T) -> T {
+        self.safety.job_transaction();
+        r
+    }
+}
+
+impl Actuator for Counting<'_> {
+    fn motor_id(&self) -> u8 {
+        self.inner.motor_id()
+    }
+    fn enable(&mut self) -> misa_actuator::Result<MotorFeedback> {
+        let r = self.inner.enable();
+        self.tally(r)
+    }
+    fn disable(&mut self) -> misa_actuator::Result<()> {
+        let r = self.inner.disable();
+        self.tally(r)
+    }
+    fn set_zero(&mut self) -> misa_actuator::Result<()> {
+        let r = self.inner.set_zero();
+        self.tally(r)
+    }
+    fn set_run_mode(&mut self, mode: RunMode) -> misa_actuator::Result<()> {
+        let r = self.inner.set_run_mode(mode);
+        self.tally(r)
+    }
+    fn set_position(
+        &mut self,
+        pos_rad: f32,
+        max_speed_rad_s: f32,
+    ) -> misa_actuator::Result<MotorFeedback> {
+        let r = self.inner.set_position(pos_rad, max_speed_rad_s);
+        self.tally(r)
+    }
+    fn set_velocity(&mut self, vel_rad_s: f32) -> misa_actuator::Result<MotorFeedback> {
+        let r = self.inner.set_velocity(vel_rad_s);
+        self.tally(r)
+    }
+    fn set_torque(&mut self, torque_nm: f32) -> misa_actuator::Result<MotorFeedback> {
+        let r = self.inner.set_torque(torque_nm);
+        self.tally(r)
+    }
+    fn mit_control(
+        &mut self,
+        pos_rad: f32,
+        vel_rad_s: f32,
+        kp: f32,
+        kd: f32,
+        torque_ff_nm: f32,
+    ) -> misa_actuator::Result<MotorFeedback> {
+        let r = self
+            .inner
+            .mit_control(pos_rad, vel_rad_s, kp, kd, torque_ff_nm);
+        self.tally(r)
+    }
+    fn measure(&mut self) -> misa_actuator::Result<MotorFeedback> {
+        let r = self.inner.measure();
+        self.tally(r)
+    }
+    fn read_status(&mut self) -> misa_actuator::Result<misa_actuator::MotorStatus> {
+        let r = self.inner.read_status();
+        self.tally(r)
+    }
+    fn current_run_mode_hint(&self) -> Option<RunMode> {
+        self.inner.current_run_mode_hint()
+    }
+    fn is_enabled_hint(&self) -> bool {
+        self.inner.is_enabled_hint()
+    }
+    fn set_report_current(&mut self, on: bool) {
+        self.inner.set_report_current(on);
+    }
+    fn set_torque_constant(&mut self, kt_nm_per_a: f32) {
+        self.inner.set_torque_constant(kt_nm_per_a);
     }
 }
 
@@ -615,7 +708,7 @@ impl Worker {
     fn run_characterize(&mut self, run: CharacterizeJob, envelope: RunEnvelope) {
         let _ = self.shared.safety.take_stop();
         self.shared.safety.set_streaming(false);
-        self.shared.safety.set_job_active(true);
+        self.shared.safety.begin_job(Some(run.expected_duration()));
         self.shared.safety.beat();
         let _ = self.events.send(Event::JobStarted {
             spec: JobSpec::Characterize { run, envelope },
@@ -692,7 +785,15 @@ impl Worker {
                     return_sweep,
                     ..misa_sysid::LoadMapSpec::symmetric(0.5, 2)
                 };
-                misa_sysid::run_load_map(self.actuator.as_mut(), &spec, limits, self.shared.safety.abort_flag())
+                misa_sysid::run_load_map(
+                    &mut Counting {
+                        inner: self.actuator.as_mut(),
+                        safety: &self.shared.safety,
+                    },
+                    &spec,
+                    limits,
+                    self.shared.safety.abort_flag(),
+                )
                     .map(|m| {
                         note_abort(m.abort);
                         load_map_data(m)
@@ -712,7 +813,10 @@ impl Worker {
                     return_sweep,
                 };
                 misa_sysid::run_velocity_sweep(
-                    self.actuator.as_mut(),
+                    &mut Counting {
+                        inner: self.actuator.as_mut(),
+                        safety: &self.shared.safety,
+                    },
                     &spec,
                     limits,
                     self.shared.safety.abort_flag(),
@@ -738,7 +842,15 @@ impl Worker {
                     rate_hz,
                     ..misa_sysid::BreakawaySpec::slow(max_torque_nm, direction)
                 };
-                misa_sysid::run_breakaway(self.actuator.as_mut(), &spec, limits, self.shared.safety.abort_flag())
+                misa_sysid::run_breakaway(
+                    &mut Counting {
+                        inner: self.actuator.as_mut(),
+                        safety: &self.shared.safety,
+                    },
+                    &spec,
+                    limits,
+                    self.shared.safety.abort_flag(),
+                )
                     .map(|b| {
                         note_abort(b.abort);
                         breakaway_data(b)
@@ -784,7 +896,15 @@ impl Worker {
                     leash_kp,
                     leash_kd,
                 };
-                misa_sysid::run_kt(self.actuator.as_mut(), &spec, limits, self.shared.safety.abort_flag())
+                misa_sysid::run_kt(
+                    &mut Counting {
+                        inner: self.actuator.as_mut(),
+                        safety: &self.shared.safety,
+                    },
+                    &spec,
+                    limits,
+                    self.shared.safety.abort_flag(),
+                )
                     .map(|k| {
                         note_abort(k.abort);
                         let (data, note, kt) = kt_data(k);

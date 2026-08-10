@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use misa_actuator::Actuator;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use damiao_driver::{DamiaoMotor, MotorModel as DmModel};
 use lkmotor_driver::{LkMotor, MotorConfig as LkMotorConfig, MotorId as LkMotorId};
@@ -57,7 +57,10 @@ fn simulated_bus_ids(preset_ids: &[u8], bound_id: u8) -> Vec<u8> {
     ids
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+// Serialize as well as Deserialize: a multi-motor reading names the family it
+// came from, so a mixed wire can be labelled on screen. The kebab-case rename
+// makes that match `as_str` below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[serde(rename_all = "kebab-case")]
 pub enum DriverKind {

@@ -56,6 +56,7 @@
 
 pub mod factory;
 pub mod multi;
+pub mod multi_session;
 pub mod protocol;
 pub mod session;
 pub(crate) mod worker;

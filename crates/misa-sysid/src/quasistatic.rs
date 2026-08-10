@@ -642,15 +642,42 @@ pub fn run_breakaway(
     let period = Duration::from_secs_f32(1.0 / spec.rate_hz.max(1.0));
     let rest_deadline = Instant::now() + Duration::from_secs_f32(spec.rest_timeout_s.max(0.0));
     let rest_window = Duration::from_secs_f32(spec.rest_window_s.max(0.0));
-    let mut still_since: Option<Instant> = None;
+    // Stillness is judged by **position**, not by the reported velocity.
+    //
+    // The velocity field is not trustworthy across this workspace: some
+    // RobStride firmware reports an exact zero in most frames — which passes a
+    // velocity test trivially — while other units carry noise above any useful
+    // threshold and never pass it. The same test therefore gave opposite
+    // verdicts on the same bench: on 2026-08-08 a MyActuator was judged rested
+    // and all three RobStrides beside it were not, in one batch, with no
+    // mechanical difference to explain it. `run_velocity_sweep`'s stall check
+    // was moved to position for exactly this reason; this one had been left
+    // behind.
+    //
+    // The threshold is the same `motion_threshold_rad` the ramp uses to decide
+    // the shaft *has* moved, so "still" and "moving" are two sides of one
+    // measurement rather than two unrelated ones. Over the default 0.3 s window
+    // that allows about 0.067 rad/s of drift — close to the 0.05 rad/s the
+    // velocity test used to permit, so the standard has not quietly changed.
+    let mut still_since: Option<(Instant, f32)> = None;
     let mut fb = act.set_torque(0.0)?;
     let rested = loop {
-        if fb.velocity_rad_per_s.abs() <= spec.motion_threshold_rad_per_s {
-            let since = *still_since.get_or_insert_with(Instant::now);
+        let anchored = still_since.filter(|&(_, at)| {
+            fb.position_rad.is_finite()
+                && (fb.position_rad - at).abs() <= spec.motion_threshold_rad
+        });
+        if let Some((since, _)) = anchored {
+            still_since = anchored;
             if since.elapsed() >= rest_window {
                 break true;
             }
+        } else if fb.position_rad.is_finite() {
+            // Drifted past the threshold, or this is the first sample: start
+            // the window again from where the shaft is now.
+            still_since = Some((Instant::now(), fb.position_rad));
         } else {
+            // A rig that reports no position cannot be judged still. Saying so
+            // beats calling it rested on the strength of a NaN.
             still_since = None;
         }
         if Instant::now() >= rest_deadline || abort.load(Ordering::Relaxed) {
@@ -2416,7 +2443,17 @@ mod tests {
     #[test]
     fn breakaway_flags_a_shaft_that_never_rests() {
         /// Always moving.
-        struct Spinning;
+        /// A shaft that keeps turning while the run waits for it to settle.
+        ///
+        /// The position advances, which is what "never rests" now means: the
+        /// check reads position rather than the velocity field, because that
+        /// field gave opposite verdicts on two families of the same bench
+        /// (2026-08-08). This rig used to report a *stationary* position with a
+        /// non-zero velocity — a combination no real shaft has, and one that
+        /// only tested the field that turned out not to be trustworthy.
+        struct Spinning {
+            pos: f32,
+        }
         impl Actuator for Spinning {
             fn motor_id(&self) -> u8 {
                 1
@@ -2453,8 +2490,11 @@ mod tests {
                 self.measure()
             }
             fn measure(&mut self) -> Result<MotorFeedback> {
+                // Well past `motion_threshold_rad` per sample, so no window
+                // ever closes however often it is restarted.
+                self.pos += 0.1;
                 Ok(MotorFeedback {
-                    position_rad: 0.0,
+                    position_rad: self.pos,
                     velocity_rad_per_s: 1.0,
                     torque_nm: 0.0,
                     current_a: f32::NAN,
@@ -2476,8 +2516,91 @@ mod tests {
             rest_timeout_s: 0.05, // gives up almost immediately
             ..BreakawaySpec::slow(1.0, Direction::Positive)
         };
-        let r = run_breakaway(&mut Spinning, &spec, roomy(), &no_abort()).unwrap();
+        let r = run_breakaway(&mut Spinning { pos: 0.0 }, &spec, roomy(), &no_abort()).unwrap();
         assert!(!r.rested, "must record that stillness was never reached");
+    }
+
+    /// A still shaft whose velocity field is noise must still count as rested.
+    ///
+    /// This is the case the check was getting wrong. On 2026-08-08 the same
+    /// batch judged a MyActuator rested and all three RobStrides beside it not,
+    /// with no mechanical difference between them — the RobStrides' velocity
+    /// field simply carries noise above the threshold. A shaft whose position
+    /// does not move is at rest whatever its velocity field claims.
+    #[test]
+    fn a_still_shaft_is_rested_even_if_its_velocity_field_is_noise() {
+        struct NoisyVelocity {
+            n: u32,
+        }
+        impl Actuator for NoisyVelocity {
+            fn motor_id(&self) -> u8 {
+                1
+            }
+            fn enable(&mut self) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn disable(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_zero(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_run_mode(&mut self, _m: RunMode) -> Result<()> {
+                Ok(())
+            }
+            fn set_position(&mut self, _p: f32, _s: f32) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn set_velocity(&mut self, _v: f32) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn set_torque(&mut self, _t: f32) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn mit_control(
+                &mut self,
+                _p: f32,
+                _v: f32,
+                _kp: f32,
+                _kd: f32,
+                _t: f32,
+            ) -> Result<MotorFeedback> {
+                self.measure()
+            }
+            fn measure(&mut self) -> Result<MotorFeedback> {
+                self.n += 1;
+                Ok(MotorFeedback {
+                    // Dead still — the encoder does not move at all.
+                    position_rad: 0.25,
+                    // …while the velocity field alternates well past any
+                    // sensible threshold.
+                    velocity_rad_per_s: if self.n % 2 == 0 { 0.9 } else { -0.9 },
+                    torque_nm: 0.0,
+                    current_a: f32::NAN,
+                    temperature_c: 30.0,
+                })
+            }
+            fn read_status(&mut self) -> Result<misa_actuator::MotorStatus> {
+                Ok(misa_actuator::MotorStatus {
+                    voltage_v: 24.0,
+                    temperature_c: 30.0,
+                    error: Default::default(),
+                })
+            }
+        }
+
+        let spec = BreakawaySpec {
+            ramp_nm_per_s: 50.0,
+            rate_hz: 2000.0,
+            rest_window_s: 0.05,
+            rest_timeout_s: 2.0,
+            ..BreakawaySpec::slow(1.0, Direction::Positive)
+        };
+        let r = run_breakaway(&mut NoisyVelocity { n: 0 }, &spec, roomy(), &no_abort()).unwrap();
+        assert!(
+            r.rested,
+            "a shaft whose position never moved was judged not at rest"
+        );
     }
 
     /// With a leash the run must drive `mit_control`, not `set_torque`: that is

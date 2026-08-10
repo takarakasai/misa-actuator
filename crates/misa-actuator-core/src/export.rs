@@ -38,6 +38,10 @@ pub const DATA_DIR_ENV: &str = "MISA_ACTUATOR_DATA_DIR";
 /// last resort only when the environment names no home at all, because losing
 /// the run outright would be worse than putting it somewhere awkward.
 pub fn data_dir() -> PathBuf {
+    // Order matters, most explicit first. The environment beats the remembered
+    // choice so a scripted campaign can redirect one run without disturbing what
+    // the operator picked in the app.
+    //
     // Whitespace-only is treated as unset: an exported-but-empty variable is a
     // shell accident, and writing to the process's working directory because of
     // one would scatter runs wherever the app happened to be launched from.
@@ -47,12 +51,80 @@ pub fn data_dir() -> PathBuf {
             return dir;
         }
     }
+    if let Some(dir) = remembered_dir() {
+        return dir;
+    }
+    default_dir()
+}
+
+/// Whether [`data_dir`] is answering with something that was chosen, rather than
+/// the default. A UI should be able to say which.
+pub fn data_dir_is_chosen() -> bool {
+    std::env::var_os(DATA_DIR_ENV)
+        .map(|v| !v.to_string_lossy().trim().is_empty())
+        .unwrap_or(false)
+        || remembered_dir().is_some()
+}
+
+/// The fallback: under the user's home.
+///
+/// Not beside the executable, which is often read-only once installed, and not
+/// under a temp directory, which is the one place measurements are expected to
+/// disappear from. Temp is the last resort only when the environment names no
+/// home at all, because losing the run outright would be worse than putting it
+/// somewhere awkward.
+fn default_dir() -> PathBuf {
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from);
     match home {
         Some(h) => h.join("misa-actuator-data"),
         None => std::env::temp_dir().join("misa-actuator-data"),
+    }
+}
+
+/// Where the remembered choice is kept.
+///
+/// Beside the default output directory rather than in a config directory of its
+/// own: one place to look, and a settings file that travels with the data it
+/// describes is easier to reason about than one that does not.
+fn settings_path() -> PathBuf {
+    default_dir().join("output-dir.txt")
+}
+
+/// The directory the operator last chose, if it is still usable.
+///
+/// A remembered path that has since been deleted or unmounted returns `None`
+/// rather than being honoured: a run written into a recreated stub of a path that
+/// used to be a network share is a run in a place nobody will look. Falling back
+/// to the default is visible in the UI, which says whether the location was
+/// chosen.
+fn remembered_dir() -> Option<PathBuf> {
+    let text = fs::read_to_string(settings_path()).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let dir = PathBuf::from(trimmed);
+    dir.is_dir().then_some(dir)
+}
+
+/// Remember `dir` as where runs go, or forget the choice with `None`.
+///
+/// Verified before it is stored — a path that cannot be created is not a setting,
+/// it is a run that will fail later with nothing on screen explaining why.
+pub fn set_data_dir(dir: Option<PathBuf>) -> io::Result<()> {
+    let path = settings_path();
+    match dir {
+        Some(dir) => {
+            fs::create_dir_all(&dir)?;
+            fs::create_dir_all(default_dir())?;
+            fs::write(path, dir.display().to_string())
+        }
+        None => match fs::remove_file(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        },
     }
 }
 
@@ -239,6 +311,36 @@ mod tests {
         assert!(data_dir().ends_with("misa-actuator-data"), "{:?}", data_dir());
 
         set(restore.as_deref().and_then(|s| s.to_str()));
+    }
+
+    /// A remembered directory has to survive a restart, or picking one is
+    /// theatre — and a remembered one that has gone away must not be honoured.
+    #[test]
+    fn a_chosen_directory_is_remembered_and_a_vanished_one_is_not() {
+        // The settings file lives beside the default output directory, so this
+        // touches real paths. Restored at the end.
+        let restore = fs::read_to_string(settings_path()).ok();
+        let chosen = std::env::temp_dir().join(format!("misa-chosen-{}", now_secs()));
+
+        set_data_dir(Some(chosen.clone())).expect("remember");
+        assert_eq!(remembered_dir(), Some(chosen.clone()));
+        assert!(data_dir_is_chosen());
+
+        // Gone since it was chosen — a network share that is no longer mounted,
+        // say. Honouring it would write runs into a recreated stub nobody looks
+        // in, so it falls back and the UI can say the location is not chosen.
+        fs::remove_dir_all(&chosen).expect("remove");
+        assert_eq!(remembered_dir(), None);
+        assert_eq!(data_dir(), default_dir());
+
+        set_data_dir(None).expect("forget");
+        assert_eq!(remembered_dir(), None);
+        // Forgetting twice is not an error.
+        set_data_dir(None).expect("forget again");
+
+        if let Some(text) = restore {
+            fs::write(settings_path(), text).ok();
+        }
     }
 
     #[test]

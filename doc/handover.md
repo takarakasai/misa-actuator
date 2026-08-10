@@ -73,10 +73,12 @@ Linux/SocketCAN 専用だったワークスペースを Windows に移植し、�
 
 ### 補足
 
-- インストーラは 2026-08-02 に再ビルド済みで、接続失敗バナー（`6d42be7`）が入っている。
-  `misa-actuator_0.1.0_x64-setup.exe`（2.57 MB）と自己完結 exe（11.4 MB）。
+- インストーラは **2026-08-05 に再ビルド済みで、Multi タブが入っている**。
+  `misa-actuator_0.1.0_x64-setup.exe`（2.63 MB）と自己完結 exe（11.72 MB）。
   **ユーザー単位インストール**（`INSTALLMODE currentUser`、マニフェストは `asInvoker`）
-  なので昇格は不要で、`%LOCALAPPDATA%\misa-actuator` と HKCU にしか触らない
+  なので昇格は不要で、`%LOCALAPPDATA%\misa-actuator` と HKCU にしか触らない。
+  **機能を足したらここを再ビルドすること** — 2 回続けて、実装済みの機能が
+  インストーラに入っていない状態で放置している（接続失敗バナー、Multi タブ）
 - `crates/` と `ui/src/` に **TODO/FIXME/`#[ignore]` は 1 件も無い**。
   隠れたバックログは無く、§9 の表が全部。なお `cargo test --workspace` が報告する
   ignored 1 件は `misa-actuator/src/shared.rs` の ` ```ignore ` doc fence（説明用の
@@ -321,6 +323,13 @@ Tauri 版には `assets/index-*.js` の名前が入っているが cargo 版に�
   初回応答前は 0 ではなく「never」
 - **通電の警告は決める場所に置く。** DAMIAO のチェックボックスに `ENERGISES` の
   タグ、その社を選んでいる間だけ理由付きの 1 行が出る。外すと消える
+- **レートは streaming 中しか出さない。** `achieved_rate_hz` は**ループの**レートで、
+  パスが実際に交換するのは駆動中のモータだけ。idle では 200 Hz と出るが実際の
+  読み出しは 50 ms 毎（20 Hz）なので**10 倍の過大表示**になる。**2026-08-05 に
+  リリースビルドのスクリーンショットで見つけた** — 同じ画面の `AGE` 列が 14〜19 ms
+  で、表示と矛盾していた。Console タブは元から
+  `idle (polling at 20 Hz)` と出し分けていたので、そちらに合わせた
+  （[ConsoleTab.tsx:226-227](../ui/src/components/ConsoleTab.tsx#L226-L227)）
 
 **検証はシミュレータ 4 台のみ。** CAN 3 社のチェックを外してスキャン → 4 台接続 →
 一括 Enable → モータ 1 だけに 0.75 rad → モータ 1 の角度が 0.750、他の 3 台は

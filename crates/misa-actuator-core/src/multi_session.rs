@@ -111,8 +111,16 @@ pub struct MultiSnapshot {
     /// Seconds since the session opened.
     pub t_s: f64,
     pub motors: Vec<MotorReading>,
-    /// Passes completed per second, measured. A pass visits every motor, so
-    /// this is the per-motor update rate and it falls as motors are added.
+    /// Passes completed per second, measured. Falls as motors are added,
+    /// because a pass has to visit all of them.
+    ///
+    /// **This is the loop rate, not always the per-motor update rate.** A pass
+    /// only transacts with a motor that is being driven; an idle one is read on
+    /// [`IDLE_POLL`] and skipped the rest of the time. So while streaming this
+    /// is what each enabled motor sees, and while idle it overstates it by the
+    /// ratio of the two — which is why the UI shows it only while streaming.
+    /// Per-motor freshness is [`MotorReading::age_ms`], which is measured rather
+    /// than inferred.
     pub achieved_rate_hz: f32,
     /// Snapshots dropped because the consumer was behind.
     pub dropped: u64,

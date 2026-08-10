@@ -9,7 +9,7 @@
 
   Source : doc/architecture.md
   Command: node scripts/md2html.js doc/architecture.md
-  Built  : 2026-08-04 15:20 UTC
+  Built  : 2026-08-04 15:30 UTC
 
   Every edit made here is destroyed the next time the command above runs.
   Change the markdown instead.
@@ -431,6 +431,8 @@ pre.mermaid svg { max-width: 100%; height: auto; }
 
 <p><strong>深さ 2 と poll 100 ms は同じ判断から来ている。</strong> プロットが無いので、欲しいのは常に最新の 1 枚で、古い読み値には価値が無い。逆に <code>achieved_rate_hz</code> と <code>starved</code> は出す — 台数で割られたレートを黙って報告しないと、数字の意味が変わったことに気付けない。</p>
 
+<p><strong><code>achieved_rate_hz</code> はループのレートで、常に「モータ毎の更新レート」ではない。</strong> パスが実際に交換するのは<strong>駆動中のモータだけ</strong>で、そうでないものは <code>IDLE_POLL</code> （50 ms）でしか読まない。したがって streaming 中は enable されたモータの更新レートに一致するが、<strong>idle では 10 倍過大</strong>になる。だから UI は streaming 中しか出さない（Console タブと同じ扱い）。<strong>モータ毎の鮮度は <code>age_ms</code></strong> — 推定ではなく実測。</p>
+
 <p><strong>Windows ではタイマ分解能を明示的に上げている。</strong> 既定の sleep は ~15.6 ms に丸められ、それだけで制御ループが 64 Hz に張り付く。worker は起動時に <code>TimerResolutionGuard</code> を取る（<a href="../crates/misa-actuator-core/src/worker.rs#L260-L262">worker.rs:260-262</a>）。</p>
 
 <hr>
@@ -442,7 +444,7 @@ pre.mermaid svg { max-width: 100%; height: auto; }
 <ul>
 <li><strong>セッションのスロットは 2 つで、同時に開けるのは 1 つ。</strong> <code>AppState</code> は <code>Mutex&lt;Option&lt;Session&gt;&gt;</code>（既存 5 タブ、1 モータ）と <code>Mutex&lt;Option&lt;MultiSession&gt;&gt;</code> （Multi タブ、N モータ）を別々に持つ（<a href="../crates/misa-actuator-gui/src/lib.rs">lib.rs</a>）。 <strong>1 CAN チャネルの所有者は 1 つ</strong>なので、片方が開いていればもう片方は <code>PCAN_ERROR_NETINUSE</code> になる。UI は開いている側を指して断る（<code>open_elsewhere</code>）</li>
 <li><strong><code>Session</code> と <code>MultiSession</code> は別実装で、worker / watchdog / 停止経路が二重にある。</strong> 既存 5 タブの配線契約を守るための意図的な判断だが、<strong>安全に関わる部分が 2 箇所にある</strong>のは重複の中でも最悪の種類。出口は <code>build_actuator</code> の「開く」と「束ねる」の分離と、worker の 1..N 対応で、単体を N=1 の薄いラッパにすること</li>
-<li><strong>1 バスに複数モータでも、同時に 1 交換しか流せない。</strong> 逐次に回すのが安全の根拠なので、レートは台数で割られる（4 台なら 1 台あたり約 1/4）。さらに <strong>1 交換はバスのタイムアウト全部を使い得る</strong>（タイムアウトは共有トランスポートの持ち物で、モータ毎には設定できない）。<code>Worker::pass()</code> の予算は <strong>何台が遅れるかを縛るだけで、1 回の長さは縛らない</strong> — モータ毎タイムアウトはトランスポート側の変更が要る</li>
+<li><strong>1 バスに複数モータでも、同時に 1 交換しか流せない。</strong> 逐次に回すのが安全の根拠なので、<strong>達成し得る</strong>レートは台数で割られる（1 交換に t 掛かるなら、 N 台のパスレートの上限は <code>1/(N·t)</code>）。<strong>ワイヤが十分速ければ設定した tick がそのまま出る</strong> — シミュレータ 4 台では 200 Hz のまま。頭打ちになったかどうかは <code>achieved_rate_hz</code> と <code>starved</code> を見て判断する（設定値との比較では分からない）。さらに <strong>1 交換はバスのタイムアウト全部を使い得る</strong>（タイムアウトは共有トランスポートの持ち物で、モータ毎には設定できない）。<code>Worker::pass()</code> の予算は <strong>何台が遅れるかを縛るだけで、1 回の長さは縛らない</strong> — モータ毎タイムアウトはトランスポート側の変更が要る</li>
 <li><strong>測定ジョブは worker のループを占有する。</strong> 数十秒間、通常の制御ティックは回らない。<code>job_active</code> フラグはそれを外から知るための手段</li>
 <li><strong><code>Shared&lt;T&gt;</code> の要求と応答は原子的ではない。</strong> 同一バスでモータごとにスレッドを立てることは可能だが推奨しない</li>
 <li><strong>停止は「ソフトウェアが指令を出すのをやめる」までを保証する。</strong> 無励磁のラッチではない（handover §2）</li>

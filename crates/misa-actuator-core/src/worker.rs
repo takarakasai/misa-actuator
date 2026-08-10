@@ -866,7 +866,7 @@ impl Worker {
                     .map(|b| {
                         note_abort(b.abort);
                         keep(&b.points);
-                        breakaway_data(b)
+                        breakaway_data(b, ceiling_nm)
                     })
             }
             CharacterizeJob::BreakawayMap {
@@ -1515,7 +1515,12 @@ fn velocity_sweep_data(v: misa_sysid::VelocitySweep, bins: usize) -> (Characteri
     )
 }
 
-fn breakaway_data(b: misa_sysid::Breakaway) -> (CharacterizeData, String) {
+fn breakaway_data(b: misa_sysid::Breakaway, envelope_ceiling_nm: f32) -> (CharacterizeData, String) {
+    // What the ramp could actually reach. `run_breakaway` clamps its own ceiling
+    // to the envelope's, so a run asked for 20 N·m inside a 12 N·m envelope only
+    // ever tried 12 — and saying "not reached below 20" would credit it with a
+    // push it never made.
+    let reached_nm = b.spec.max_torque_nm.min(envelope_ceiling_nm);
     let x: Vec<f32> = b.points.iter().map(|p| p.t_s).collect();
     let y: Vec<f32> = b.points.iter().map(|p| p.cmd).collect();
     let measured: Vec<f32> = b.points.iter().map(|p| p.torque_nm).collect();
@@ -1542,7 +1547,7 @@ fn breakaway_data(b: misa_sysid::Breakaway) -> (CharacterizeData, String) {
             // means the ramp ran out before anything moved.
             summary.push((
                 "breakaway torque".to_string(),
-                format!("not reached below {:.3} N·m{caveat}", b.spec.max_torque_nm),
+                format!("not reached below {reached_nm:.3} N·m{caveat}"),
             ));
             "did not break loose within the torque ceiling".to_string()
         }

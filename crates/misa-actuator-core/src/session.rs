@@ -328,6 +328,34 @@ mod tests {
         assert!(samples.is_some(), "no idle telemetry");
     }
 
+    /// The Monitor tab is built entirely on this event, and it polls for it
+    /// rather than receiving it with telemetry. If `ReadStatus` stopped
+    /// answering, the tab would sit on "waiting for the first status read"
+    /// forever without anything looking broken.
+    #[test]
+    fn read_status_answers_with_a_usable_health_snapshot() {
+        let session = Session::connect(&sim_config()).expect("connect");
+        session.send(Command::ReadStatus).expect("send");
+
+        let status = wait_event(&session, Duration::from_secs(2), |e| {
+            matches!(e, Event::Status(_))
+        })
+        .expect("no Status event");
+        let Event::Status(s) = status else {
+            unreachable!("filtered above")
+        };
+
+        // Values a health view can actually render, rather than zeroes that
+        // would render as a plausible-looking dead motor.
+        assert!(s.voltage_v > 1.0, "voltage {} looks unreported", s.voltage_v);
+        assert!(
+            (-40.0..150.0).contains(&s.temperature_c),
+            "temperature {} is outside anything physical",
+            s.temperature_c
+        );
+        assert_eq!(s.error_bits, 0, "an idle simulated motor should be clean");
+    }
+
     #[test]
     fn a_bad_configuration_fails_at_connect_rather_than_later() {
         let cfg = DriverConfig {

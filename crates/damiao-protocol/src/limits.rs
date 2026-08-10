@@ -77,6 +77,45 @@ pub enum LimitsSource {
 /// Kp/Kd quantization ranges are global across the family (`[0,500]` /
 /// `[0,5]`); only P/V/T differ per model — and those are register-backed, so
 /// see [`LimitsSource`] before trusting [`Self::limits`].
+/// Which hardware generation a firmware series code belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hardware {
+    /// V2 hardware, codes `31xx`–`34xx`.
+    V2,
+    /// V3 hardware, codes `50xx`–`64xx`.
+    V3,
+    /// The 48 V variants, codes `60xx`–`67xx`.
+    V48,
+}
+
+impl Hardware {
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Hardware::V2 => "V2",
+            Hardware::V3 => "V3",
+            Hardware::V48 => "48V",
+        }
+    }
+}
+
+/// What a DAMIAO `sw_ver` says about the motor reporting it.
+///
+/// See [`MotorModel::from_firmware_version`] for the encoding and the evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DamiaoFirmware {
+    /// The two-digit series and hardware code, e.g. `50`.
+    pub code: u8,
+    /// The two-digit build number, e.g. `19`.
+    pub build: u8,
+    /// The vendor's series name, e.g. `"4310"`. Reported even when no
+    /// [`MotorModel`] exists for it.
+    pub series: &'static str,
+    pub hardware: Hardware,
+    /// The matching driver model, or `None` for a series this crate has no
+    /// variant for.
+    pub model: Option<MotorModel>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotorModel {
     /// DM-J4310-2EC V1.2.
@@ -216,6 +255,80 @@ impl MotorModel {
             i += 1;
         }
         fallback
+    }
+
+    /// Decode `sw_ver` (RID 14) into what the vendor's own firmware naming says.
+    ///
+    /// The version is a four-digit number: **the first two digits are a series
+    /// and hardware-generation code, the last two are the build**. `5019` is
+    /// series `50` — a 4310 on V3 hardware — at build 19.
+    ///
+    /// This is a second, independent identification channel alongside
+    /// [`Self::from_gear_ratio`], and it says something the gear ratio cannot:
+    /// the **hardware generation**. A 4310 reads `GR = 10` whether it is V2, V3
+    /// or the 48 V variant, while the firmware code separates them (`31xx`,
+    /// `50xx`, `60xx`).
+    ///
+    /// # Evidence
+    ///
+    /// Two sources, agreeing:
+    ///
+    /// - the vendor's release assets, whose names carry both the series and the
+    ///   code: `APP_DM4310(V3)_V5017_03.bin`, `APP_DM4340(V3)_V5117_04.bin`,
+    ///   `APP_DM3507(V3)_V5717_03.bin`, `APP_DM8009(V3)_V6417_03.bin`
+    /// - a vendor table listing the code per series and hardware generation
+    ///
+    /// A bench DM-J4310 reports `5019`, which the table puts at 4310/V3 and the
+    /// gear ratio independently confirms. Note this **contradicts** the DM4310
+    /// manual's upgrade note, which says to pick firmware "with a prefix of 70";
+    /// the release assets and the table are the better evidence, and the same
+    /// preference for vendor asset names over manual prose was what settled the
+    /// RobStride mapping.
+    ///
+    /// Returns [`DamiaoFirmware`] rather than a bare model, because the series
+    /// codes cover motors this crate has no [`MotorModel`] for — a `6006` is a
+    /// real answer even when it cannot be turned into a variant, and reporting
+    /// "unknown" for it would throw away what was read.
+    pub fn from_firmware_version(sw_ver: u32) -> Option<DamiaoFirmware> {
+        // Four digits. Anything else is not this scheme, and guessing at a
+        // truncated or extended one would invent a motor.
+        if !(1000..=9999).contains(&sw_ver) {
+            return None;
+        }
+        let code = (sw_ver / 100) as u8;
+        let build = (sw_ver % 100) as u8;
+        let (series, hardware, model) = match code {
+            // V2 hardware.
+            31 => ("4310", Hardware::V2, Some(MotorModel::Dm4310)),
+            32 => ("4340", Hardware::V2, Some(MotorModel::Dm4340)),
+            33 => ("8006", Hardware::V2, None),
+            34 => ("8009", Hardware::V2, Some(MotorModel::Dm8009)),
+            // V3 hardware.
+            50 => ("4310", Hardware::V3, Some(MotorModel::Dm4310)),
+            51 => ("4340", Hardware::V3, Some(MotorModel::Dm4340)),
+            56 => ("10010", Hardware::V3, None),
+            57 => ("3507", Hardware::V3, Some(MotorModel::Dm3507)),
+            58 => ("smallHUB", Hardware::V3, None),
+            62 => ("6006", Hardware::V3, None),
+            63 => ("8006", Hardware::V3, None),
+            64 => ("8009", Hardware::V3, Some(MotorModel::Dm8009)),
+            // 48 V variants.
+            60 => ("4310", Hardware::V48, Some(MotorModel::Dm4310)),
+            61 => ("4340", Hardware::V48, Some(MotorModel::Dm4340)),
+            67 => ("10010L", Hardware::V48, None),
+            // Deliberately absent: the vendor table's hub and gimbal rows are
+            // not corroborated by a release asset, and one of them disagrees
+            // with the `smallHUB` filename above. An unmapped code returns the
+            // code itself rather than a guess.
+            _ => return None,
+        };
+        Some(DamiaoFirmware {
+            code,
+            build,
+            series,
+            hardware,
+            model,
+        })
     }
 
     /// Which register-map layout this model uses above RID `0x25`.
@@ -388,6 +501,100 @@ impl LowerBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bench DM-J4310 reports `5019`. Pinned because it is the one reading
+    /// taken from real hardware, and it is what showed the DM4310 manual's
+    /// "prefix 70" upgrade note to be the wrong thing to identify a motor by.
+    #[test]
+    fn the_bench_unit_decodes_as_a_4310_on_v3_hardware() {
+        let fw = MotorModel::from_firmware_version(5019).expect("5019 is a known series");
+        assert_eq!(fw.series, "4310");
+        assert_eq!(fw.hardware, Hardware::V3);
+        assert_eq!(fw.build, 19);
+        assert_eq!(fw.model, Some(MotorModel::Dm4310));
+    }
+
+    /// Every code here is corroborated by the name of a vendor release asset,
+    /// which is the evidence the mapping rests on. A test per filename, so a
+    /// wrong digit fails loudly rather than mislabelling a motor.
+    #[test]
+    fn the_codes_match_the_vendor_release_filenames() {
+        // APP_DM4310(V3)_V5017_03.bin
+        let fw = MotorModel::from_firmware_version(5017).unwrap();
+        assert_eq!((fw.series, fw.hardware), ("4310", Hardware::V3));
+        // APP_DM4340(V3)_V5117_04.bin
+        let fw = MotorModel::from_firmware_version(5117).unwrap();
+        assert_eq!((fw.series, fw.hardware), ("4340", Hardware::V3));
+        // APP_DM3507(V3)_V5717_03.bin -- also the version printed in the manual
+        let fw = MotorModel::from_firmware_version(5717).unwrap();
+        assert_eq!((fw.series, fw.hardware), ("3507", Hardware::V3));
+        assert_eq!(fw.model, Some(MotorModel::Dm3507));
+        // APP_DM8009(V3)_V6417_03.bin
+        let fw = MotorModel::from_firmware_version(6417).unwrap();
+        assert_eq!((fw.series, fw.hardware), ("8009", Hardware::V3));
+        assert_eq!(fw.model, Some(MotorModel::Dm8009));
+        // APP_DM10010(V3)_V5617_03.bin
+        let fw = MotorModel::from_firmware_version(5617).unwrap();
+        assert_eq!((fw.series, fw.hardware), ("10010", Hardware::V3));
+        // APP_DM6006(V3)_V6217_03.bin and APP_DM8006(V3)_V6317_03.bin
+        assert_eq!(MotorModel::from_firmware_version(6217).unwrap().series, "6006");
+        assert_eq!(MotorModel::from_firmware_version(6317).unwrap().series, "8006");
+        // APP_smallHUB_5817_02.bin
+        assert_eq!(
+            MotorModel::from_firmware_version(5817).unwrap().series,
+            "smallHUB"
+        );
+    }
+
+    /// A series with no driver variant is still an answer. Reporting "unknown"
+    /// for a 6006 would throw away what was read off the wire.
+    #[test]
+    fn a_series_without_a_variant_still_reports_itself() {
+        let fw = MotorModel::from_firmware_version(6217).unwrap();
+        assert_eq!(fw.series, "6006");
+        assert_eq!(fw.model, None);
+    }
+
+    /// The firmware code separates hardware generations that share a gear
+    /// ratio, which is the whole reason to read it as well as `GR`.
+    #[test]
+    fn the_code_distinguishes_hardware_generations_that_gr_cannot() {
+        let v2 = MotorModel::from_firmware_version(3156).unwrap();
+        let v3 = MotorModel::from_firmware_version(5019).unwrap();
+        let v48 = MotorModel::from_firmware_version(6019).unwrap();
+        // All three are 4310s, so the gear ratio is the same for all of them.
+        for fw in [v2, v3, v48] {
+            assert_eq!(fw.series, "4310");
+            assert_eq!(fw.model, Some(MotorModel::Dm4310));
+        }
+        assert_eq!(v2.hardware, Hardware::V2);
+        assert_eq!(v3.hardware, Hardware::V3);
+        assert_eq!(v48.hardware, Hardware::V48);
+        assert_eq!(
+            MotorModel::Dm4310.gear_ratio(),
+            10,
+            "GR cannot tell these apart"
+        );
+    }
+
+    /// `3156` is the vendor's own worked example: series 31, build 56.
+    #[test]
+    fn the_vendors_worked_example_decodes() {
+        let fw = MotorModel::from_firmware_version(3156).unwrap();
+        assert_eq!(fw.code, 31);
+        assert_eq!(fw.build, 56);
+    }
+
+    /// Not four digits is not this scheme, and an unmapped code is reported as
+    /// nothing rather than as the nearest series.
+    #[test]
+    fn anything_outside_the_scheme_is_refused() {
+        assert!(MotorModel::from_firmware_version(0).is_none());
+        assert!(MotorModel::from_firmware_version(999).is_none());
+        assert!(MotorModel::from_firmware_version(10_000).is_none());
+        // 99 is not in the vendor table.
+        assert!(MotorModel::from_firmware_version(9917).is_none());
+    }
 
     /// The reduction ratio is what makes over-the-bus identification work, so
     /// it has to stay unique across distinct motors. If a future model

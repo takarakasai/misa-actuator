@@ -550,19 +550,67 @@ fn damiao_hit(
     );
     let _ = motor.set_timeout(timeout);
 
-    match motor.identify_model() {
-        Ok(model) => ScanHit {
-            driver: DriverKind::Damiao,
-            motor_id,
-            model: Some(model.name().to_string()),
-            evidence: Some("reduction ratio (RID 20)".into()),
-        },
-        Err(e) => ScanHit {
-            driver: DriverKind::Damiao,
-            motor_id,
-            model: None,
-            evidence: Some(format!("answered a probe, but the gear-ratio read failed: {e}")),
-        },
+    // Two independent channels, like RobStride: the reduction ratio names the
+    // model, and `sw_ver` names the series *and the hardware generation* — which
+    // the ratio cannot, because a 4310 reads GR 10 whether it is V2, V3 or 48 V.
+    let by_ratio = motor.identify_model().ok();
+    let firmware = motor
+        .read_register(damiao_driver::protocol::Rid::SW_VER)
+        .ok()
+        .map(|r| r.as_i32() as u32)
+        .and_then(damiao_driver::MotorModel::from_firmware_version);
+
+    let model = by_ratio
+        .map(|m| m.name().to_string())
+        // The firmware code is a real answer even where the ratio read failed,
+        // and for a series this crate has no variant for it is the *only*
+        // answer.
+        .or_else(|| firmware.and_then(|f| f.model).map(|m| m.name().to_string()))
+        .or_else(|| firmware.map(|f| format!("{} ({})", f.series, f.hardware.name())));
+
+    let evidence = match (by_ratio, firmware) {
+        (Some(r), Some(f)) => {
+            let agree = f.model.is_none_or(|m| m == r);
+            if agree {
+                Some(format!(
+                    "reduction ratio {}:1 and firmware {}{:02} ({} {}) agree",
+                    r.gear_ratio(),
+                    f.code,
+                    f.build,
+                    f.series,
+                    f.hardware.name()
+                ))
+            } else {
+                // Say it rather than pick one. Two channels disagreeing means
+                // one of the tables is stale, and neither answer is safe to
+                // build a MIT range on.
+                Some(format!(
+                    "DISAGREEMENT: reduction ratio says {}, firmware {}{:02} says {} {}. \
+                     Trust neither until this is resolved.",
+                    r.name(),
+                    f.code,
+                    f.build,
+                    f.series,
+                    f.hardware.name()
+                ))
+            }
+        }
+        (Some(r), None) => Some(format!("reduction ratio {}:1 (RID 20)", r.gear_ratio())),
+        (None, Some(f)) => Some(format!(
+            "firmware {}{:02} ({} {}); the gear-ratio read did not answer",
+            f.code,
+            f.build,
+            f.series,
+            f.hardware.name()
+        )),
+        (None, None) => Some("answered a probe, but neither identification read came back".into()),
+    };
+
+    ScanHit {
+        driver: DriverKind::Damiao,
+        motor_id,
+        model,
+        evidence,
     }
 }
 

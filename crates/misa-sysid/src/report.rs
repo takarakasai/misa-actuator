@@ -239,9 +239,16 @@ pub fn run_breakaway_map_to_csv(
 #[derive(Debug, Clone)]
 pub struct VelocitySweepReport {
     pub n_samples: usize,
-    /// Mean speed achieved while commanded to move (rad/s). Far below the
-    /// command means the traverse stalled and the decomposition does not hold.
+    /// Speed the shaft actually travelled at, from the positions visited (rad/s).
+    /// Far below the command means the traverse stalled and the decomposition does
+    /// not hold.
     pub mean_speed_rad_s: Option<f32>,
+    /// Mean of the speed the motor *reported*.
+    ///
+    /// Separate because the two disagree on firmware that reports velocity as an
+    /// exact zero most frames, and then this one says something about the motor
+    /// rather than about the joint.
+    pub reported_speed_rad_s: Option<f32>,
     /// Mean kinetic friction over the binned curve (N·m).
     pub mean_kinetic_friction_nm: Option<f32>,
     /// Peak |static load| over the binned curve (N·m).
@@ -266,7 +273,11 @@ pub fn run_velocity_sweep_to_csv(
     write_points_csv(&sweep.points, csv, write_header)?;
     Ok(VelocitySweepReport {
         n_samples: sweep.points.len(),
-        mean_speed_rad_s: sweep.mean_speed_rad_s(),
+        // From the positions, not the reported velocity — see
+        // `VelocitySweep::traversed_speed_rad_s` for the motor that made the
+        // difference matter.
+        mean_speed_rad_s: sweep.traversed_speed_rad_s(),
+        reported_speed_rad_s: sweep.mean_speed_rad_s(),
         mean_kinetic_friction_nm: sweep.mean_kinetic_friction_nm(bins),
         peak_static_load_nm: sweep.peak_static_load_nm(bins),
         curve: sweep.friction_curve(bins),

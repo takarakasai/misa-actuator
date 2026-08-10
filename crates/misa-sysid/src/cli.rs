@@ -464,7 +464,17 @@ pub fn run_characterize(
             let r =
                 run_velocity_sweep_to_csv(act, &spec, limits, &abort, &mut csv, true, *bins)?;
             println!("  samples                : {}", r.n_samples);
-            print_opt("mean speed achieved", r.mean_speed_rad_s, "rad/s");
+            print_opt("speed travelled", r.mean_speed_rad_s, "rad/s");
+            // Only when it contradicts the positions: then it is a fact about the
+            // motor's feedback, not about the joint.
+            if let (Some(a), Some(c)) = (r.mean_speed_rad_s, r.reported_speed_rad_s) {
+                if a > 0.01 && c < a * 0.5 {
+                    println!(
+                        "  reported velocity      : {c:+.4} rad/s — under half what the \
+                         positions show, so this motor's velocity field is unreliable"
+                    );
+                }
+            }
             print_opt("mean kinetic friction", r.mean_kinetic_friction_nm, "N·m");
             print_opt("peak static load", r.peak_static_load_nm, "N·m");
             // A traverse that stalled is not steady motion, so the split is void.

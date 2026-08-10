@@ -118,6 +118,8 @@ pub(crate) struct Worker {
     last_status: Instant,
     last_idle_poll: Instant,
     consecutive_faults: u32,
+    /// Torque ceiling for characterization runs (N·m); 0 keeps the gentle default.
+    envelope_max_torque_nm: f32,
 }
 
 impl Worker {
@@ -127,6 +129,7 @@ impl Worker {
         commands: Receiver<Command>,
         events: Sender<Event>,
         telemetry: SyncSender<TelemetryBatch>,
+        envelope_max_torque_nm: f32,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -145,6 +148,7 @@ impl Worker {
             last_status: now,
             last_idle_poll: now,
             consecutive_faults: 0,
+            envelope_max_torque_nm,
         }
     }
 
@@ -614,8 +618,24 @@ impl Worker {
         // `gentle` rather than anything tuned: this envelope is survivable on
         // the smallest motor in the workspace, and the GUI does not know which
         // one is plugged in. A rig that can take more should say so
-        // deliberately, not inherit it from a default.
-        let limits = misa_sysid::SafetyLimits::gentle();
+        // deliberately, not inherit it from a default — which is what the
+        // connect-time ceiling is for.
+        //
+        // It has to be raisable, though: 1 N·m is below what a geared RS-03 needs
+        // to move at all, so every friction run on it aborted on the ceiling as
+        // soon as a Kt made the torque visible (2026-08-06). A limit that no run
+        // can stay inside protects nothing and measures nothing.
+        let mut limits = misa_sysid::SafetyLimits::gentle();
+        if self.envelope_max_torque_nm > 0.0 {
+            limits.max_torque_nm = self.envelope_max_torque_nm;
+            self.log(
+                LogLevel::Warn,
+                format!(
+                    "torque envelope raised to {:.3} N·m for this session",
+                    limits.max_torque_nm
+                ),
+            );
+        }
         let outcome = match run {
             CharacterizeJob::LoadMap {
                 from_rad,
@@ -976,7 +996,11 @@ fn velocity_sweep_data(v: misa_sysid::VelocitySweep, bins: usize) -> (Characteri
 
     let friction = v.mean_kinetic_friction_nm(bins);
     let load = v.peak_static_load_nm(bins);
-    let achieved = v.mean_speed_rad_s();
+    // From the positions visited, not from the velocity the motor reported: on
+    // some firmware that field is an exact zero most frames, which called every
+    // run stalled while the shaft turned at exactly the commanded speed.
+    let achieved = v.traversed_speed_rad_s();
+    let claimed = v.mean_speed_rad_s();
 
     let mut summary = vec![("samples".to_string(), v.points.len().to_string())];
     // Torque that is identically zero is the signature of firmware that reports
@@ -999,12 +1023,24 @@ fn velocity_sweep_data(v: misa_sysid::VelocitySweep, bins: usize) -> (Characteri
         },
     ));
     summary.push((
-        "mean speed".to_string(),
+        "speed travelled".to_string(),
         match achieved {
             Some(s) => format!("{s:.4} rad/s of {:.4} commanded", v.spec.speed_rad_s),
             None => "not measured".to_string(),
         },
     ));
+    // Reported only when it contradicts the positions, because then it is a fact
+    // about the motor rather than about the joint: a velocity field that reads
+    // zero while the shaft moves is the same firmware trait as a torque field
+    // that does.
+    if let (Some(a), Some(c)) = (achieved, claimed) {
+        if a > 0.01 && c < a * 0.5 {
+            summary.push((
+                "reported velocity".to_string(),
+                format!("{c:.4} rad/s — under half what the positions show; the motor's velocity field is unreliable"),
+            ));
+        }
+    }
     if !v.spec.return_sweep {
         // Without the return sweep the split has nothing to subtract, so the
         // number above is load plus friction, not friction.

@@ -102,6 +102,8 @@ fn main() -> Result<()> {
         baud: cli.baud,
         gear_ratio: cli.gear_ratio,
         kt: cli.kt,
+        // The TUI runs no characterization jobs, so the envelope never applies.
+        max_torque_nm: 0.0,
         bus_kind: cli.bus,
         timeout: Duration::from_millis(cli.timeout_ms),
     };

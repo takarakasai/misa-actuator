@@ -116,6 +116,17 @@ pub struct DriverConfig {
     /// the datasheet; a real reading is always preferred, so this changes nothing
     /// on healthy firmware.
     pub kt: f32,
+    /// Torque ceiling for the characterization envelope (N·m). 0 → the gentle
+    /// default.
+    ///
+    /// A property of the rig, not of a run, which is why it sits here beside
+    /// [`Self::kt`]: this crate cannot know what is bolted to the shaft. The
+    /// default is sized for the smallest motor in the workspace, and on
+    /// 2026-08-06 an RS-03 geared joint turned out to need over 1 N·m just to
+    /// move — so every friction run aborted on the ceiling the moment a Kt made
+    /// the torque visible at all. Raising it is a deliberate act about a specific
+    /// rig, and inheriting it from a default is what this avoids.
+    pub max_torque_nm: f32,
     /// Damiao: physical CAN layer (classic CAN or CAN-FD). Ignored otherwise.
     pub bus_kind: BusKind,
     /// Per-request timeout.
@@ -133,6 +144,7 @@ impl Default for DriverConfig {
             baud: 1_000_000,
             gear_ratio: 10.0,
             kt: 0.0,
+            max_torque_nm: 0.0,
             bus_kind: BusKind::Can,
             timeout: Duration::from_millis(100),
         }

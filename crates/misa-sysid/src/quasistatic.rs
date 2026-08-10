@@ -1443,10 +1443,14 @@ impl VelocitySweep {
             .max_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal))
     }
 
-    /// Mean speed actually achieved while commanded to move (rad/s).
+    /// Mean of the speed the motor **reported**, while commanded to move (rad/s).
     ///
-    /// Far below [`VelocitySweepSpec::speed_rad_s`] means the traverse stalled,
-    /// so the log is not steady motion and the decomposition does not hold.
+    /// Not the same thing as the speed it went — see
+    /// [`Self::traversed_speed_rad_s`], and prefer that for judging a stall.
+    /// Measured on an RS-03 (2026-08-06): this reads 0.0085 while the shaft
+    /// travels at the commanded 0.05, because the firmware reports velocity as an
+    /// exact zero in most frames. Kept because a disagreement between the two is
+    /// worth reporting — it says the velocity field cannot be trusted.
     pub fn mean_speed_rad_s(&self) -> Option<f32> {
         let v: Vec<f32> = self
             .points
@@ -1455,6 +1459,35 @@ impl VelocitySweep {
             .map(|p| p.velocity_rad_per_s.abs())
             .collect();
         (!v.is_empty()).then(|| v.iter().sum::<f32>() / v.len() as f32)
+    }
+
+    /// Speed from the positions actually visited (rad/s).
+    ///
+    /// The distance travelled — summed over consecutive samples, so a there-and-back
+    /// traverse counts both legs — divided by the time spent under command.
+    ///
+    /// **This is what a stall check should use.** Position is the one field this
+    /// measurement can rely on; the reported velocity is a constant zero on some
+    /// firmware, and judging a stall by it condemns every run on such a motor
+    /// while the shaft is visibly turning at the commanded speed.
+    ///
+    /// Far below [`VelocitySweepSpec::speed_rad_s`] means the traverse really did
+    /// stall, so the log is not steady motion and the decomposition does not hold.
+    pub fn traversed_speed_rad_s(&self) -> Option<f32> {
+        let moving: Vec<&Point> = self
+            .points
+            .iter()
+            .filter(|p| p.cmd != 0.0 && p.position_rad.is_finite() && p.t_s.is_finite())
+            .collect();
+        if moving.len() < 2 {
+            return None;
+        }
+        let distance: f32 = moving
+            .windows(2)
+            .map(|w| (w[1].position_rad - w[0].position_rad).abs())
+            .sum();
+        let elapsed = moving[moving.len() - 1].t_s - moving[0].t_s;
+        (elapsed > 0.0).then_some(distance / elapsed)
     }
 }
 
@@ -3067,6 +3100,84 @@ mod tests {
                 rig.pos
             );
         }
+    }
+
+    /// A stall must be judged by where the shaft went, not by what it said.
+    ///
+    /// Measured on an RS-03 (2026-08-06): while traversing at the commanded
+    /// 0.05 rad/s, the firmware reported velocity as an exact zero in most frames,
+    /// so the mean of the reported values came out at 0.0085 — under a fifth of
+    /// the command. Judging by that condemned every run on that motor as stalled
+    /// while the position column showed a clean traverse.
+    #[test]
+    fn a_stall_is_judged_by_position_not_by_the_reported_velocity() {
+        // 100 samples at 100 Hz travelling 0.01 rad each: 1.0 rad/s, and the
+        // motor claims zero for two out of every three frames.
+        let points: Vec<Point> = (0..100)
+            .map(|i| Point {
+                t_s: i as f32 * 0.01,
+                position_rad: i as f32 * 0.01,
+                velocity_rad_per_s: if i % 3 == 0 { 1.0 } else { 0.0 },
+                torque_nm: 0.2,
+                current_a: f32::NAN,
+                temperature_c: 30.0,
+                cmd: 1.0,
+            })
+            .collect();
+        let sweep = VelocitySweep {
+            points,
+            start_position_rad: 0.0,
+            spec: VelocitySweepSpec {
+                speed_rad_s: 1.0,
+                half_span_rad: 0.5,
+                rate_hz: 100.0,
+                return_sweep: true,
+            },
+            abort: None,
+        };
+
+        let travelled = sweep.traversed_speed_rad_s().expect("distance over time");
+        assert!(
+            (travelled - 1.0).abs() < 0.02,
+            "position says 1.0 rad/s, got {travelled}"
+        );
+
+        let reported = sweep.mean_speed_rad_s().expect("reported mean");
+        assert!(
+            reported < 0.5,
+            "the reported mean should be dragged down by the zeros, got {reported}"
+        );
+        // The two disagreeing is the signature of an unreliable velocity field,
+        // which is worth reporting rather than resolving silently either way.
+        assert!(travelled > reported * 2.0);
+    }
+
+    /// And a real stall still has to be caught: no movement, whatever is reported.
+    #[test]
+    fn a_shaft_that_did_not_move_is_still_a_stall() {
+        let points: Vec<Point> = (0..50)
+            .map(|i| Point {
+                t_s: i as f32 * 0.01,
+                position_rad: 0.25,
+                velocity_rad_per_s: 1.0,
+                torque_nm: 0.2,
+                current_a: f32::NAN,
+                temperature_c: 30.0,
+                cmd: 1.0,
+            })
+            .collect();
+        let sweep = VelocitySweep {
+            points,
+            start_position_rad: 0.25,
+            spec: VelocitySweepSpec {
+                speed_rad_s: 1.0,
+                half_span_rad: 0.5,
+                rate_hz: 100.0,
+                return_sweep: true,
+            },
+            abort: None,
+        };
+        assert_eq!(sweep.traversed_speed_rad_s(), Some(0.0));
     }
 
     /// Minimal traverse rig for the walk test: moves at the commanded speed.

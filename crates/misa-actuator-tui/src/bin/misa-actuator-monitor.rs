@@ -127,6 +127,8 @@ impl MotorEntry {
             baud: self.baud,
             gear_ratio: self.gear_ratio,
             kt: self.kt,
+            // Read-only monitoring: no characterization runs, so no envelope.
+            max_torque_nm: 0.0,
             bus_kind: self.bus_kind,
             timeout,
         }

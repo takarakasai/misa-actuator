@@ -553,12 +553,7 @@ pub fn scan_for_motors_with(
                 )
                 .unwrap_or_default();
                 for id in found {
-                    hits.push(ScanHit {
-                        driver: DriverKind::Myactuator,
-                        motor_id: id,
-                        model: None,
-                        evidence: Some("answered a Status1 read".into()),
-                    });
+                    hits.push(myactuator_hit(&shared, id, timeout));
                 }
             }
             DriverKind::Damiao => {
@@ -584,6 +579,58 @@ pub fn scan_for_motors_with(
         }
     }
     Ok(hits)
+}
+
+/// Identify a MyActuator that answered, from the model name it will tell you.
+///
+/// This family is the only one of the four that returns its **type as a string**
+/// (`0xB5`, chunked ASCII, e.g. `RMD-X4-P36-36`) — see
+/// `misa-actuator-tui/doc/vendor-identity-coverage.md`. RobStride has to be
+/// inferred from a firmware version and DAMIAO has no string register at all, so
+/// leaving this family unidentified was giving up the one answer that needs no
+/// guessing. The scan used to record only that an id had answered.
+///
+/// It matters beyond tidiness: a batch falls back to the connection bar's model
+/// for any motor whose own is unknown, so on a mixed bus a MyActuator was being
+/// handed whatever family the bar happened to name.
+///
+/// Read-only, and no `enable` — unlike the DAMIAO probe, which has to energise
+/// the motor to get an answer (`multi_capabilities` reports that). A failure
+/// leaves `model` as `None` and says so in the evidence rather than dropping the
+/// motor: an id that answered is a real find whether or not it will say what it
+/// is.
+fn myactuator_hit(shared: &SharedCanBus, motor_id: u8, timeout: Duration) -> ScanHit {
+    let mut hit = ScanHit {
+        driver: DriverKind::Myactuator,
+        motor_id,
+        model: None,
+        evidence: Some("answered a Status1 read".into()),
+    };
+    // `with_bus` validates the id (1..=32); a scan can only have found one it
+    // probed, but the constructor is fallible so this stays a `let else` rather
+    // than an unwrap.
+    let Ok(mut motor) = myactuator_driver::MyActuatorMotor::with_bus(
+        myactuator_driver::CanBus::new(shared.clone()),
+        motor_id,
+        myactuator_driver::MotorConfig::current_units(),
+    ) else {
+        return hit;
+    };
+    let _ = motor.set_timeout(timeout);
+
+    match motor.read_motor_model() {
+        Ok(name) if !name.trim().is_empty() => {
+            hit.evidence = Some(format!("reported \"{}\" (0xB5)", name.trim()));
+            hit.model = Some(name.trim().to_string());
+        }
+        Ok(_) => {
+            hit.evidence = Some("answered a Status1 read; 0xB5 returned nothing".into());
+        }
+        Err(e) => {
+            hit.evidence = Some(format!("answered a Status1 read; 0xB5 failed: {e}"));
+        }
+    }
+    hit
 }
 
 /// Identify a RobStride that answered, from its firmware version.

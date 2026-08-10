@@ -1075,21 +1075,72 @@ fn load_map_data(m: misa_sysid::LoadMap) -> (CharacterizeData, String) {
         .iter()
         .map(|p| p.torque_nm.abs())
         .fold(0.0f32, f32::max);
-    let summary = vec![
-        ("points".to_string(), n.to_string()),
-        ("peak |torque|".to_string(), format!("{peak:.3} N·m")),
-        // A dwell spread comparable to the torque itself means the shaft was
-        // hunting, so that point averages a limit cycle rather than measuring
-        // a steady load. Worth stating rather than leaving in the curve.
+    let nm = |v: Option<f32>| match v {
+        Some(x) => format!("{x:+.3} N·m"),
+        None => "not measured".to_string(),
+    };
+
+    // The gap between the two legs is what the run is for, so the figures that
+    // quantify it lead. Without them the plot showed two separated clouds and
+    // left the reader to eyeball the separation — which is the measurement
+    // (2026-08-06, an RS-04 whose operator quite reasonably asked what the two
+    // clouds were). The CLI had been printing these all along.
+    let mut summary = vec![
         (
-            "worst dwell spread".to_string(),
-            match m.worst_dwell_spread_nm() {
-                Some(w) => format!("{w:.3} N·m"),
-                None => "not measured".to_string(),
+            "mean friction".to_string(),
+            match m.mean_friction_nm() {
+                Some(f) => format!("{f:.3} N·m"),
+                // Only a return sweep can separate friction from load: one leg
+                // measures load ± friction and cannot say which is which.
+                None => "needs a return sweep".to_string(),
             },
         ),
+        (
+            "peak hysteresis".to_string(),
+            match m.peak_hysteresis_nm() {
+                Some(h) => format!("{h:.3} N·m"),
+                None => "needs a return sweep".to_string(),
+            },
+        ),
+        ("peak static load".to_string(), nm(m.peak_static_load_nm())),
+        (
+            "equilibrium".to_string(),
+            match m.static_equilibrium_position_rad() {
+                Some(p) => format!("{p:+.4} rad"),
+                // No sign change in the swept range: the load does not balance
+                // anywhere inside it, which is a fact about the range.
+                None => "not inside the range".to_string(),
+            },
+        ),
+        ("points".to_string(), n.to_string()),
+        ("peak |torque|".to_string(), format!("{peak:.3} N·m")),
     ];
-    let note = format!("{n} points, peak {peak:.3} N·m");
+
+    // A dwell spread comparable to the torque itself means the shaft was
+    // hunting, so that point averages a limit cycle rather than measuring a
+    // steady load. Said here rather than left for the reader to compare two
+    // tiles, because it decides whether the other numbers mean anything.
+    let spread = m.worst_dwell_spread_nm();
+    let hunting = matches!(
+        (spread, m.peak_holding_torque_nm()),
+        (Some(s), Some(p)) if s >= p.abs()
+    );
+    summary.push((
+        "worst dwell spread".to_string(),
+        match spread {
+            Some(w) if hunting => format!("{w:.3} N·m — hunting, not settling"),
+            Some(w) => format!("{w:.3} N·m"),
+            None => "not measured".to_string(),
+        },
+    ));
+
+    let note = match m.mean_friction_nm() {
+        Some(f) if hunting => format!(
+            "{n} points, friction {f:.3} N·m — but the dwells were hunting, so treat every figure as an average of a limit cycle; a longer settle would fix it"
+        ),
+        Some(f) => format!("{n} points, friction {f:.3} N·m, peak {peak:.3} N·m"),
+        None => format!("{n} points, peak {peak:.3} N·m"),
+    };
     (
         CharacterizeData {
             x_label: "position [rad]".to_string(),

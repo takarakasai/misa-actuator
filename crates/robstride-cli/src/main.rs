@@ -27,6 +27,12 @@ use robstride_driver::{
 
 mod param_commands;
 
+/// Highest legal RobStride CAN id.
+///
+/// The scan's default range stops well below it, deliberately — 127 ids at the
+/// per-id timeout is slow — so the "nothing found" message has to name both.
+const MAX_MOTOR_ID: u8 = 127;
+
 #[derive(Parser, Debug)]
 #[command(version, about = "Test CLI for the Robstride CAN servo motor driver")]
 struct Cli {
@@ -804,7 +810,19 @@ fn run(cli: Cli) -> Result<()> {
             };
             eprintln!();
             if results.is_empty() {
-                println!("no motors found");
+                // Say what was looked at, not just what was not found. A
+                // RobStride id runs to 127 while the default range stops at 32,
+                // so "no motors found" reads as "there are none" while meaning
+                // "none in the quarter of the space I probed" — which cost an
+                // evening on 2026-08-06, chasing wiring for a motor sitting at
+                // id 96.
+                println!("no motors found in ids {from}..={to}");
+                if *to < MAX_MOTOR_ID {
+                    println!(
+                        "  ids up to {MAX_MOTOR_ID} are legal — try `--from {} --to {MAX_MOTOR_ID}`",
+                        *to + 1
+                    );
+                }
             } else {
                 println!("found {} motor(s):", results.len());
                 for r in results {

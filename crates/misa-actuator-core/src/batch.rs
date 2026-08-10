@@ -50,6 +50,18 @@ pub struct BatchMotor {
     ///
     /// `None` falls back to [`BatchSpec::model`].
     pub model: Option<String>,
+    /// Torque ceiling for this motor's runs (N·m). `None` falls back to
+    /// [`BatchSpec::envelope`].
+    ///
+    /// Per motor for the same reason the model is. A ceiling is a statement
+    /// about one motor and its rig, and a bus can carry very different ones: an
+    /// RS-05 peaks at 5.5 N·m where an RS-04 peaks at 120. One figure for the
+    /// batch has to be either too high for the small motor — a ceiling above
+    /// what it can survive protects nothing — or too low for the large one, at
+    /// which point every run on it aborts without measuring. Taking the smallest
+    /// looks safe and is not: it trades a safety problem for a silent
+    /// measurement failure on every other motor.
+    pub max_torque_nm: Option<f32>,
 }
 
 /// What to measure, and on which motors.
@@ -236,6 +248,19 @@ fn run(spec: BatchSpec, progress: &Mutex<BatchProgress>, cancel: &AtomicBool) {
         // measure zero, and a batch is the one place nobody can type a value in
         // between motors.
         let mut envelope = spec.envelope;
+        if let Some(nm) = motor.max_torque_nm {
+            envelope.max_torque_nm = nm;
+        }
+        // Ramping runs are scaled to this motor's ceiling too, or a ramp sized
+        // for the largest motor on the bus would spend every run on a small one
+        // being aborted by its envelope just short of finishing. Half, because
+        // the envelope judges *measured* torque and a ramp that reaches it trips
+        // it — the two ceilings must not meet.
+        let runs: Vec<CharacterizeJob> = spec
+            .runs
+            .iter()
+            .map(|r| clamp_ramp(*r, envelope.max_torque_nm))
+            .collect();
         if spec.measure_kt_first {
             let kt_run = kt_job(envelope);
             match one_run(&session, kt_run, envelope, cancel) {
@@ -253,7 +278,7 @@ fn run(spec: BatchSpec, progress: &Mutex<BatchProgress>, cancel: &AtomicBool) {
             bump_run(progress);
         }
 
-        for &job in &spec.runs {
+        for &job in &runs {
             if cancel.load(Ordering::Acquire) {
                 session.shutdown();
                 return;
@@ -275,6 +300,56 @@ fn run(spec: BatchSpec, progress: &Mutex<BatchProgress>, cancel: &AtomicBool) {
         // resource and holding a channel open for a motor we are done with can
         // stop the next one opening at all.
         session.shutdown();
+    }
+}
+
+/// Fraction of a motor's torque ceiling a ramping run may climb to.
+///
+/// The two ceilings must not meet: the envelope judges *measured* torque, which
+/// carries noise on hardware that derives it from current, so a ramp that
+/// reaches the envelope trips it just short of finishing and a valid "did not
+/// break loose" is discarded as a fault.
+const RAMP_FRACTION: f32 = 0.5;
+
+/// Hold a ramping run's ceiling under this motor's envelope.
+///
+/// Only lowers. A run configured more gently than the envelope allows is the
+/// operator's choice about their rig, and a batch is not the place to overrule
+/// it — this exists to stop one figure chosen for a large motor being applied to
+/// a small one, not to push every run to the maximum.
+fn clamp_ramp(job: CharacterizeJob, ceiling_nm: f32) -> CharacterizeJob {
+    let cap = ceiling_nm * RAMP_FRACTION;
+    match job {
+        CharacterizeJob::Breakaway {
+            ramp_nm_per_s,
+            max_torque_nm,
+            positive,
+            rate_hz,
+        } => CharacterizeJob::Breakaway {
+            ramp_nm_per_s,
+            max_torque_nm: max_torque_nm.min(cap),
+            positive,
+            rate_hz,
+        },
+        CharacterizeJob::BreakawayMap {
+            half_span_rad,
+            steps,
+            ramp_nm_per_s,
+            max_torque_nm,
+            rate_hz,
+            both_directions,
+        } => CharacterizeJob::BreakawayMap {
+            half_span_rad,
+            steps,
+            ramp_nm_per_s,
+            max_torque_nm: max_torque_nm.min(cap),
+            rate_hz,
+            both_directions,
+        },
+        // The others do not ramp torque against a ceiling: a load map and a
+        // velocity sweep are bounded by position and speed, and the Kt run sizes
+        // itself from the envelope already.
+        other => other,
     }
 }
 
@@ -437,7 +512,11 @@ mod tests {
             model: "rs04".to_string(),
             motors: ids
                 .into_iter()
-                .map(|id| BatchMotor { id, model: None })
+                .map(|id| BatchMotor {
+                    id,
+                    model: None,
+                    max_torque_nm: None,
+                })
                 .collect(),
             runs,
             envelope: RunEnvelope {
@@ -577,8 +656,13 @@ mod tests {
             BatchMotor {
                 id: 1,
                 model: Some("rs04".to_string()),
+                max_torque_nm: None,
             },
-            BatchMotor { id: 2, model: None },
+            BatchMotor {
+                id: 2,
+                model: None,
+                max_torque_nm: None,
+            },
         ];
         let p = wait_done(&spawn(spec), Duration::from_secs(60));
 
@@ -594,6 +678,44 @@ mod tests {
             "the motor without one should have fallen back and failed: {:?}",
             by_id(2)
         );
+    }
+
+    /// A bus can carry motors two orders of magnitude apart — an RS-05 peaks at
+    /// 5.5 N·m against an RS-04's 120 — so one ceiling for the batch is either
+    /// unsafe for the small one or useless on the large one. Taking the smallest
+    /// is the trap: it looks safe and quietly stops the large motor measuring
+    /// anything.
+    #[test]
+    fn each_motor_gets_its_own_ceiling_and_its_ramps_follow() {
+        let ramp = |nm: f32| CharacterizeJob::Breakaway {
+            ramp_nm_per_s: 0.2,
+            max_torque_nm: nm,
+            positive: true,
+            rate_hz: 200.0,
+        };
+
+        // A ramp sized for a big motor is cut to half the small motor's ceiling.
+        assert_eq!(
+            clamp_ramp(ramp(6.0), 0.55),
+            ramp(0.275),
+            "a 6 N·m ramp must not be applied inside a 0.55 N·m envelope"
+        );
+        // And the large motor keeps its own.
+        assert_eq!(clamp_ramp(ramp(6.0), 12.0), ramp(6.0));
+
+        // Only ever lowered: a deliberately gentle run is not pushed up to the
+        // envelope just because there is room.
+        assert_eq!(clamp_ramp(ramp(0.5), 12.0), ramp(0.5));
+
+        // Runs that do not ramp against a ceiling are untouched.
+        let sweep = CharacterizeJob::VelocitySweep {
+            half_span_rad: 0.2,
+            speed_rad_s: 0.05,
+            rate_hz: 200.0,
+            return_sweep: true,
+            bins: 12,
+        };
+        assert_eq!(clamp_ramp(sweep, 0.55), sweep);
     }
 
     #[test]

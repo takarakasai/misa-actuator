@@ -127,7 +127,14 @@ const INFO_DLC: u8 = 0x0F;
 const MODE_NORMAL: u8 = 0x00;
 const MODE_SILENT: u8 = 0x02;
 
-const FILTER_FRAME_EXTENDED: u8 = 0x02;
+/// Byte 4 of the settings command.
+///
+/// The working reference passes `STANDARD` unconditionally, with the filter and
+/// mask left at zero, and that is the only combination with evidence behind it —
+/// so this follows it rather than reasoning about what the field ought to mean.
+/// It does **not** restrict what can be sent: the frame's own width lives in bit
+/// 5 of each data packet's info byte.
+const FILTER_FRAME_STANDARD: u8 = 0x01;
 
 /// Longest packet either shape can be: an extended data frame with 8 bytes.
 const MAX_DATA_PACKET: usize = 15;
@@ -406,10 +413,7 @@ fn settings_packet(speed: u8, mode: u8) -> [u8; COMMAND_LEN] {
     p[1] = COMMAND_MARK;
     p[2] = COMMAND_SETTINGS;
     p[3] = speed;
-    // The filter frame type with an all-zero filter and mask, which lets
-    // everything through — we need standard *and* extended traffic on the same
-    // wire (DAMIAO is 11-bit, RobStride is 29-bit).
-    p[4] = FILTER_FRAME_EXTENDED;
+    p[4] = FILTER_FRAME_STANDARD;
     // 5..=12 filter and mask ids stay zero.
     p[13] = mode;
     p[14] = 0x01;
@@ -614,7 +618,7 @@ mod tests {
         // 1 Mbit/s, normal mode.
         let p = settings_packet(0x01, MODE_NORMAL);
         assert_eq!(&p[..4], &[0xAA, 0x55, 0x12, 0x01]);
-        assert_eq!(p[4], 0x02, "filter frame type");
+        assert_eq!(p[4], 0x01, "filter frame type, as the reference sends it");
         assert_eq!(&p[5..13], &[0u8; 8], "no filter, no mask");
         assert_eq!(p[13], 0x00, "normal mode");
         assert_eq!(p[14], 0x01);

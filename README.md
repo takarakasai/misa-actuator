@@ -127,23 +127,33 @@ That is the command to use day to day. `npm run app` runs `tauri dev`, which
 starts the Vite dev server and then `cargo run` — both halves, in the right
 order.
 
-**`cargo run -p misa-actuator-gui` on its own is not enough in a debug build.**
-Tauri points a debug build at the dev server (`http://localhost:5173`), so
-without Vite running the window opens on `ERR_CONNECTION_REFUSED`. Either use
-`npm run app`, or build a release binary, which embeds the front end and needs
-nothing else at run time:
+**`cargo` cannot build a runnable GUI on its own — not even in release.** The
+front end is embedded by the *Tauri CLI*, not by `cargo`, so a binary from
+`cargo build`/`cargo run` contains no front end at all and falls back to the dev
+URL (`http://localhost:5173`). Without Vite running, the window opens on
+`ERR_CONNECTION_REFUSED`; with Vite running you get the dev server rather than
+the build you thought you were testing.
 
-```powershell
-cd ui; npm run build; cd ..
-cargo run -p misa-actuator-gui --release
-```
+Verified 2026-08-05 by comparing the two binaries: the Tauri-built one contains
+the `assets/index-*.js` name, the `cargo build --release` one does not.
 
-To produce a distributable installer:
+So there are exactly two ways to run it, both through the CLI:
 
 ```powershell
 cd ui
-npm run app:build      # → target/release/bundle/nsis/
+npm run app            # development: Vite + the app, hot reload
+npm run app:build      # distributable: exe + installer → target/release/bundle/nsis/
 ```
+
+For a release binary without waiting for the installer, skip the bundling step:
+
+```powershell
+cd crates\misa-actuator-gui
+..\..\ui\node_modules\.bin\tauri build --no-bundle
+```
+
+(The CLI lives in `ui/node_modules`, which is why `npm run app:build` does its
+work from `ui/` — a bare `npx tauri` from the crate directory will not find it.)
 
 Every other crate needs nothing but a Rust toolchain — the workspace's
 `default-members` excludes the GUI, so a plain `cargo build` / `cargo test`

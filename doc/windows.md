@@ -245,10 +245,17 @@ That produces two things:
 | `target/release/bundle/nsis/misa-actuator_0.1.0_x64-setup.exe` | ~2.6 MB | NSIS installer |
 
 The `.exe` is self-contained apart from the WebView2 runtime — the front end
-is embedded, not loaded from disk. A debug build is different: it loads the
-front end from the Vite dev server at `localhost:5173`, so `cargo run` alone
-gives a blank window unless `npm run dev` is already up. Use `npm run app`
-for development and `npm run app:build` for anything you hand to somebody.
+is embedded, not loaded from disk.
+
+**The embedding is done by the Tauri CLI, not by `cargo`, and `--release` does
+not change that.** A binary from `cargo build -p misa-actuator-gui --release`
+contains no front end at all; it falls back to `devUrl` and opens on
+`ERR_CONNECTION_REFUSED` exactly like a debug build. Confirmed 2026-08-05 by
+scanning both binaries: the Tauri-built one carries the `assets/index-*.js`
+name, the cargo-built one does not. Use `npm run app` for development and
+`npm run app:build` for anything you hand to somebody; for a release binary
+without the installer, `tauri build --no-bundle` from
+`crates/misa-actuator-gui` using the CLI in `ui/node_modules/.bin`.
 
 ### The bundler downloads its own tools
 

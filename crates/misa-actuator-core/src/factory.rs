@@ -167,6 +167,33 @@ pub fn known_models(kind: DriverKind) -> Vec<&'static str> {
     }
 }
 
+/// A characterization torque ceiling to start from, keyed by model name (N·m).
+///
+/// One tenth of the model's MIT quantisation full scale. **That scale is a peak
+/// figure, not a rated one**, so a tenth of it is nearer a third of rated torque
+/// than a tenth — this is a deliberately loose starting point, chosen on
+/// 2026-08-06 over the 1 N·m default that an RS-03 geared joint could not move
+/// under at all. Rated torque is not available here: it appears in no
+/// datasheet this workspace carries, and inventing one would be worse than
+/// deriving from a figure that is actually known.
+///
+/// A default in a visible field, not a limit. The operator can lower it, every
+/// raise is logged by the worker, and nothing raises it silently.
+///
+/// RobStride only. The other families keep the gentle default: they report real
+/// torque, so they do not run into the case this exists for.
+pub fn suggested_torque_limits() -> std::collections::BTreeMap<String, f32> {
+    MotorModel::CATALOGUE
+        .iter()
+        .map(|(name, model)| {
+            (
+                (*name).to_string(),
+                robstride_driver::MitScales::for_model(*model).torque / 10.0,
+            )
+        })
+        .collect()
+}
+
 /// Every driver family, for building a selector.
 pub const ALL_DRIVERS: &[DriverKind] = &[
     DriverKind::Sim,

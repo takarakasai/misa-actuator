@@ -141,7 +141,6 @@ mod tests {
         assert_eq!(centi_amps, 250);
     }
 
-    #[test]
     /// A control reply's position is 1°/LSB unless the fine reading is asked
     /// for, and asking for it costs a round trip.
     ///

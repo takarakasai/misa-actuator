@@ -1340,6 +1340,35 @@ fn load_map_data(m: misa_sysid::LoadMap) -> (CharacterizeData, String) {
                 None => "needs a return sweep".to_string(),
             },
         ),
+        // Same question a breakaway map answers with "span travelled": a load
+        // map that never moved reports friction over an angle it did not visit.
+        (
+            "span travelled".to_string(),
+            {
+                let requested = (m.spec.to_rad - m.spec.from_rad).abs();
+                let ps: Vec<f32> = m
+                    .points
+                    .iter()
+                    .map(|p| p.position_rad)
+                    .filter(|v| v.is_finite())
+                    .collect();
+                let reached = match (
+                    ps.iter().copied().reduce(f32::min),
+                    ps.iter().copied().reduce(f32::max),
+                ) {
+                    (Some(lo), Some(hi)) => hi - lo,
+                    _ => 0.0,
+                };
+                if requested > 0.0 && reached / requested < 0.8 {
+                    format!(
+                        "{reached:.3} of {requested:.3} rad — the shaft did not visit the \
+                         span, so the angle figures describe one place"
+                    )
+                } else {
+                    format!("{reached:.3} of {requested:.3} rad")
+                }
+            },
+        ),
         // `static_load_curve` is friction *per position*, and reporting only its
         // mean threw the angle dependence away — which for a geared joint is
         // often the interesting part. The range says whether one number can
@@ -1672,6 +1701,43 @@ fn breakaway_map_data(m: misa_sysid::BreakawayMap) -> (CharacterizeData, String)
         },
     ));
     summary.push(("positions".to_string(), m.points.len().to_string()));
+
+    // Did the shaft actually visit the span it was asked to? The run reports
+    // stiction per position and says nothing about whether the positions are
+    // where they were meant to be — so a joint that never travelled produced
+    // five readings from one place and looked like a map (2026-08-08, an RMD-X4
+    // that spanned 0.016 rad of a requested 0.6). Angle dependence measured
+    // over a span that did not happen is not angle dependence.
+    let requested = (m.spec.to_rad - m.spec.from_rad).abs();
+    let reached = {
+        let ps: Vec<f32> = m
+            .points
+            .iter()
+            .map(|p| p.position_rad)
+            .filter(|v| v.is_finite())
+            .collect();
+        match (
+            ps.iter().copied().reduce(f32::min),
+            ps.iter().copied().reduce(f32::max),
+        ) {
+            (Some(lo), Some(hi)) => hi - lo,
+            _ => 0.0,
+        }
+    };
+    if requested > 0.0 {
+        let fraction = reached / requested;
+        summary.push((
+            "span travelled".to_string(),
+            if fraction < 0.8 {
+                format!(
+                    "{reached:.3} of {requested:.3} rad — the shaft did not visit the span, \
+                     so the angle figures describe one place"
+                )
+            } else {
+                format!("{reached:.3} of {requested:.3} rad")
+            },
+        ));
+    }
 
 
     let note = match m.mean_stiction_nm() {

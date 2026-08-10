@@ -106,7 +106,15 @@ pub struct DriverConfig {
     pub baud: u32,
     /// Lkmotor: gear ratio (e.g. 10.0 for 1:10 gearbox). Ignored for robstride.
     pub gear_ratio: f32,
-    /// Lkmotor / Myactuator: torque constant Kt (N·m/A). 0 → current-units mode.
+    /// Torque constant Kt (N·m/A). 0 means "use whatever the motor reports".
+    ///
+    /// Lkmotor / Myactuator: 0 selects current-units mode. **RobStride: a
+    /// non-zero value makes the driver synthesize torque from current**, which is
+    /// the only way to measure anything torque-based on firmware that reports
+    /// `MeasuredTorque` as a constant zero. Measure it with
+    /// `robstride-cli characterize kt` (an RS-04 measured 1.5093) or take it from
+    /// the datasheet; a real reading is always preferred, so this changes nothing
+    /// on healthy firmware.
     pub kt: f32,
     /// Damiao: physical CAN layer (classic CAN or CAN-FD). Ignored otherwise.
     pub bus_kind: BusKind,
@@ -242,6 +250,23 @@ pub fn build_actuator_checked(
             motor
                 .set_timeout(cfg.timeout)
                 .context("failed to set CAN socket timeout")?;
+            // Some firmware returns a constant 0 for `MeasuredTorque`, which
+            // leaves every torque-based measurement with nothing to measure —
+            // confirmed again on 2026-08-06 on an RS-03, where a velocity-mode
+            // spin reported 0.000 N·m throughout while the shaft turned at the
+            // commanded speed. `IqFilt` works there, so `torque = current · Kt`
+            // recovers it.
+            //
+            // Deriving torque needs a current reading, so a Kt implies asking for
+            // one — the same rule `robstride-cli --kt` follows, rather than
+            // accepting a Kt and silently doing nothing with it.
+            if cfg.kt > 0.0 {
+                motor.set_report_current(true);
+                motor.set_torque_constant(cfg.kt);
+                if motor.torque_constant().is_none() {
+                    bail!("kt must be finite and positive, got {}", cfg.kt);
+                }
+            }
             let report = robstride_identity(&mut motor, model, &cfg.model);
             Ok((Box::new(motor), report))
         }

@@ -379,7 +379,43 @@ pub fn build_actuator_checked(
             motor
                 .set_timeout(cfg.timeout)
                 .context("failed to set CAN socket timeout")?;
-            Ok((Box::new(motor), IdentityReport::default()))
+
+            // Ask the motor for its own Kt unless one was supplied. Without it
+            // the driver runs in current-units mode, where `torque_nm` *is*
+            // amps: every figure on screen is off by the ratio and nothing
+            // says so — a real RMD-X4-P36-36 reports 1.1, so an unset Kt
+            // understates torque by ten percent, and a Kt run on this family
+            // returns exactly 1.0000 at R² 1.0000 because it is measuring the
+            // identity map rather than the motor (2026-08-08).
+            //
+            // `KT_OUT` sits in the undocumented `0xC0` block. The caution
+            // against undocumented spaces on record is about **RobStride's**
+            // bulk parameter table, which left motors unresponsive twice; this
+            // is a different family's block with no such history, and it is a
+            // single parameter read rather than a table sweep.
+            //
+            // A failure is logged and left alone rather than propagated: the
+            // motor is open and usable, and refusing to connect because one
+            // register would not answer would be the worse trade. The units are
+            // then current, which the log line says.
+            let identity = if cfg.kt > 0.0 {
+                IdentityReport::default()
+            } else {
+                match motor.refresh_torque_constant() {
+                    Ok(kt) => IdentityReport {
+                        observed: format!("KT_OUT {kt} N·m/A"),
+                        ..IdentityReport::default()
+                    },
+                    Err(e) => IdentityReport {
+                        warning: Some(format!(
+                            "could not read KT_OUT ({e}); torque figures are amps, \
+                             not N·m — supply --kt to fix the units"
+                        )),
+                        ..IdentityReport::default()
+                    },
+                }
+            };
+            Ok((Box::new(motor), identity))
         }
         DriverKind::Sim => {
             // Same sentinel handling as DAMIAO: the shared `--model` default

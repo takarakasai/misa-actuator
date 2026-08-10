@@ -1,8 +1,14 @@
 # misa-actuator
 
 Common actuator-control interface for multiple servo-motor families on
-multiple bus transports, plus a debug TUI. Runs on Linux and Windows — see
-[`doc/windows.md`](doc/windows.md) for the Windows setup.
+multiple bus transports, plus a debug TUI and a desktop GUI. Runs on Linux and
+Windows — see [`doc/windows.md`](doc/windows.md) for the Windows setup and for
+building the GUI.
+
+**Picking this up after a break, or for the first time?** Start with
+[`doc/handover.md`](doc/handover.md). It carries the things the code cannot
+tell you: what the motors actually reported on a bench, why several decisions
+went the way they did, and the traps that have already cost time once.
 
 ## Workspace layout
 

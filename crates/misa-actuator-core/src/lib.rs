@@ -55,6 +55,7 @@
 //!    confirm, so a closing window cannot outlive a driven motor.
 
 pub mod factory;
+pub mod multi;
 pub mod protocol;
 pub mod session;
 pub(crate) mod worker;

@@ -436,7 +436,7 @@ fn robstride_named_identity(
 /// Never fails the connection. A motor that will not answer a parameter read
 /// is still a motor you may need to talk to, and an unanswered question is not
 /// a wrong answer.
-fn robstride_identity<B: robstride_driver::RobstrideBus>(
+pub(crate) fn robstride_identity<B: robstride_driver::RobstrideBus>(
     motor: &mut RsMotor<B>,
     selected: MotorModel,
     selected_name: &str,
@@ -553,7 +553,7 @@ fn robstride_identity<B: robstride_driver::RobstrideBus>(
 /// removes the guess entirely and the selected model stops mattering for
 /// scaling. Failure is reported, not fatal — the per-model defaults still
 /// apply, which is what the driver would have used anyway.
-fn damiao_identity<B: damiao_driver::DamiaoBus>(
+pub(crate) fn damiao_identity<B: damiao_driver::DamiaoBus>(
     motor: &mut DamiaoMotor<B>,
     selected: DmModel,
 ) -> IdentityReport {

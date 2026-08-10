@@ -63,6 +63,13 @@ pub struct BatchResult {
     /// The run's own one-line finding, or why there is none.
     pub headline: String,
     pub csv_path: Option<String>,
+    /// The curve and findings, kept so the result can be *looked at* rather than
+    /// only summarised.
+    ///
+    /// A headline per run made a batch's output a list of sentences, and the
+    /// whole point of measuring several motors is comparing their curves. The
+    /// alternative was reopening each CSV by hand, which is not a UI.
+    pub data: Option<crate::protocol::CharacterizeData>,
 }
 
 /// How far a batch has got, and what it has found so far.
@@ -194,6 +201,7 @@ fn run(spec: BatchSpec, progress: &Mutex<BatchProgress>, cancel: &AtomicBool) {
                         ok: false,
                         headline: format!("{e:#}"),
                         csv_path: None,
+                        data: None,
                     },
                 );
                 continue;
@@ -270,6 +278,7 @@ struct Outcome {
     headline: String,
     csv_path: Option<String>,
     fitted_kt: Option<f32>,
+    data: Option<crate::protocol::CharacterizeData>,
 }
 
 impl Outcome {
@@ -280,6 +289,7 @@ impl Outcome {
             ok: self.ok,
             headline: self.headline,
             csv_path: self.csv_path,
+            data: self.data,
         }
     }
 }
@@ -306,6 +316,7 @@ fn one_run(
             headline: "the motor worker stopped before the run began".to_string(),
             csv_path: None,
             fitted_kt: None,
+            data: None,
         });
     }
 
@@ -325,6 +336,7 @@ fn one_run(
                 headline: format!("no result after {} s", RUN_TIMEOUT.as_secs()),
                 csv_path: None,
                 fitted_kt: None,
+                data: None,
             });
         }
 
@@ -357,6 +369,7 @@ fn one_run(
                         },
                         csv_path,
                         fitted_kt,
+                        data,
                     });
                 }
                 // Kept so the finished event can report it. `JobFailed` arrives

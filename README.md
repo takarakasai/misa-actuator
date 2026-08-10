@@ -208,6 +208,13 @@ makes it more than a stub: a characterization run against the simulator has a
 *known right answer*, which no real motor can offer. `misa-actuator-sim`'s
 integration tests assert that `misa-sysid` recovers the planted values.
 
+The quasi-static runs measure three different things and are easy to confuse —
+a load map is a curve about *position*, breakaway is the threshold to *start*
+moving, a velocity sweep is the cost of *staying* in motion.
+[`doc/friction.md`](doc/friction.md) sets out which to reach for, how they
+cross-check each other, and how to tell a result you can trust from one where
+the shaft was hunting.
+
 ## Platform notes
 
 Linux is the reference platform. Windows is fully supported with two

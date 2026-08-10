@@ -128,15 +128,21 @@ std::mem::forget(motor);
 
 | コマンド | 危険 |
 |---|---|
-| `damiao-cli reg-write RID VALUE --save` | **無検証**。`PMAX`/`VMAX`/`TMAX`（MIT スケール）、保護閾値、`CAN_BR` まで書けて flash に即確定 |
+| `damiao-cli reg-write RID VALUE --save` | **値の検証は無い**。`PMAX`/`VMAX`/`TMAX`（MIT スケール）、保護閾値、`CAN_BR` まで書けて flash に即確定。2026-08-02 以降、危険レジスタは書き込み前に警告を出す（下記） |
 | `robstride-cli set-id` | ID 変更。**過去に RS-04 が 1 日応答しなくなった実例あり** |
 | `robstride-cli set-zero` | **永続性が不明**。DAMIAO の `--nvm`、MyActuator の `--rom` に相当するフラグも説明も無い。誰も確かめていない |
 | `damiao-cli zero --nvm` / `myactuator-cli zero --rom` | flash 書き込み。摩耗する |
 | `damiao-cli factory-reset` | 校正値ごと消える |
 
 `lkmotor-cli` には**正しいパターンが既にある** — `is_risky()` で危険パラメータを
-判定し、上記 RS-04 の事故を引用して警告する。**DAMIAO の `reg-write` には適用されて
-いない。** 書き込み経路を触るならまずこれを揃えること。
+判定し、上記 RS-04 の事故を引用して警告する。**2026-08-02 に `damiao-cli reg-write`
+にも同じものを入れた**（`RegisterRisk` / `register_risk()`）。通信系（`MST_ID` /
+`ESC_ID` / `TIMEOUT` / `CAN_BR`）、MIT スケール（`PMAX`/`VMAX`/`TMAX`）、保護閾値、
+マニュアルが読み取り専用とする校正・識別値の 4 クラスを、書き込み前に警告する。
+
+**警告するだけで、値そのものは検証していない。** `--save` の flash 確定も止めない
+（CLI 全体が警告して続行する方式で、確認プロンプトはどこにも無い）。範囲検証は
+未着手 — レジスタの範囲は `Rid` の doc コメントに転記済みなので、やるならそこから。
 
 ### 安全エンベロープの実効性
 
@@ -598,7 +604,7 @@ RobStride の param table と MyActuator の `0xC0`。ここにしかない値�
 | SLCAN 実機検証 | **DM-J4310 では検証できない**（FD 非対応）。RobStride か MyActuator で |
 | GUI Characterize タブの実機確認 | 測定エンジン自体は検証済み。**RS-04 でやるなら `--kt 1.5093` 相当と、1 N·m を超える枠が要る** |
 | RS-04 Sysid 撮り直し | 下記 |
-| Params 書き込み | まず `damiao-cli reg-write` に `lkmotor-cli` 相当のガードを |
+| Params 書き込み | `reg-write` の警告は入れた（2026-08-02、§2）。次は値の範囲検証 |
 | gs_usb バックエンド | 未着手 |
 
 ### DAMIAO FD 欠落の再測定（最優先）

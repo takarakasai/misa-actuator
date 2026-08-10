@@ -269,6 +269,11 @@ enum Command {
         rid: u8,
     },
     /// Write a register (RID). Float by default; pass --int for an integer.
+    ///
+    /// The value is written as given — nothing range-checks it. Registers that
+    /// can make the motor unreachable (ids, bitrate, timeout), silently
+    /// mis-scale every command (PMAX/VMAX/TMAX), weaken a protection threshold,
+    /// or overwrite a read-only calibration value print a warning first.
     RegWrite {
         rid: u8,
         #[arg(allow_hyphen_values = true)]
@@ -319,6 +324,88 @@ enum Command {
         #[arg(long, default_value = "chirp_bode.csv")]
         bode: String,
     },
+}
+
+/// How a `reg-write` to a given register can go wrong.
+///
+/// `reg-write` takes a bare RID and writes whatever number follows it, and
+/// `--save` commits that to flash in the same breath. `lkmotor-cli` already
+/// warns before the writes that can make a motor unreachable
+/// (`SettingParamArg::is_risky`); this is the same guard, widened to the
+/// failure modes this register block adds.
+///
+/// Warn and proceed, rather than refuse: this is a diagnostic tool and the
+/// operator may well mean it. What was missing is any statement of what the
+/// write does before it goes out on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegisterRisk {
+    /// Changes where or how the motor talks. Get it wrong and it stops
+    /// answering on this interface.
+    Communication,
+    /// The MIT quantisation range itself.
+    Scaling,
+    /// A protection threshold.
+    Protection,
+    /// Read-only per the manuals: calibration constants and identity.
+    ReadOnly,
+    /// Writable, with no documented hazard beyond `--save` being permanent.
+    Ordinary,
+}
+
+impl RegisterRisk {
+    /// What to tell the operator, or `None` when there is nothing specific to
+    /// say. Phrased as the consequence, not the category.
+    fn hazard(self) -> Option<&'static str> {
+        match self {
+            RegisterRisk::Communication => Some(
+                "changes the CAN id, master id, bitrate or timeout this motor communicates \
+                 on. If the new value is wrong the motor stops answering on this interface \
+                 — a RobStride unit took a day to come back from the equivalent mistake. \
+                 Change one motor at a time and write down the previous value.",
+            ),
+            RegisterRisk::Scaling => Some(
+                "is one of PMAX/VMAX/TMAX, the MIT quantisation ranges. Every position, \
+                 velocity and torque value on the wire is scaled by these, so a wrong one \
+                 produces no error and no fault — just every command silently off by a \
+                 factor.",
+            ),
+            RegisterRisk::Protection => Some(
+                "is a protection threshold (under/over-voltage, over-temperature, \
+                 over-current). Loosening it removes the limit that stops the motor \
+                 damaging itself.",
+            ),
+            RegisterRisk::ReadOnly => Some(
+                "is read-only in the manuals — a calibration or identity value the motor \
+                 measured for itself. Of the gear ratio the manual says: \"This parameter \
+                 is preconfigured. Do not modify.\" Nothing in this tool can restore the \
+                 original value.",
+            ),
+            RegisterRisk::Ordinary => None,
+        }
+    }
+}
+
+/// Classify a raw RID. Ranges come from [`Rid`]'s own documentation, which is
+/// transcribed from the DM-J4310-2EC / DM-J3507-2EC manuals.
+fn register_risk(rid: u8) -> RegisterRisk {
+    match rid {
+        Rid::MST_ID | Rid::ESC_ID | Rid::TIMEOUT | Rid::CAN_BR => RegisterRisk::Communication,
+        Rid::PMAX | Rid::VMAX | Rid::TMAX => RegisterRisk::Scaling,
+        Rid::UV_VALUE | Rid::OV_VALUE | Rid::OT_VALUE | Rid::OC_VALUE => RegisterRisk::Protection,
+        Rid::DAMP
+        | Rid::INERTIA
+        | Rid::HW_VER
+        | Rid::SW_VER
+        | Rid::SN
+        | Rid::NPP
+        | Rid::RS
+        | Rid::LS
+        | Rid::FLUX
+        | Rid::GR
+        | Rid::SUB_VER
+        | Rid::BOOT_VER => RegisterRisk::ReadOnly,
+        _ => RegisterRisk::Ordinary,
+    }
 }
 
 fn main() -> Result<()> {
@@ -636,6 +723,17 @@ fn run<B: DamiaoBus>(motor: &mut DamiaoMotor<B>, cli: &Cli) -> Result<()> {
             int,
             save,
         } => {
+            // Before the write, not after: this is the only thing on the path
+            // that says what the RID means.
+            if let Some(hazard) = register_risk(*rid).hazard() {
+                eprintln!("warning: RID {rid} {hazard}");
+            }
+            if *save {
+                eprintln!(
+                    "warning: --save commits this to flash straight away. It survives a \
+                     power cycle, and flash wears out."
+                );
+            }
             if *int {
                 motor.write_register_int(*rid, *value as i32)?;
                 println!("wrote RID {rid} = {} (int)", *value as i32);
@@ -1316,6 +1414,79 @@ mod tests {
         for d in [&dm4310, &dm3507] {
             assert!(d.values.contains_key("m_off"));
             assert!(!d.not_on_this_model.contains(&"m_off"));
+        }
+    }
+
+    /// The hazard table is hand-written against the manuals' register map, and
+    /// a register in the wrong bucket fails silently — the write still goes
+    /// out, just without its warning. Pin the classes that matter.
+    #[test]
+    fn dangerous_registers_are_classified() {
+        for rid in [Rid::MST_ID, Rid::ESC_ID, Rid::TIMEOUT, Rid::CAN_BR] {
+            assert_eq!(register_risk(rid), RegisterRisk::Communication, "RID {rid}");
+        }
+        for rid in [Rid::PMAX, Rid::VMAX, Rid::TMAX] {
+            assert_eq!(register_risk(rid), RegisterRisk::Scaling, "RID {rid}");
+        }
+        for rid in [Rid::UV_VALUE, Rid::OV_VALUE, Rid::OT_VALUE, Rid::OC_VALUE] {
+            assert_eq!(register_risk(rid), RegisterRisk::Protection, "RID {rid}");
+        }
+        // Every register the manuals mark read-only, including the calibration
+        // constants the motor identified for itself.
+        for rid in [
+            Rid::DAMP,
+            Rid::INERTIA,
+            Rid::HW_VER,
+            Rid::SW_VER,
+            Rid::SN,
+            Rid::NPP,
+            Rid::RS,
+            Rid::LS,
+            Rid::FLUX,
+            Rid::GR,
+            Rid::SUB_VER,
+            Rid::BOOT_VER,
+        ] {
+            assert_eq!(register_risk(rid), RegisterRisk::ReadOnly, "RID {rid}");
+        }
+    }
+
+    /// Ordinary tuning registers must stay quiet, or the warning becomes noise
+    /// that gets ignored on the writes that matter.
+    #[test]
+    fn ordinary_registers_warn_about_nothing() {
+        for rid in [
+            Rid::ACC,
+            Rid::DEC,
+            Rid::MAX_SPD,
+            Rid::CTRL_MODE,
+            Rid::KP_ASR,
+            Rid::KI_ASR,
+            Rid::KP_APR,
+            Rid::KI_APR,
+            Rid::I_BW,
+            Rid::GREF,
+            Rid::DETA,
+            Rid::V_BW,
+            Rid::IQ_C1,
+            Rid::VL_C1,
+            Rid::KT_VALUE,
+        ] {
+            assert_eq!(register_risk(rid), RegisterRisk::Ordinary, "RID {rid}");
+            assert!(register_risk(rid).hazard().is_none(), "RID {rid}");
+        }
+    }
+
+    /// Anything classified as risky must actually have something to say.
+    #[test]
+    fn every_risky_class_has_a_hazard_message() {
+        for rid in 0..=Rid::BOOT_VER {
+            let risk = register_risk(rid);
+            assert_eq!(
+                risk.hazard().is_some(),
+                risk != RegisterRisk::Ordinary,
+                "RID {rid} classified {risk:?} but its message disagrees"
+            );
         }
     }
 }

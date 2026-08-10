@@ -358,6 +358,64 @@ pub fn build_actuator_checked(
     }
 }
 
+/// What to report when the firmware version named the model, given what the
+/// second channel said about it.
+///
+/// Pure, so the disagreement logic can be tested without a bus — RobStride has
+/// no mock transport, and this is the branch where being wrong is quietest.
+fn robstride_named_identity(
+    model: MotorModel,
+    line: robstride_driver::ProductLine,
+    selected: MotorModel,
+    label: &str,
+    version_text: &str,
+    seen: robstride_driver::ReportedLimits,
+) -> IdentityReport {
+    let called = line.catalogue_name(model);
+
+    let mut observed = format!("firmware {version_text} identifies this as {called}");
+    if let Some(t) = seen.limit_torque {
+        observed.push_str(&format!("; limit_torque {t:.3} N·m"));
+    }
+    if let Some(v) = seen.limit_spd {
+        observed.push_str(&format!("; limit_spd {v:.3} rad/s"));
+    }
+
+    // Only a refutation counts. An unanswered read is not a wrong answer, and
+    // `consistent_with` passes anything it cannot rule out.
+    let contradiction = (!seen.is_empty() && !seen.consistent_with(model)).then(|| {
+        let scales = robstride_driver::MitScales::for_model(model);
+        format!(
+            "The two channels disagree: the firmware version says {called}, whose MIT \
+             range is ±{:.1} N·m / ±{:.1} rad/s, but the motor reports limits that range \
+             cannot express. Trust neither until this is resolved — the version→model \
+             mapping comes from one unit per product line and breaks if the vendor bumps \
+             a version component (doc/handover.md §4). Torque may be mis-scaled whichever \
+             channel is right.",
+            scales.torque, scales.velocity
+        )
+    });
+
+    let selection_warning = (model != selected).then(|| {
+        format!(
+            "{observed}, but the session was opened as {label}. MIT scaling is wrong — \
+             reconnect as {called}."
+        )
+    });
+
+    // Both can fire at once, and they say different things: one that the
+    // operator picked the wrong model, the other that we may not know which
+    // model is right.
+    let warning = match (selection_warning, contradiction) {
+        (Some(a), Some(b)) => Some(format!("{a} {b}")),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(format!("{observed}. {b}")),
+        (None, None) => None,
+    };
+
+    IdentityReport { observed, warning }
+}
+
 /// Ask a RobStride motor whether the selected model is even possible.
 ///
 /// Uses only the documented classic parameter reads (`limit_torque`,
@@ -409,28 +467,34 @@ fn robstride_identity<B: robstride_driver::RobstrideBus>(
     // vendor tool uses.
     let named = version.and_then(|v| MotorModel::from_firmware_version(v.version));
     if let Some((model, line)) = named {
-        let called = line.catalogue_name(model);
-        let observed = format!(
-            "firmware {} identifies this as {called}",
-            version.expect("named implies a version")
+        // Ask the second channel too, even though the version already answered.
+        //
+        // The version→model table rests on n = 1 per product line and has zero
+        // headroom: it decodes the minor byte as the model number, so a vendor
+        // who bumps the major once breaks it, and `0.5.x.x` on an EduLite would
+        // break it silently in the other direction. `limit_torque` is an
+        // independent channel — measured 115 N·m on the RS-04, 6 on the
+        // EduLite05 — and until now nothing compared the two. A disagreement is
+        // the only evidence available that the table has gone stale.
+        //
+        // Costs two documented register reads on every connect. They are the
+        // same reads the fallback path below already makes, so this adds round
+        // trips rather than risk, and `read_reported_limits` reports failure by
+        // returning nothing rather than by failing.
+        let seen = motor.read_reported_limits();
+        let report = robstride_named_identity(
+            model,
+            line,
+            selected,
+            &label,
+            &version.expect("named implies a version").to_string(),
+            seen,
         );
-        return if model == selected {
-            log::info!("{observed}; matches the selection");
-            IdentityReport {
-                observed,
-                warning: None,
-            }
-        } else {
-            let warning = format!(
-                "{observed}, but the session was opened as {label}. MIT scaling is \
-                 wrong — reconnect as {called}."
-            );
-            log::warn!("{warning}");
-            IdentityReport {
-                observed,
-                warning: Some(warning),
-            }
-        };
+        match &report.warning {
+            Some(w) => log::warn!("{w}"),
+            None => log::info!("{}; matches the selection", report.observed),
+        }
+        return report;
     }
 
     let seen = motor.read_reported_limits();
@@ -557,6 +621,102 @@ pub fn validate_driver_args(cfg: &DriverConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use robstride_driver::{ProductLine, ReportedLimits};
+
+    fn limits(torque: Option<f32>, speed: Option<f32>) -> ReportedLimits {
+        ReportedLimits {
+            limit_torque: torque,
+            limit_spd: speed,
+        }
+    }
+
+    /// The real RS-04: firmware `0.4.1.32`, `limit_torque` 115 N·m against a
+    /// ±120 MIT range. Both channels agree, so nothing should be said.
+    #[test]
+    fn agreeing_channels_produce_no_warning() {
+        let r = robstride_named_identity(
+            MotorModel::Rs04,
+            ProductLine::Rs,
+            MotorModel::Rs04,
+            "RS-04",
+            "0.4.1.32",
+            limits(Some(115.0), Some(1.0)),
+        );
+        assert!(r.warning.is_none(), "{:?}", r.warning);
+        assert!(r.observed.contains("115.000"), "the reading is shown: {}", r.observed);
+    }
+
+    /// The case this cross-check exists for: the version names a model whose
+    /// MIT range cannot express the limit the motor reports. Before this, the
+    /// version won unchallenged and the contradiction was never looked at.
+    ///
+    /// Fires **even though the operator's selection matches the version** —
+    /// agreement between the two things that could both be wrong is not
+    /// evidence.
+    #[test]
+    fn a_limit_the_named_model_cannot_express_is_reported() {
+        let r = robstride_named_identity(
+            MotorModel::Rs05,
+            ProductLine::EduLite,
+            MotorModel::Rs05,
+            "EduLite05",
+            "10.5.0.1",
+            // 115 N·m against an EduLite05's ±5.5.
+            limits(Some(115.0), None),
+        );
+        let w = r.warning.expect("a contradiction must be reported");
+        assert!(w.contains("disagree"), "{w}");
+        assert!(w.contains("handover.md"), "points at the evidence: {w}");
+    }
+
+    /// A wrong selection still reports as before, and says what to do.
+    #[test]
+    fn a_mismatched_selection_is_still_reported() {
+        let r = robstride_named_identity(
+            MotorModel::Rs04,
+            ProductLine::Rs,
+            MotorModel::Rs05,
+            "EduLite05",
+            "0.4.1.32",
+            limits(Some(115.0), None),
+        );
+        let w = r.warning.expect("a mismatch must be reported");
+        assert!(w.contains("reconnect as"), "{w}");
+        assert!(!w.contains("disagree"), "the channels agree here: {w}");
+    }
+
+    /// Both at once: the operator picked the wrong model *and* the channels
+    /// disagree. Neither message may swallow the other — they call for
+    /// different actions.
+    #[test]
+    fn both_problems_are_reported_together() {
+        let r = robstride_named_identity(
+            MotorModel::Rs05,
+            ProductLine::EduLite,
+            MotorModel::Rs04,
+            "RS-04",
+            "10.5.0.1",
+            limits(Some(115.0), None),
+        );
+        let w = r.warning.expect("two problems must be reported");
+        assert!(w.contains("reconnect as"), "{w}");
+        assert!(w.contains("disagree"), "{w}");
+    }
+
+    /// A motor that will not answer the parameter read must not look like a
+    /// motor that answered wrongly. Silence is not a contradiction.
+    #[test]
+    fn unanswered_limits_are_not_a_contradiction() {
+        let r = robstride_named_identity(
+            MotorModel::Rs05,
+            ProductLine::EduLite,
+            MotorModel::Rs05,
+            "EduLite05",
+            "10.5.0.1",
+            limits(None, None),
+        );
+        assert!(r.warning.is_none(), "{:?}", r.warning);
+    }
 
     /// The sentinel has to be something no operator can legitimately type.
     /// It used to be `"Edulite05"`, so "I didn't say" and "I want an EduLite05"

@@ -408,7 +408,50 @@ pub const SCANNABLE: &[DriverKind] = &[
 ///
 /// The vendor is always reported. The model is reported only when the protocol
 /// answers, because the alternative is presenting a guess as a reading.
+/// Where a scan has got to, reported once per id probed.
+///
+/// Carries the family as well as the position within it, because a scan sweeps
+/// the whole range once **per family** — three times over for the default
+/// selection. A bare `index/total` would run to the end and start again, which
+/// reads as a stall or a restart rather than as progress.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanStep<'a> {
+    pub family: &'a str,
+    pub family_index: usize,
+    pub family_count: usize,
+    /// Position within this family's sweep.
+    pub index: usize,
+    pub total: usize,
+    pub motor_id: u8,
+}
+
+impl ScanStep<'_> {
+    /// Progress across the whole scan, in `0..=1`.
+    pub fn fraction(&self) -> f32 {
+        if self.family_count == 0 || self.total == 0 {
+            return 0.0;
+        }
+        let within = self.index as f32 / self.total as f32;
+        ((self.family_index as f32 + within) / self.family_count as f32).clamp(0.0, 1.0)
+    }
+}
+
+/// Callback fed one [`ScanStep`] per id probed.
+pub type ScanProgress<'a> = &'a mut dyn FnMut(ScanStep<'_>);
+
 pub fn scan_for_motors(req: &ScanRequest) -> Result<Vec<ScanHit>> {
+    scan_for_motors_with(req, None)
+}
+
+/// [`scan_for_motors`], reporting each id as it is probed.
+///
+/// The per-id hook already existed in every driver's `scan_bus_on`; this passed
+/// `None` to all of them, so a scan that takes seconds looked identical to one
+/// that had hung.
+pub fn scan_for_motors_with(
+    req: &ScanRequest,
+    mut progress: Option<ScanProgress<'_>>,
+) -> Result<Vec<ScanHit>> {
     if req.to < req.from {
         bail!("scan range is inverted: {}..{}", req.from, req.to);
     }
@@ -459,7 +502,23 @@ pub fn scan_for_motors(req: &ScanRequest) -> Result<Vec<ScanHit>> {
     let timeout = Duration::from_millis(req.timeout_ms);
     let range = req.from..=req.to;
 
-    for driver in can {
+    let family_count = can.len();
+    for (family_index, driver) in can.into_iter().enumerate() {
+        // One adapter per family, so each family's own `(index, total)` is
+        // widened into a position across the whole scan.
+        let family = driver.as_str();
+        let mut relay = |index: usize, total: usize, motor_id: u8| {
+            if let Some(cb) = progress.as_mut() {
+                cb(ScanStep {
+                    family,
+                    family_index,
+                    family_count,
+                    index,
+                    total,
+                    motor_id,
+                });
+            }
+        };
         match driver {
             DriverKind::Robstride => {
                 let mut adapter = robstride_driver::CanBus::new(shared.clone());
@@ -468,7 +527,7 @@ pub fn scan_for_motors(req: &ScanRequest) -> Result<Vec<ScanHit>> {
                     robstride_driver::DEFAULT_HOST_ID,
                     range.clone(),
                     timeout,
-                    None,
+                    Some(&mut relay),
                 )
                 .unwrap_or_default();
                 for r in found {
@@ -481,7 +540,7 @@ pub fn scan_for_motors(req: &ScanRequest) -> Result<Vec<ScanHit>> {
                     &mut adapter,
                     range.clone(),
                     timeout,
-                    None,
+                    Some(&mut relay),
                 )
                 .unwrap_or_default();
                 for id in found {
@@ -499,7 +558,7 @@ pub fn scan_for_motors(req: &ScanRequest) -> Result<Vec<ScanHit>> {
                     BusKind::CanFd => damiao_driver::CanBus::new_fd(shared.clone()),
                 };
                 let found =
-                    damiao_driver::scan_bus_on(&mut adapter, range.clone(), timeout, None)
+                    damiao_driver::scan_bus_on(&mut adapter, range.clone(), timeout, Some(&mut relay))
                         .unwrap_or_default();
                 for id in found {
                     hits.push(damiao_hit(&shared, req.bus, id, timeout));

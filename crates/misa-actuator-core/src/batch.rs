@@ -38,6 +38,17 @@ const WAIT_TICK: Duration = Duration::from_millis(50);
 #[derive(Debug, Clone)]
 pub struct BatchMotor {
     pub id: u8,
+    /// Which family this motor is, where the scan could say.
+    ///
+    /// Per motor because a CAN wire carries mixed vendors — a MyActuator at id 1
+    /// beside RobStrides at 2 and 3 is a real configuration, not a mistake — and
+    /// a scan reports the family it answered as. One family for the whole batch
+    /// would open every motor with the wrong protocol for some of them, which is
+    /// the third time this shape of bug has appeared here: after the model and
+    /// the torque ceiling, the driver was still being collapsed.
+    ///
+    /// `None` falls back to [`BatchSpec::driver`].
+    pub driver: Option<DriverKind>,
     /// This motor's own model, where it is known.
     ///
     /// Per motor rather than one for the batch, because the model sets the MIT
@@ -220,7 +231,7 @@ fn run(spec: BatchSpec, progress: &Mutex<BatchProgress>, cancel: &AtomicBool) {
         }
 
         let cfg = DriverConfig {
-            kind: spec.driver,
+            kind: motor.driver.unwrap_or(spec.driver),
             interface: spec.interface.clone(),
             motor_id,
             // This motor's own model wins over the batch's fallback. Getting it
@@ -547,6 +558,7 @@ mod tests {
                 .into_iter()
                 .map(|id| BatchMotor {
                     id,
+                    driver: None,
                     model: None,
                     max_torque_nm: None,
                 })
@@ -689,11 +701,13 @@ mod tests {
         spec.motors = vec![
             BatchMotor {
                 id: 1,
+                driver: None,
                 model: Some("rs04".to_string()),
                 max_torque_nm: None,
             },
             BatchMotor {
                 id: 2,
+                driver: None,
                 model: None,
                 max_torque_nm: None,
             },
@@ -765,6 +779,41 @@ mod tests {
             bins: 12,
         };
         assert_eq!(ramp_for(sweep, 0.55, false), sweep);
+    }
+
+    /// A CAN wire carries mixed vendors, so each motor opens as its own family.
+    ///
+    /// The batch's fallback is a family the simulator is not, so the motor
+    /// carrying `Sim` opens and the one relying on the fallback does not — a
+    /// direct read on which value reached the driver, as with the model.
+    #[test]
+    fn each_motor_opens_as_its_own_family() {
+        let mut spec = sim_spec(vec![], vec![quick_breakaway()]);
+        spec.driver = DriverKind::Robstride;
+        spec.motors = vec![
+            BatchMotor {
+                id: 1,
+                driver: Some(DriverKind::Sim),
+                model: Some("rs04".to_string()),
+                max_torque_nm: None,
+            },
+            BatchMotor {
+                id: 2,
+                driver: None,
+                model: Some("rs04".to_string()),
+                max_torque_nm: None,
+            },
+        ];
+        let p = wait_done(&spawn(spec), Duration::from_secs(60));
+
+        assert_eq!(p.results.len(), 2, "{:?}", p.results);
+        let by_id = |id: u8| p.results.iter().find(|r| r.motor_id == id).unwrap();
+        assert!(by_id(1).ok, "the simulated motor should have run: {:?}", by_id(1));
+        assert!(
+            !by_id(2).ok,
+            "the one falling back to RobStride has no bus to open: {:?}",
+            by_id(2)
+        );
     }
 
     #[test]

@@ -246,6 +246,15 @@ pub fn write_run_csv(
 mod tests {
     use super::*;
 
+    /// Serialises the tests that touch process-wide state.
+    ///
+    /// Two of them do: one sets the environment variable, the other writes the
+    /// settings file, and `data_dir()` consults both. Run in parallel they see
+    /// each other's setup and fail on assertions about the fallback — observed
+    /// 2026-08-08, passing under `--test-threads=1` and failing without it,
+    /// which is the signature of exactly this.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn the_stamp_is_a_real_utc_date() {
         // 2026-08-08T04:15:30Z. Cross-checked by hand: 1970-01-01 to 2026-01-01
@@ -288,9 +297,11 @@ mod tests {
     /// test runner is threaded.
     #[test]
     fn the_data_directory_can_be_pointed_somewhere_else() {
-        // SAFETY-ish: single test touching this variable, and it is restored
-        // before returning. Rust 2024 marks `set_var` unsafe for exactly the
-        // data race this comment is promising not to cause.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Any remembered directory would win the fallback assertions below, so
+        // this test owns that state too for its duration.
+        let restore_file = fs::read_to_string(settings_path()).ok();
+        set_data_dir(None).ok();
         let restore = std::env::var_os(DATA_DIR_ENV);
         let set = |v: Option<&str>| match v {
             Some(v) => std::env::set_var(DATA_DIR_ENV, v),
@@ -311,12 +322,16 @@ mod tests {
         assert!(data_dir().ends_with("misa-actuator-data"), "{:?}", data_dir());
 
         set(restore.as_deref().and_then(|s| s.to_str()));
+        if let Some(text) = restore_file {
+            fs::write(settings_path(), text).ok();
+        }
     }
 
     /// A remembered directory has to survive a restart, or picking one is
     /// theatre — and a remembered one that has gone away must not be honoured.
     #[test]
     fn a_chosen_directory_is_remembered_and_a_vanished_one_is_not() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // The settings file lives beside the default output directory, so this
         // touches real paths. Restored at the end.
         let restore = fs::read_to_string(settings_path()).ok();

@@ -1520,9 +1520,18 @@ fn breakaway_data(b: misa_sysid::Breakaway) -> (CharacterizeData, String) {
     let y: Vec<f32> = b.points.iter().map(|p| p.cmd).collect();
     let measured: Vec<f32> = b.points.iter().map(|p| p.torque_nm).collect();
     let mut summary = Vec::new();
+    // A ramp that began while the shaft was still moving measured drag, not
+    // stiction. Carried on the figure itself rather than left in a neighbouring
+    // tile, because the figure travels: a batch list quotes the leading summary
+    // entry and nothing else, so an unrested 0.669 N·m sat in it looking exactly
+    // like a good measurement (2026-08-07).
+    let caveat = if b.rested { "" } else { " (not at rest)" };
     let note = match b.breakaway_torque_nm {
         Some(t) => {
-            summary.push(("breakaway torque".to_string(), format!("{t:.3} N·m")));
+            summary.push((
+                "breakaway torque".to_string(),
+                format!("{t:.3} N·m{caveat}"),
+            ));
             if let Some(p) = b.breakaway_position_rad {
                 summary.push(("at position".to_string(), format!("{p:+.4} rad")));
             }
@@ -1533,7 +1542,7 @@ fn breakaway_data(b: misa_sysid::Breakaway) -> (CharacterizeData, String) {
             // means the ramp ran out before anything moved.
             summary.push((
                 "breakaway torque".to_string(),
-                format!("not reached below {:.3} N·m", b.spec.max_torque_nm),
+                format!("not reached below {:.3} N·m{caveat}", b.spec.max_torque_nm),
             ));
             "did not break loose within the torque ceiling".to_string()
         }
@@ -1585,9 +1594,20 @@ fn breakaway_map_data(m: misa_sysid::BreakawayMap) -> (CharacterizeData, String)
     let stictions: Vec<f32> = m.points.iter().filter_map(|p| p.stiction_nm()).collect();
     let mut summary = Vec::new();
 
+    // Same reasoning as the single breakaway: the caveat rides on the figure,
+    // because the figure is what a batch list quotes.
+    let unrested = m.points.iter().filter(|p| !p.rested).count();
+    let caveat = if unrested == 0 {
+        String::new()
+    } else {
+        format!(" ({unrested} of {} not at rest)", m.points.len())
+    };
     match m.mean_stiction_nm() {
         Some(mean) => {
-            summary.push(("mean stiction".to_string(), format!("{mean:.3} N·m")));
+            summary.push((
+                "mean stiction".to_string(),
+                format!("{mean:.3} N·m{caveat}"),
+            ));
             // The point of sweeping angle at all: a spread comparable to the
             // mean means one figure cannot describe the joint, and that is the
             // finding rather than a caveat about it.
@@ -1632,16 +1652,6 @@ fn breakaway_map_data(m: misa_sysid::BreakawayMap) -> (CharacterizeData, String)
     ));
     summary.push(("positions".to_string(), m.points.len().to_string()));
 
-    // A ramp that started while the shaft was still moving measured drag, not
-    // stiction. Reported per run because it invalidates the figures rather than
-    // just adding noise to them.
-    let unrested = m.points.iter().filter(|p| !p.rested).count();
-    if unrested > 0 {
-        summary.push((
-            "not at rest".to_string(),
-            format!("{unrested} of {} positions", m.points.len()),
-        ));
-    }
 
     let note = match m.mean_stiction_nm() {
         Some(mean) => format!(

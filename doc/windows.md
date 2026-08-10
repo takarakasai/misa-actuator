@@ -81,6 +81,23 @@ Classic CAN accepts the fixed PCAN bitrate table (1M, 800K, 500K, 250K, 125K,
 100K, 95K, 83K, 50K, 47K, 33K, 20K, 10K, 5K). CAN-FD timings are derived for
 the adapter's 80 MHz clock at an 80 % sample point.
 
+### Finding out what is attached
+
+```powershell
+robstride-cli.exe interfaces        # same in damiao-cli and myactuator-cli
+```
+
+Opens nothing and puts no frame on any wire. PEAK channels come back named
+(`pcan:usb1  PCAN-USB Pro FD`); serial ports are marked `?` and listed with every
+protocol that could be behind them, because nothing about a port name says which
+one is. The GUI shows the same list as a dropdown next to `INTERFACE`, with `↻` to
+look again after plugging something in — and keeps a text field, since a device
+the driver does not report still needs opening.
+
+If a PEAK adapter is attached and missing from the list, the log says why: the
+enumeration compares the driver's channel count against how many it could name and
+warns when those disagree.
+
 ### SLCAN (CANable, candleLight, USBtin, ...) — cheap fallback
 
 The adapter appears as a virtual COM port and needs no vendor DLL, only its

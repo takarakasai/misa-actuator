@@ -851,6 +851,31 @@ P 版しか存在しないので識別不能になっていた。実機は DM431
   `embedBootstrapper`（+150 MB）
 - `npm run app:info`（`tauri info`）が設定不良の第一診断
 
+### PCAN のチャネル列挙: 使える問い合わせと使えない問い合わせ（2026-08-05 実測）
+
+`interfaces` / GUI のドロップダウンの実装で分かったこと。**PEAK 2 チャネル接続状態で
+実測**した。
+
+| 問い合わせ | 結果 |
+|---|---|
+| `PCAN_CHANNEL_CONDITION`（`0x0B`、チャネル単位） | **全滅**。32 回すべて `0x00001C00`（ILLHANDLE） |
+| `PCAN_ATTACHED_CHANNELS_COUNT`（`0x2A`、`PCAN_NONEBUS`） | **OK**。未接続 0、接続後 2 |
+| `PCAN_ATTACHED_CHANNELS`（`0x2B`、構造体配列） | **OK** |
+
+**チャネル単位の condition が「一番素直な方法」に見えるが動かない。** 台数を先に
+訊いて配列で取る経路を使うこと。`CAN_GetValue` は optional シンボルで解決している
+（古い DLL でも起動する）。
+
+`TPCANChannelInformation` のレイアウトはヘッダからの転記＝推測なので、
+**ハンドルが既知ファミリの範囲外なら結果全体を捨てる**チェックを入れてある。
+別ドライバでレイアウトが違えば「不完全なリスト」ではなく「リスト無し＋警告」になる。
+この個体では**ハンドル `0x0051`/`0x0052`・機種名 `"PCAN-USB Pro FD"`・condition 1 の
+3 つが同時に整合**したのでレイアウトは確認済み。
+
+**台数と命名できた数を突き合わせて、足りなければ警告する。** これが上記の
+ILLHANDLE を見つけた仕掛け。空リストが「無い」なのか「訊けなかった」なのかを
+区別できないと、列挙は嘘をつく。
+
 ### USB-CAN ドングルは「USB-CAN」と書いてあっても中身が違う（2026-08-05）
 
 **同じ見た目の筐体で少なくとも 3 プロトコルある。** 手元の Seeed「USB-CAN Analyzer
@@ -942,6 +967,7 @@ V7.00」で踏んだ。
 | コマンド | 用途 |
 |---|---|
 | `robstride-cli dump` / `myactuator-cli dump` | 受信専用。デコードして逐次表示。**公式ツールを操作しながら観測できる**。`0xB5` の flag も RobStride のバージョン読みもこれで判明 |
+| `robstride-cli interfaces` / `damiao-cli` / `myactuator-cli` | **繋がっている CAN インタフェースの一覧**（2026-08-05 追加）。デバイスを開かずフレームも出さない。GUI では Interface 欄がドロップダウンになっている |
 | `robstride-cli identify` | 型番判別。既定は文書化済み経路のみ、`--deep` で非公式空間 |
 | `damiao-cli --fd-link-classic-frames` | **FD リンクで classic フレームを送る**。「モータが FD 非対応」と「こちらの FD が壊れている」を切り分ける |
 | `misa-actuator-identify` | 全ベンダー横断の識別（`misa-actuator-tui` の bin） |

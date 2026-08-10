@@ -54,6 +54,10 @@ crates/
 | SLCAN (CANable, USBtin, …) | Linux + Windows | no | `slcan:COM5`, `slcan:/dev/ttyACM0` |
 | USB-CAN Analyzer (CH340) | Linux + Windows | no | `usbcan:COM1` |
 
+`robstride-cli interfaces` (also `damiao-cli`, `myactuator-cli`) lists what is
+attached without opening anything; the GUI offers the same list as a dropdown.
+Entries marked `?` are serial ports whose protocol is a guess — see below.
+
 **Which protocol a cheap dongle speaks is not visible from the outside.** SLCAN
 is the Lawicel ASCII protocol; "USB-CAN" on the box does not imply it. The
 common *USB-CAN Analyzer* units exchange 20-byte binary packets instead — those

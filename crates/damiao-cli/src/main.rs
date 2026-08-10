@@ -133,6 +133,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// List the CAN interfaces attached right now.
+    ///
+    /// Opens nothing and puts no frame on any wire. A typed `-i` still works for
+    /// anything this misses.
+    Interfaces,
     /// Probe a range of CAN_IDs for responding motors.
     Scan {
         /// First CAN_ID to probe.
@@ -472,6 +477,14 @@ fn main() -> Result<()> {
         .with_context(|| format!("unknown DAMIAO model: {}", cli.model))?;
     let timeout = Duration::from_millis(cli.timeout_ms);
 
+    // Before anything is opened: listing what is attached must not need one of
+    // the things it is listing. Going through the normal path would fail on
+    // `-i`'s default before printing a word.
+    if matches!(cli.command, Command::Interfaces) {
+        print!("{}", misa_can::format_list(&misa_can::list_interfaces()));
+        return Ok(());
+    }
+
     // Handled before a motor exists: this one deliberately never transmits, so
     // it must not go through the paths that bind and configure a motor.
     if let Command::Dump {
@@ -699,6 +712,9 @@ fn run<B: DamiaoBus>(motor: &mut DamiaoMotor<B>, cli: &Cli) -> Result<()> {
         // Handled in `main` before a motor is bound, because binding one
         // transmits and this command must not.
         Command::Dump { .. } => unreachable!("dump is dispatched before the motor is opened"),
+        Command::Interfaces => {
+            print!("{}", misa_can::format_list(&misa_can::list_interfaces()));
+        }
         Command::Scan { from, to } => {
             if to < from {
                 bail!("--to must be >= --from");

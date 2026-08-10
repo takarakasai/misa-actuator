@@ -181,6 +181,11 @@ enum Command {
         /// New CAN id to assign (1..=127).
         new_id: u8,
     },
+    /// List the CAN interfaces attached right now.
+    ///
+    /// Opens nothing and puts no frame on any wire. A typed `-i` still works for
+    /// anything this misses.
+    Interfaces,
     /// Probe each motor id in the range and print responders.
     Scan {
         #[arg(long, default_value_t = 1)]
@@ -775,6 +780,9 @@ fn run(cli: Cli) -> Result<()> {
             println!(
                 "\nNEXT: use  -m {new_id}  for all further commands on this motor."
             );
+        }
+        Command::Interfaces => {
+            print!("{}", misa_can::format_list(&misa_can::list_interfaces()));
         }
         Command::Scan { from, to, timeout } => {
             let timeout_per_id = Duration::from_millis(*timeout);

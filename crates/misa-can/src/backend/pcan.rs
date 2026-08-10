@@ -69,6 +69,54 @@ const PCAN_MESSAGE_STATUS: u8 = 0x80;
 
 const PCAN_RECEIVE_EVENT: u8 = 0x03;
 
+/// `channel_condition` values inside [`TPCANChannelInformation`].
+///
+/// The same values are documented for a per-channel `PCAN_CHANNEL_CONDITION`
+/// (`0x0B`) query, which would have been the obvious way to enumerate. **It does
+/// not work on this driver**: with two channels genuinely attached, all 32
+/// per-channel queries returned `0x00001C00` (ILLHANDLE). Measured 2026-08-05
+/// against a PCAN-USB Pro FD. Hence the array below.
+const PCAN_CHANNEL_UNAVAILABLE: u32 = 0x00;
+const PCAN_CHANNEL_AVAILABLE: u32 = 0x01;
+const PCAN_CHANNEL_OCCUPIED: u32 = 0x02;
+
+/// The "no channel" handle. Parameters about the driver as a whole are read
+/// against this rather than against a channel.
+const PCAN_NONEBUS: u16 = 0x00;
+/// `CAN_GetValue(PCAN_NONEBUS, …)`: how many channels are attached.
+///
+/// Asked first because it is legal with no hardware present, which
+/// `PCAN_CHANNEL_CONDITION` on a specific channel is not: with nothing plugged
+/// in, every per-channel query on this machine came back `0x00001C00`
+/// (`ILLCLIENT`/`ILLHANDLE`). So the count is what distinguishes "the driver
+/// says nothing is attached" from "this driver does not answer these questions" —
+/// and only the first of those makes an empty list trustworthy.
+const PCAN_ATTACHED_CHANNELS_COUNT: u8 = 0x2A;
+/// `CAN_GetValue(PCAN_NONEBUS, …)`: the attached channels themselves, as an array
+/// of [`TPCANChannelInformation`].
+const PCAN_ATTACHED_CHANNELS: u8 = 0x2B;
+
+/// `MAX_LENGTH_HARDWARE_NAME` from PCANBasic.h.
+const MAX_LENGTH_HARDWARE_NAME: usize = 33;
+
+/// `TPCANChannelInformation`, transcribed from PCANBasic.h.
+///
+/// The layout is **checked against the driver's answer** rather than trusted:
+/// [`available_channels`] rejects the result unless the handles come back inside
+/// the documented families. A wrong layout would show up as nonsense handles, and
+/// a silently wrong list is the one thing enumeration must not produce.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TPCANChannelInformation {
+    channel_handle: u16,
+    device_type: u8,
+    controller_number: u8,
+    device_features: u32,
+    device_name: [u8; MAX_LENGTH_HARDWARE_NAME],
+    device_id: u32,
+    channel_condition: u32,
+}
+
 /// `TPCANBaudrate` (BTR0/BTR1) codes for classic CAN. PCAN-Basic only accepts
 /// this fixed set for `CAN_Initialize`.
 const CLASSIC_BITRATES: &[(u32, u16)] = &[
@@ -162,6 +210,7 @@ type FnReadFD = unsafe extern "system" fn(u16, *mut TPCANMsgFD, *mut u64) -> u32
 type FnWrite = unsafe extern "system" fn(u16, *mut TPCANMsg) -> u32;
 type FnWriteFD = unsafe extern "system" fn(u16, *mut TPCANMsgFD) -> u32;
 type FnSetValue = unsafe extern "system" fn(u16, u8, *mut c_void, u32) -> u32;
+type FnGetValue = unsafe extern "system" fn(u16, u8, *mut c_void, u32) -> u32;
 type FnGetErrorText = unsafe extern "system" fn(u32, u16, *mut c_char) -> u32;
 
 /// Resolved entry points of `PCANBasic.dll`.
@@ -174,6 +223,8 @@ struct PcanApi {
     write: FnWrite,
     write_fd: Option<FnWriteFD>,
     set_value: FnSetValue,
+    /// Optional so an old DLL still loads: only channel enumeration needs it.
+    get_value: Option<FnGetValue>,
     get_error_text: Option<FnGetErrorText>,
 }
 
@@ -238,6 +289,7 @@ fn api() -> Result<&'static PcanApi> {
             write: required!("CAN_Write", FnWrite),
             write_fd: optional!("CAN_WriteFD", FnWriteFD),
             set_value: required!("CAN_SetValue", FnSetValue),
+            get_value: optional!("CAN_GetValue", FnGetValue),
             get_error_text: optional!("CAN_GetErrorText", FnGetErrorText),
         })
     });
@@ -380,6 +432,151 @@ fn resolve_channel(target: &str, raw_spec: &str) -> Result<(u16, String)> {
         _ => (base << 4) + n,
     };
     Ok((handle, format!("PCAN_{}BUS{n}", family.to_uppercase())))
+}
+
+/// What a channel is doing, for enumeration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelState {
+    /// Plugged in and free.
+    Available,
+    /// Plugged in, and somebody already has it — including us, if a session is
+    /// open. Worth listing rather than hiding: "the adapter is there but busy"
+    /// is a different problem from "there is no adapter".
+    Occupied,
+}
+
+/// Which PCAN channels exist right now, as spec targets (`usb1`, `pci2`, …).
+///
+/// Reads `PCAN_CHANNEL_CONDITION` for `usb1..=usb16`, `pci1..=pci8` and
+/// `lan1..=lan8` — no channel is initialised, so this cannot disturb a session
+/// that is already running.
+///
+/// Empty when `PCANBasic.dll` is missing, which is the normal state on a machine
+/// with no PEAK driver, not an error. Also empty on an old DLL that exports no
+/// `CAN_GetValue`; the caller cannot tell those apart and does not need to,
+/// because in both cases the answer is "ask the operator to type a name".
+pub fn available_channels() -> Vec<(String, String, ChannelState)> {
+    let api = match api() {
+        Ok(api) => api,
+        Err(e) => {
+            log::debug!("cannot enumerate PCAN channels: {e}");
+            return Vec::new();
+        }
+    };
+    let Some(get_value) = api.get_value else {
+        log::debug!("PCANBasic.dll exports no CAN_GetValue; cannot enumerate channels");
+        return Vec::new();
+    };
+
+    // How many the driver says are attached. Legal with nothing plugged in,
+    // unlike the per-channel query below, so this is what makes an empty list
+    // mean "nothing attached" rather than "the question was refused".
+    let mut count: u32 = 0;
+    let count_status = unsafe {
+        get_value(
+            PCAN_NONEBUS,
+            PCAN_ATTACHED_CHANNELS_COUNT,
+            &mut count as *mut u32 as *mut c_void,
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    if count_status != PCAN_ERROR_OK {
+        log::warn!(
+            "PCAN channel enumeration is not available on this driver \
+             (attached-channel count refused with 0x{count_status:08X}); \
+             type an interface instead of picking one"
+        );
+        return Vec::new();
+    }
+    if count == 0 {
+        log::debug!("PCAN driver reports no attached channels");
+        return Vec::new();
+    }
+
+    // Ask for the channels themselves — see the note on the condition constants
+    // for why the per-channel query is not used.
+    let stride = std::mem::size_of::<TPCANChannelInformation>();
+    // Over-allocated so a wrong `stride` cannot make the driver write past the
+    // end. The length handed to the API is the honest one.
+    let mut buffer = vec![0u8; stride * count as usize + 4 * stride];
+    let status = unsafe {
+        get_value(
+            PCAN_NONEBUS,
+            PCAN_ATTACHED_CHANNELS,
+            buffer.as_mut_ptr() as *mut c_void,
+            (stride * count as usize) as u32,
+        )
+    };
+    if status != PCAN_ERROR_OK {
+        log::warn!(
+            "PCAN reports {count} attached channel(s) but refused to list them \
+             (0x{status:08X}, struct stride {stride}); type an interface instead"
+        );
+        return Vec::new();
+    }
+
+    let mut found = Vec::new();
+    for i in 0..count as usize {
+        // Safety: the driver filled `count` structs of `stride` bytes into a
+        // buffer that is larger than that, and the type is plain data.
+        let info: TPCANChannelInformation =
+            unsafe { std::ptr::read_unaligned(buffer.as_ptr().add(i * stride) as *const _) };
+        let Some(target) = channel_target(info.channel_handle) else {
+            // The layout check: a handle outside every documented family means
+            // the struct does not match this driver's, so the whole answer is
+            // untrustworthy rather than partially usable.
+            log::warn!(
+                "PCAN channel list does not match the expected layout \
+                 (entry {i} has handle 0x{:04X}, stride {stride}); ignoring the list",
+                info.channel_handle
+            );
+            return Vec::new();
+        };
+        let name = {
+            let end = info
+                .device_name
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(info.device_name.len());
+            String::from_utf8_lossy(&info.device_name[..end])
+                .trim()
+                .to_string()
+        };
+        let state = if info.channel_condition & PCAN_CHANNEL_OCCUPIED != 0 {
+            ChannelState::Occupied
+        } else if info.channel_condition & PCAN_CHANNEL_AVAILABLE != 0 {
+            ChannelState::Available
+        } else {
+            debug_assert_eq!(info.channel_condition, PCAN_CHANNEL_UNAVAILABLE);
+            continue;
+        };
+        log::debug!(
+            "PCAN channel {target}: handle 0x{:04X}, {name:?}, condition {}",
+            info.channel_handle,
+            info.channel_condition
+        );
+        found.push((target, name, state));
+    }
+    found
+}
+
+/// Invert [`resolve_channel`]: a `TPCANHandle` back to the name a spec uses.
+///
+/// `None` for anything outside the documented families, which is what makes a
+/// wrong struct layout detectable instead of silently producing bad names.
+fn channel_target(handle: u16) -> Option<String> {
+    for (family, base, count) in [("usb", 0x50u16, 8u16), ("pci", 0x40, 8), ("lan", 0x800, 8)] {
+        for n in 1..=count {
+            if handle == base + n {
+                return Some(format!("{family}{n}"));
+            }
+            // The second block PEAK added for channels 9..=16.
+            if family != "lan" && handle == (base << 4) + n + 8 {
+                return Some(format!("{family}{}", n + 8));
+            }
+        }
+    }
+    None
 }
 
 /// Bit timing for one phase of a CAN-FD link, derived for an 80 MHz clock at

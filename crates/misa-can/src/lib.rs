@@ -30,12 +30,14 @@
 //! ```
 
 pub mod backend;
+pub mod discover;
 pub mod error;
 pub mod frame;
 pub mod spec;
 
 use std::time::Duration;
 
+pub use discover::{format_list, list_interfaces, Discovered};
 pub use error::{Error, Result};
 pub use frame::{ExtendedId, Frame, Id, StandardId, MAX_DATA_LEN};
 pub use spec::{

@@ -92,6 +92,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// List the CAN interfaces attached right now.
+    ///
+    /// Opens nothing and puts no frame on any wire. A typed `-i` still works for
+    /// anything this misses.
+    Interfaces,
     /// Probe a range of motor ids for responding motors (0x9A read — no motion).
     Scan {
         /// First id to probe.
@@ -360,6 +365,9 @@ fn main() -> Result<()> {
                 &mut |t, id, data| print_dump_frame(t, id, data, *raw),
             )?;
             eprintln!("captured {n} frame(s)");
+        }
+        Command::Interfaces => {
+            print!("{}", misa_can::format_list(&misa_can::list_interfaces()));
         }
         Command::Scan { from, to } => {
             if to < from {

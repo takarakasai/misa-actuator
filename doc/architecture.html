@@ -9,7 +9,7 @@
 
   Source : doc/architecture.md
   Command: node scripts/md2html.js doc/architecture.md
-  Built  : 2026-08-04 07:57 UTC
+  Built  : 2026-08-04 15:20 UTC
 
   Every edit made here is destroyed the next time the command above runs.
   Change the markdown instead.
@@ -127,9 +127,9 @@ pre.mermaid svg { max-width: 100%; height: auto; }
 <pre class="mermaid">flowchart TB
     subgraph GUIPROC[&quot;プロセス 1: misa-actuator-gui.exe（Rust / 実測 27 OS スレッド）&quot;]
         direction TB
-        MAIN[&quot;Tauri メインスレッド&lt;br/&gt;IPC コマンドを処理&lt;br/&gt;AppState = Mutex(Option(Session))&quot;]
-        WORKER[&quot;worker スレッド 'motor-N'&lt;br/&gt;Box dyn Actuator を単独所有&lt;br/&gt;既定 200 Hz&quot;]
-        WDOG[&quot;watchdog スレッド 'motor-N-watchdog'&lt;br/&gt;50 ms ごとに心拍を確認&quot;]
+        MAIN[&quot;Tauri メインスレッド&lt;br/&gt;IPC コマンドを処理&lt;br/&gt;AppState = Session と MultiSession の&lt;br/&gt;スロット 2 つ（開けるのは 1 つ）&quot;]
+        WORKER[&quot;worker スレッド&lt;br/&gt;'motor-N' または 'motors'&lt;br/&gt;Actuator を単独所有&lt;br/&gt;既定 200 Hz&quot;]
+        WDOG[&quot;watchdog スレッド&lt;br/&gt;'…-watchdog'&lt;br/&gt;50 ms ごとに心拍を確認&quot;]
     end
 
     subgraph WV[&quot;プロセス 2〜7: msedgewebview2.exe（実測 6 プロセス）&quot;]
@@ -171,6 +171,8 @@ pre.mermaid svg { max-width: 100%; height: auto; }
 
 <p>27 スレッドのうち<strong>この設計が明示的に張るのは 2 本だけ</strong>（worker と watchdog）。残りは Tauri / tao / WebView2 ホスト側のもので、こちらが管理しているわけではない。</p>
 
+<p><strong>モータが 4 台でも 2 本のまま。</strong> Multi タブは <code>MultiSession</code> を開くが、張るのは <code>motors</code> と <code>motors-watchdog</code> の 2 本で、<strong>N 台を 1 本のワーカーで順に回す</strong>（§1.2）。スロットは 2 つあるが同時に開けるのは 1 つなので、この数え方は台数が増えても変わらない。</p>
+
 <h3 id="1.2-スレッドは-1-セッションあたり-2-本">1.2 スレッドは 1 セッションあたり 2 本</h3>
 
 <p><code>Session::connect</code> が両方を spawn する（<a href="../crates/misa-actuator-core/src/session.rs#L75-L88">session.rs:75-88</a>）。</p>
@@ -184,6 +186,10 @@ pre.mermaid svg { max-width: 100%; height: auto; }
 </table></div>
 
 <p><strong>1 バスに複数モータのときも 2 本のまま。</strong> <code>MultiSession</code>（<code>multi_session.rs</code>）は <code>motors</code> / <code>motors-watchdog</code> の 2 本で <strong>N モータを順に回す</strong>。モータ毎スレッドには <strong>しない</strong> — ベンダーのバストレイトは send と recv が別呼び出しで、共有バスでは同時に 1 交換しか許されないため、<strong>1 台ずつ回すことが安全の根拠</strong>になっている。バスは <code>SharedCanBus</code>（<code>Arc&lt;Mutex&lt;Box&lt;dyn CanBus&gt;&gt;&gt;</code> 自身が <code>CanBus</code>）で共有するので、 4 ベンダーのアダプタは無改造で乗る。</p>
+
+<p><strong>1 巡には予算がある。</strong> <code>Worker::pass()</code> に与えられるのは<strong>ティック 1 周期分だけ</strong>で、切れたら残りを飛ばし、<strong>次パスで先頭に回す</strong>。予算が無いと<strong>遅い 1 台が全員のレートを決める</strong>ためで、これは想像ではなく実測（DAMIAO のレジスタ読み欠落、handover §4）。飛ばした回数は <code>starved</code> としてスナップショットに出る — <strong>0 でなければ、レートを決めているのは設定したティックではなくワイヤ</strong>。</p>
+
+<p><strong>各交換の前にワイヤを掃く</strong>（<code>SharedCanBus::drain_stale()</code>、タイムアウト 0 で最大 64 フレーム）。フィードバックフレームに<strong>シーケンス番号が無い</strong>ので、掃かないと前のターンの残骸を今のターンの答えとして読む。捨てた数は返して報告する — <strong>見えない破棄は否定できない破棄</strong>。</p>
 
 <p><strong>なぜ watchdog を worker のループ内チェックにしないか。</strong> これは整理の問題ではなく、ループ内では<strong>成立しない</strong>。<code>misa-sysid</code> の測定ジョブは worker のループを数十秒占有するので、ループ内チェックは<strong>一番危険な時間帯にちょうど動かない</strong> （<a href="../crates/misa-actuator-core/src/worker.rs#L163-L170">worker.rs:163-170</a>）。別スレッドなら worker が何をしていようが検査が続く。</p>
 
@@ -229,6 +235,8 @@ pre.mermaid svg { max-width: 100%; height: auto; }
 <li><strong>Drop</strong> — <code>shutdown()</code> は「フラグ→Shutdown コマンド→worker を join」の順。 watchdog は<strong>worker より後に</strong>落とす。ジョブから抜けかけの worker が途中で保護を失わないため（<a href="../crates/misa-actuator-core/src/session.rs#L205-L224">session.rs:205-224</a>）</li>
 </ol>
 
+<p><strong><code>MultiSession</code> も同じ 3 系統</strong>で、加えて 1 つ規則がある: <strong><code>disable_all()</code> は失敗しても次のモータに進む</strong>。途中で <code>?</code> を返すと、応答しない 1 台のせいで <strong>残りが通電したまま</strong>になる。停止は「全部に届く」ことが要件なので、最初のエラーで抜けてはいけない。</p>
+
 <p><strong>ただし</strong>: これらは<strong>ソフトウェアの停止経路</strong>であって、モータが無励磁でラッチされることを意味しない。handover §2 を読むこと。</p>
 
 <h3 id="1.5-ポーリングであって-push-ではない">1.5 ポーリングであって push ではない</h3>
@@ -252,7 +260,14 @@ pre.mermaid svg { max-width: 100%; height: auto; }
 
 <p>これは手抜きではなく用途の違い: CLI は 1 コマンド 1 トランザクションで終わり、 UI フレームを落とす相手が居ない。逆に言うと <strong>CLI には watchdog も Drop 保護も無い</strong> （handover §2「CLI は Session の安全網の外にいる」）。</p>
 
-<p>複数モータを 1 本の線で駆動する場合は <code>Shared&lt;T&gt;</code>（<code>Arc&lt;Mutex&lt;T&gt;&gt;</code>）でバスを共有し、 <strong>バス 1 本につき制御ループ 1 本</strong>が想定パターン（<a href="../crates/misa-actuator/src/shared.rs#L28-L36">shared.rs:28-36</a>）。バストレイトの <code>send</code>/<code>recv</code> は別呼び出しなので、要求と応答は 1 つの原子的トランザクションでは<strong>ない</strong>。</p>
+<p>複数モータを 1 本の線で駆動する共有機構は <strong>2 段ある</strong>。混同しやすいので分けて書く。</p>
+
+<ul>
+<li><strong><code>Shared&lt;T&gt;</code></strong>（<a href="../crates/misa-actuator/src/shared.rs">shared.rs</a>、<code>misa-actuator</code>）は <strong>各社のバストレイト</strong>を共有する。<code>Arc&lt;Mutex&lt;T&gt;&gt;</code> を各社が自分のトレイトに実装する（孤児則を避けるためこの向き）。<strong>CAN 系は要求と応答が別呼び出しなので、 1 つの原子的トランザクションにはならない</strong>。例外は LK Motor で、<code>LkBus::transact</code> が 1 呼び出しなので <code>Shared&lt;B&gt;</code> の実装がそのまま原子的になる</li>
+<li><strong><code>SharedCanBus</code></strong>（<a href="../crates/misa-actuator-core/src/multi.rs">multi.rs</a>、 <code>misa-actuator-core</code>）は<strong>その 1 段下、<code>misa_can::CanBus</code> を共有する</strong>。 <code>CanBus</code> 自身を実装しているので、<strong>4 社のアダプタを無改造で乗せられる</strong>のがこちら。<code>MultiSession</code> が使うのはこれ</li>
+</ul>
+
+<p>どちらでも <strong>バス 1 本につき制御ループ 1 本</strong>が想定パターンで、それが上記の非原子性への答えになっている。モータ毎スレッドは動くが推奨しない。</p>
 
 <hr>
 
@@ -398,6 +413,24 @@ pre.mermaid svg { max-width: 100%; height: auto; }
 </tbody>
 </table></div>
 
+<p><code>MultiSession</code> は別の定数を持つ。<strong>ティックと watchdog は単体と同じ</strong>（200 Hz / 750 ms）が、それ以外は「4 台を表で見る」用途に合わせて違う。</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th style="text-align:left">値</th><th style="text-align:left">既定</th><th style="text-align:left">出典</th></tr></thead>
+<tbody>
+<tr><td style="text-align:left">スナップショット深さ</td><td style="text-align:left"><strong>2</strong>（単体は 4）</td><td style="text-align:left"><a href="../crates/misa-actuator-core/src/multi_session.rs#L51">multi_session.rs:51</a></td></tr>
+<tr><td style="text-align:left">非 streaming 時のポーリング</td><td style="text-align:left">50 ms</td><td style="text-align:left"><a href="../crates/misa-actuator-core/src/multi_session.rs#L54">multi_session.rs:54</a></td></tr>
+<tr><td style="text-align:left">連続故障の打ち切り</td><td style="text-align:left"><strong>20 回、モータ毎</strong></td><td style="text-align:left"><a href="../crates/misa-actuator-core/src/multi_session.rs#L60">multi_session.rs:60</a></td></tr>
+<tr><td style="text-align:left">watchdog の確認間隔</td><td style="text-align:left">50 ms</td><td style="text-align:left"><a href="../crates/misa-actuator-core/src/multi_session.rs#L185">multi_session.rs:185</a></td></tr>
+<tr><td style="text-align:left">バスのタイムアウト</td><td style="text-align:left">100 ms（<strong>チャネル単位</strong>）</td><td style="text-align:left"><a href="../crates/misa-actuator-core/src/multi.rs#L207-L209">multi.rs:207-209</a></td></tr>
+<tr><td style="text-align:left">1 パスの予算</td><td style="text-align:left">ティック 1 周期</td><td style="text-align:left"><a href="../crates/misa-actuator-core/src/multi_session.rs#L638">multi_session.rs:638</a></td></tr>
+<tr><td style="text-align:left">残骸の掃き出し上限</td><td style="text-align:left">64 フレーム/交換</td><td style="text-align:left"><a href="../crates/misa-actuator-core/src/multi.rs#L87">multi.rs:87</a></td></tr>
+<tr><td style="text-align:left">Multi タブの poll 間隔</td><td style="text-align:left"><strong>100 ms</strong>（単体は 33 ms）</td><td style="text-align:left"><a href="../ui/src/components/MultiTab.tsx#L31">MultiTab.tsx:31</a></td></tr>
+</tbody>
+</table></div>
+
+<p><strong>深さ 2 と poll 100 ms は同じ判断から来ている。</strong> プロットが無いので、欲しいのは常に最新の 1 枚で、古い読み値には価値が無い。逆に <code>achieved_rate_hz</code> と <code>starved</code> は出す — 台数で割られたレートを黙って報告しないと、数字の意味が変わったことに気付けない。</p>
+
 <p><strong>Windows ではタイマ分解能を明示的に上げている。</strong> 既定の sleep は ~15.6 ms に丸められ、それだけで制御ループが 64 Hz に張り付く。worker は起動時に <code>TimerResolutionGuard</code> を取る（<a href="../crates/misa-actuator-core/src/worker.rs#L260-L262">worker.rs:260-262</a>）。</p>
 
 <hr>
@@ -407,9 +440,9 @@ pre.mermaid svg { max-width: 100%; height: auto; }
 <p>正直に書いておく。設計上そうなっているだけで、直せないものではない。</p>
 
 <ul>
-<li><strong>GUI は同時に 1 モータ</strong>（既存 5 タブ）。<code>AppState</code> が <code>Mutex&lt;Option&lt;Session&gt;&gt;</code> を 1 つ持つだけ（<a href="../crates/misa-actuator-gui/src/lib.rs#L43-L49">lib.rs:43-49</a>）。 <strong>core 側は既に N モータに対応している</strong>（<code>MultiSession</code>）が、<strong>GUI からは未接続</strong> — Tauri コマンドとタブが未実装</li>
+<li><strong>セッションのスロットは 2 つで、同時に開けるのは 1 つ。</strong> <code>AppState</code> は <code>Mutex&lt;Option&lt;Session&gt;&gt;</code>（既存 5 タブ、1 モータ）と <code>Mutex&lt;Option&lt;MultiSession&gt;&gt;</code> （Multi タブ、N モータ）を別々に持つ（<a href="../crates/misa-actuator-gui/src/lib.rs">lib.rs</a>）。 <strong>1 CAN チャネルの所有者は 1 つ</strong>なので、片方が開いていればもう片方は <code>PCAN_ERROR_NETINUSE</code> になる。UI は開いている側を指して断る（<code>open_elsewhere</code>）</li>
 <li><strong><code>Session</code> と <code>MultiSession</code> は別実装で、worker / watchdog / 停止経路が二重にある。</strong> 既存 5 タブの配線契約を守るための意図的な判断だが、<strong>安全に関わる部分が 2 箇所にある</strong>のは重複の中でも最悪の種類。出口は <code>build_actuator</code> の「開く」と「束ねる」の分離と、worker の 1..N 対応で、単体を N=1 の薄いラッパにすること</li>
-<li><strong>1 バスに複数モータでも、同時に 1 交換しか流せない。</strong> 逐次に回すのが安全の根拠なので、レートは台数で割られる（4 台なら 1 台あたり約 1/4）</li>
+<li><strong>1 バスに複数モータでも、同時に 1 交換しか流せない。</strong> 逐次に回すのが安全の根拠なので、レートは台数で割られる（4 台なら 1 台あたり約 1/4）。さらに <strong>1 交換はバスのタイムアウト全部を使い得る</strong>（タイムアウトは共有トランスポートの持ち物で、モータ毎には設定できない）。<code>Worker::pass()</code> の予算は <strong>何台が遅れるかを縛るだけで、1 回の長さは縛らない</strong> — モータ毎タイムアウトはトランスポート側の変更が要る</li>
 <li><strong>測定ジョブは worker のループを占有する。</strong> 数十秒間、通常の制御ティックは回らない。<code>job_active</code> フラグはそれを外から知るための手段</li>
 <li><strong><code>Shared&lt;T&gt;</code> の要求と応答は原子的ではない。</strong> 同一バスでモータごとにスレッドを立てることは可能だが推奨しない</li>
 <li><strong>停止は「ソフトウェアが指令を出すのをやめる」までを保証する。</strong> 無励磁のラッチではない（handover §2）</li>

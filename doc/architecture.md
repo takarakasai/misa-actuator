@@ -30,9 +30,9 @@
 flowchart TB
     subgraph GUIPROC["プロセス 1: misa-actuator-gui.exe（Rust / 実測 27 OS スレッド）"]
         direction TB
-        MAIN["Tauri メインスレッド<br/>IPC コマンドを処理<br/>AppState = Mutex(Option(Session))"]
-        WORKER["worker スレッド 'motor-N'<br/>Box dyn Actuator を単独所有<br/>既定 200 Hz"]
-        WDOG["watchdog スレッド 'motor-N-watchdog'<br/>50 ms ごとに心拍を確認"]
+        MAIN["Tauri メインスレッド<br/>IPC コマンドを処理<br/>AppState = Session と MultiSession の<br/>スロット 2 つ（開けるのは 1 つ）"]
+        WORKER["worker スレッド<br/>'motor-N' または 'motors'<br/>Actuator を単独所有<br/>既定 200 Hz"]
+        WDOG["watchdog スレッド<br/>'…-watchdog'<br/>50 ms ごとに心拍を確認"]
     end
 
     subgraph WV["プロセス 2〜7: msedgewebview2.exe（実測 6 プロセス）"]
@@ -74,6 +74,10 @@ flowchart TB
 27 スレッドのうち**この設計が明示的に張るのは 2 本だけ**（worker と watchdog）。
 残りは Tauri / tao / WebView2 ホスト側のもので、こちらが管理しているわけではない。
 
+**モータが 4 台でも 2 本のまま。** Multi タブは `MultiSession` を開くが、張るのは
+`motors` と `motors-watchdog` の 2 本で、**N 台を 1 本のワーカーで順に回す**（§1.2）。
+スロットは 2 つあるが同時に開けるのは 1 つなので、この数え方は台数が増えても変わらない。
+
 ### 1.2 スレッドは 1 セッションあたり 2 本
 
 `Session::connect` が両方を spawn する（[session.rs:75-88](../crates/misa-actuator-core/src/session.rs#L75-L88)）。
@@ -89,6 +93,17 @@ flowchart TB
 同時に 1 交換しか許されないため、**1 台ずつ回すことが安全の根拠**になっている。
 バスは `SharedCanBus`（`Arc<Mutex<Box<dyn CanBus>>>` 自身が `CanBus`）で共有するので、
 4 ベンダーのアダプタは無改造で乗る。
+
+**1 巡には予算がある。** `Worker::pass()` に与えられるのは**ティック 1 周期分だけ**で、
+切れたら残りを飛ばし、**次パスで先頭に回す**。予算が無いと**遅い 1 台が全員のレートを
+決める**ためで、これは想像ではなく実測（DAMIAO のレジスタ読み欠落、handover §4）。
+飛ばした回数は `starved` としてスナップショットに出る — **0 でなければ、レートを
+決めているのは設定したティックではなくワイヤ**。
+
+**各交換の前にワイヤを掃く**（`SharedCanBus::drain_stale()`、タイムアウト 0 で最大
+64 フレーム）。フィードバックフレームに**シーケンス番号が無い**ので、掃かないと
+前のターンの残骸を今のターンの答えとして読む。捨てた数は返して報告する —
+**見えない破棄は否定できない破棄**。
 
 **なぜ watchdog を worker のループ内チェックにしないか。** これは整理の問題ではなく、
 ループ内では**成立しない**。`misa-sysid` の測定ジョブは worker のループを数十秒
@@ -143,6 +158,11 @@ flowchart LR
    watchdog は**worker より後に**落とす。ジョブから抜けかけの worker が
    途中で保護を失わないため（[session.rs:205-224](../crates/misa-actuator-core/src/session.rs#L205-L224)）
 
+**`MultiSession` も同じ 3 系統**で、加えて 1 つ規則がある: **`disable_all()` は
+失敗しても次のモータに進む**。途中で `?` を返すと、応答しない 1 台のせいで
+**残りが通電したまま**になる。停止は「全部に届く」ことが要件なので、
+最初のエラーで抜けてはいけない。
+
 **ただし**: これらは**ソフトウェアの停止経路**であって、モータが無励磁でラッチ
 されることを意味しない。handover §2 を読むこと。
 
@@ -179,10 +199,20 @@ setState したらツリーが毎秒数千回再描画されて落ちる。サ�
 UI フレームを落とす相手が居ない。逆に言うと **CLI には watchdog も Drop 保護も無い**
 （handover §2「CLI は Session の安全網の外にいる」）。
 
-複数モータを 1 本の線で駆動する場合は `Shared<T>`（`Arc<Mutex<T>>`）でバスを共有し、
-**バス 1 本につき制御ループ 1 本**が想定パターン
-（[shared.rs:28-36](../crates/misa-actuator/src/shared.rs#L28-L36)）。バストレイトの
-`send`/`recv` は別呼び出しなので、要求と応答は 1 つの原子的トランザクションでは**ない**。
+複数モータを 1 本の線で駆動する共有機構は **2 段ある**。混同しやすいので分けて書く。
+
+- **`Shared<T>`**（[shared.rs](../crates/misa-actuator/src/shared.rs)、`misa-actuator`）は
+  **各社のバストレイト**を共有する。`Arc<Mutex<T>>` を各社が自分のトレイトに実装する
+  （孤児則を避けるためこの向き）。**CAN 系は要求と応答が別呼び出しなので、
+  1 つの原子的トランザクションにはならない**。例外は LK Motor で、`LkBus::transact`
+  が 1 呼び出しなので `Shared<B>` の実装がそのまま原子的になる
+- **`SharedCanBus`**（[multi.rs](../crates/misa-actuator-core/src/multi.rs)、
+  `misa-actuator-core`）は**その 1 段下、`misa_can::CanBus` を共有する**。
+  `CanBus` 自身を実装しているので、**4 社のアダプタを無改造で乗せられる**のが
+  こちら。`MultiSession` が使うのはこれ
+
+どちらでも **バス 1 本につき制御ループ 1 本**が想定パターンで、それが上記の
+非原子性への答えになっている。モータ毎スレッドは動くが推奨しない。
 
 ---
 
@@ -343,6 +373,25 @@ sequenceDiagram
 | UI の poll 間隔 | 33 ms | [useSession.ts:34](../ui/src/useSession.ts#L34) |
 | プロット保持サンプル数 | 6000（200 Hz で約 30 秒） | [useSession.ts:37](../ui/src/useSession.ts#L37) |
 
+`MultiSession` は別の定数を持つ。**ティックと watchdog は単体と同じ**（200 Hz /
+750 ms）が、それ以外は「4 台を表で見る」用途に合わせて違う。
+
+| 値 | 既定 | 出典 |
+|---|---|---|
+| スナップショット深さ | **2**（単体は 4） | [multi_session.rs:51](../crates/misa-actuator-core/src/multi_session.rs#L51) |
+| 非 streaming 時のポーリング | 50 ms | [multi_session.rs:54](../crates/misa-actuator-core/src/multi_session.rs#L54) |
+| 連続故障の打ち切り | **20 回、モータ毎** | [multi_session.rs:60](../crates/misa-actuator-core/src/multi_session.rs#L60) |
+| watchdog の確認間隔 | 50 ms | [multi_session.rs:185](../crates/misa-actuator-core/src/multi_session.rs#L185) |
+| バスのタイムアウト | 100 ms（**チャネル単位**） | [multi.rs:207-209](../crates/misa-actuator-core/src/multi.rs#L207-L209) |
+| 1 パスの予算 | ティック 1 周期 | [multi_session.rs:638](../crates/misa-actuator-core/src/multi_session.rs#L638) |
+| 残骸の掃き出し上限 | 64 フレーム/交換 | [multi.rs:87](../crates/misa-actuator-core/src/multi.rs#L87) |
+| Multi タブの poll 間隔 | **100 ms**（単体は 33 ms） | [MultiTab.tsx:31](../ui/src/components/MultiTab.tsx#L31) |
+
+**深さ 2 と poll 100 ms は同じ判断から来ている。** プロットが無いので、欲しいのは
+常に最新の 1 枚で、古い読み値には価値が無い。逆に `achieved_rate_hz` と `starved`
+は出す — 台数で割られたレートを黙って報告しないと、数字の意味が変わったことに
+気付けない。
+
 **Windows ではタイマ分解能を明示的に上げている。** 既定の sleep は ~15.6 ms に
 丸められ、それだけで制御ループが 64 Hz に張り付く。worker は起動時に
 `TimerResolutionGuard` を取る（[worker.rs:260-262](../crates/misa-actuator-core/src/worker.rs#L260-L262)）。
@@ -353,16 +402,21 @@ sequenceDiagram
 
 正直に書いておく。設計上そうなっているだけで、直せないものではない。
 
-- **GUI は同時に 1 モータ**（既存 5 タブ）。`AppState` が `Mutex<Option<Session>>` を
-  1 つ持つだけ（[lib.rs:43-49](../crates/misa-actuator-gui/src/lib.rs#L43-L49)）。
-  **core 側は既に N モータに対応している**（`MultiSession`）が、**GUI からは未接続** —
-  Tauri コマンドとタブが未実装
+- **セッションのスロットは 2 つで、同時に開けるのは 1 つ。** `AppState` は
+  `Mutex<Option<Session>>`（既存 5 タブ、1 モータ）と `Mutex<Option<MultiSession>>`
+  （Multi タブ、N モータ）を別々に持つ（[lib.rs](../crates/misa-actuator-gui/src/lib.rs)）。
+  **1 CAN チャネルの所有者は 1 つ**なので、片方が開いていればもう片方は
+  `PCAN_ERROR_NETINUSE` になる。UI は開いている側を指して断る（`open_elsewhere`）
 - **`Session` と `MultiSession` は別実装で、worker / watchdog / 停止経路が二重にある。**
   既存 5 タブの配線契約を守るための意図的な判断だが、**安全に関わる部分が 2 箇所に
   ある**のは重複の中でも最悪の種類。出口は `build_actuator` の「開く」と「束ねる」の
   分離と、worker の 1..N 対応で、単体を N=1 の薄いラッパにすること
 - **1 バスに複数モータでも、同時に 1 交換しか流せない。** 逐次に回すのが安全の
-  根拠なので、レートは台数で割られる（4 台なら 1 台あたり約 1/4）
+  根拠なので、レートは台数で割られる（4 台なら 1 台あたり約 1/4）。
+  さらに **1 交換はバスのタイムアウト全部を使い得る**（タイムアウトは共有
+  トランスポートの持ち物で、モータ毎には設定できない）。`Worker::pass()` の予算は
+  **何台が遅れるかを縛るだけで、1 回の長さは縛らない** — モータ毎タイムアウトは
+  トランスポート側の変更が要る
 - **測定ジョブは worker のループを占有する。** 数十秒間、通常の制御ティックは
   回らない。`job_active` フラグはそれを外から知るための手段
 - **`Shared<T>` の要求と応答は原子的ではない。** 同一バスでモータごとに

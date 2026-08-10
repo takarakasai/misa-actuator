@@ -18,14 +18,35 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Where runs are written when nothing says otherwise.
+/// Environment variable that overrides where runs are written.
 ///
-/// Under the user's home rather than beside the executable, which is often
+/// An environment variable rather than a setting in the app, because the app has
+/// nowhere to keep a setting: there is no preferences file, and a directory typed
+/// into a field that forgets it every launch is worse than a fixed default. This
+/// works for the CLI too, which is where a scripted campaign would set it.
+pub const DATA_DIR_ENV: &str = "MISA_ACTUATOR_DATA_DIR";
+
+/// Where runs are written.
+///
+/// [`DATA_DIR_ENV`] wins if it names anything; measurements usually want to live
+/// with the project they belong to rather than in one pile under a home
+/// directory.
+///
+/// Otherwise under the user's home — not beside the executable, which is often
 /// read-only once installed, and not under a temp directory, which is the one
-/// place measurements are expected to disappear from. Falls back to the temp
-/// directory only when the environment names no home at all — losing the run
-/// would be worse than putting it somewhere awkward.
+/// place measurements are expected to disappear from. The temp directory is the
+/// last resort only when the environment names no home at all, because losing
+/// the run outright would be worse than putting it somewhere awkward.
 pub fn data_dir() -> PathBuf {
+    // Whitespace-only is treated as unset: an exported-but-empty variable is a
+    // shell accident, and writing to the process's working directory because of
+    // one would scatter runs wherever the app happened to be launched from.
+    if let Some(dir) = std::env::var_os(DATA_DIR_ENV) {
+        let dir = PathBuf::from(dir);
+        if !dir.as_os_str().is_empty() && dir.to_string_lossy().trim() != "" {
+            return dir;
+        }
+    }
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from);
@@ -189,6 +210,35 @@ mod tests {
         let name = run_file_name("20260807-041530", "../oops", 96);
         assert!(!name.contains('/') && !name.contains('\\'), "{name}");
         assert_eq!(name, "20260807-041530Z-oops-id96.csv");
+    }
+
+    /// Serialised, because it mutates process-wide environment state and the
+    /// test runner is threaded.
+    #[test]
+    fn the_data_directory_can_be_pointed_somewhere_else() {
+        // SAFETY-ish: single test touching this variable, and it is restored
+        // before returning. Rust 2024 marks `set_var` unsafe for exactly the
+        // data race this comment is promising not to cause.
+        let restore = std::env::var_os(DATA_DIR_ENV);
+        let set = |v: Option<&str>| match v {
+            Some(v) => std::env::set_var(DATA_DIR_ENV, v),
+            None => std::env::remove_var(DATA_DIR_ENV),
+        };
+
+        set(Some(r"D:\campaign-2026-08"));
+        assert_eq!(data_dir(), PathBuf::from(r"D:\campaign-2026-08"));
+
+        // An exported-but-empty variable is a shell accident, not a request to
+        // write into the working directory.
+        set(Some(""));
+        assert!(data_dir().ends_with("misa-actuator-data"), "{:?}", data_dir());
+        set(Some("   "));
+        assert!(data_dir().ends_with("misa-actuator-data"), "{:?}", data_dir());
+
+        set(None);
+        assert!(data_dir().ends_with("misa-actuator-data"), "{:?}", data_dir());
+
+        set(restore.as_deref().and_then(|s| s.to_str()));
     }
 
     #[test]

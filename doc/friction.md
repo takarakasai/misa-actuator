@@ -228,6 +228,31 @@ envelope のトルク上限に当たった場合は、GUI が **`Retry at X N·m
 
 ---
 
+## 7.5 測定データの保存先
+
+すべての run は**自動で CSV に保存される**。既定は `<ホーム>/misa-actuator-data/`。
+
+```
+20260807-031308Z-breakaway-map-id96.csv
+```
+
+先頭に `#` メタデータ（run 名・motor id・標本数・画面に出た要約値）、続いて
+`t_s,cmd,position_rad,velocity_rad_per_s,torque_nm,current_a,temperature_c`。
+
+**保存先は `MISA_ACTUATOR_DATA_DIR` で変えられる。** GUI も CLI も同じ変数を見る。
+
+```powershell
+$env:MISA_ACTUATOR_DATA_DIR = "D:\campaign-2026-08"
+```
+
+設定項目ではなく環境変数にしてあるのは、アプリに設定を置く場所が無いため
+（設定ファイルを持っていない）。起動ごとに忘れる入力欄は固定の既定値より悪い。
+
+**なぜボタンではなく自動保存なのか。** 30 秒の run のデータを「Export を押し忘れた」で
+失うと取り直しになり、複数台の一括測定では押す人がいない。そして実際、breakaway map の
+結果が左右に分かれた原因は、画面の 4 点ではなく**保存された 3682 標本を 10 本のランプに
+分解して初めて確定した**（§7 の実例）。
+
 ## 8. これまでの実測値
 
 | 日付 | 個体 | 経路 | 値 | 備考 |

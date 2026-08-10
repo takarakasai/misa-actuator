@@ -46,9 +46,18 @@ Linux/SocketCAN 専用だったワークスペースを Windows に移植し、�
 
 ### 実機で検証済み
 
-- **PCAN バックエンド** — classic / CAN-FD とも
-- **RobStride**（RS-04、EduLite05）、**DAMIAO**（DM-J4310）、**MyActuator**（RMD-X4-P36-36）
+- **3 バックエンドすべて実機確認済み**（2026-08-06 に SLCAN で完了）
+  - **PCAN** — classic / CAN-FD とも
+  - **SLCAN** — WeAct Studio USB2CAN（`USB 0483:5740`、STM32 CDC）で RS-03 を
+    `scan` / `identify`。**CAN-FD 非対応**（`slcan.rs` が拒否）なので FD ノード化した
+    DM-J4310 の検証には使えない
+  - **USB-CAN Analyzer**（`usbcan:`）— 下記
+- **RobStride**（RS-04、**RS-03**、EduLite05）、**DAMIAO**（DM-J4310）、
+  **MyActuator**（RMD-X4-P36-36）
 - 上記 3 社のモデル自動判別
+- **3 系統が同じ答えを返すことを確認**（2026-08-06）。同じ RS-03 に対して
+  PCAN / `usbcan:` / `slcan:` が**バイト単位で同一の payload**
+  （`28 96 30 21 10 70 30 0A`）を返す。トランスポートを疑うときの基準になる
 - GUI の 5 タブ（Console / Sysid / Characterize / Monitor / Params）
 - **GUI の Multi タブ**（2026-08-05、RS-04 ×2 を 1 本のバスで）。宛先判定・モータ毎の
   指令・シード・レート表示まで確認済み。数値は §4 に
@@ -66,8 +75,6 @@ Linux/SocketCAN 専用だったワークスペースを Windows に移植し、�
 - **LK Motor**。コンパイルは通るが**実機に接続したことがない**。ベンチ記録に
   「`/dev/ttyUSB*` が見えず RS485 アダプタの接続確認が先」とある段階で止まっている。
   `hw_check` の対象にも入っていない
-- **SLCAN**。実機未確認。なお **SLCAN は CAN-FD 非対応**
-  （`slcan.rs` が拒否する）なので、FD ノード化した DM-J4310 の検証には**使えない**
 - 12〜64 バイトの CAN-FD DLC 経路（DAMIAO は常に 8 バイトなので通らない）
 - **GUI の Characterize タブ**（測定エンジン自体は実機検証済み。タブはシミュレータのみ）
 - 飽和させない設定での RS-04 Sysid 撮り直し
@@ -437,7 +444,13 @@ position モードで streaming すると両方 `—` になる。§4 の「RobS
 ### RobStride: 機種はファームウェアのバージョンで分かる（確信度に注意）
 
 **マイナー成分が機種番号、メジャーが製品ライン**（`0` = RS、`10` = EduLite）。
-実機 RS-04 は `0.4.1.32`、EduLite05 は `10.5.0.1`。
+実機 RS-04 は `0.4.1.32`、**RS-03 は `0.3.1.21`**、EduLite05 は `10.5.0.1`。
+
+**2026-08-06 に RS-03 で 3 機種目の裏付けが取れた。** マイナー 3 → RS-03 と判別され、
+同時に読んだ `limit_torque = 60 N·m` が
+[`param-table-firmware-divergence.md`](../crates/robstride-protocol/doc/param-table-firmware-divergence.md)
+の「RS-03/06 は 60」という記述と一致した — **バージョンとトルク上限という 2 つの
+独立チャネルが同じ機種を指した**（下記の突き合わせ機構が実際に効いている例）。
 
 **証拠の内訳を正確に**:
 
@@ -446,7 +459,9 @@ position モードで streaming すると両方 `—` になる。§4 の「RobS
   この消去法が結論を許している
 - **弱い**: 公式リリース資産 7 件のファイル名は**ベンダーが付けた名前**であって
   測定ではない。機種ごとに `0.N.x.y` で切っていれば定義上そうなる
-- **n = 1 / ライン**。RS 系 1 台、EduLite 系 1 台
+- **n = 2 / RS 系、1 / EduLite 系**（RS-04 と RS-03、EduLite05）。
+  **RS 系で 2 機種が別のマイナーを積んでいる**ことが確認できたので、
+  「マイナー = 機種番号」の根拠は 1 機種のときより強い
 - **「メジャー = ライン」は 1 バイト × 1 台。** しかもベンダー自身の
   `AppCodeVersion` 文字列は `1.0.5.0.1` と**5 成分**で、`0x0A` を「10」と
   レンダリングしていない。先頭バイトが 2 成分を詰めている読み方も同じくらい整合する
@@ -1110,7 +1125,7 @@ RobStride の param table と MyActuator の `0xC0`。ここにしかない値�
 | ~~Multi タブの実機確認~~ | **2026-08-05 に RS-04 ×2 で完了、§4 に数値。** 残件は**ベンダー混在**と**3 台以上**。下記 |
 | `webviewInstallMode` の判断 | 配布先の Windows バージョン次第 |
 | LK Motor の実機接続 | RS485 アダプタが `/dev/ttyUSB*` に出るところから |
-| SLCAN 実機検証 | **DM-J4310 では検証できない**（FD 非対応）。RobStride か MyActuator で |
+| ~~SLCAN 実機検証~~ | **2026-08-06 完了**。WeAct Studio USB2CAN で RS-03 を `scan` / `identify`。§1 |
 | GUI Characterize タブの実機確認 | 測定エンジン自体は検証済み。**RS-04 でやるなら `--kt 1.5093` 相当と、1 N·m を超える枠が要る** |
 | RS-04 Sysid 撮り直し | 下記 |
 | Params 書き込み | `reg-write` の警告は入れた（2026-08-02、§2）。次は値の範囲検証 |

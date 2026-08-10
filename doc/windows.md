@@ -100,6 +100,21 @@ warns when those disagree.
 
 ### SLCAN (CANable, candleLight, USBtin, ...) — cheap fallback
 
+Verified 2026-08-06 against an RS-03 with a **WeAct Studio USB2CAN**
+(`USB 0483:5740`, an STM32 CDC device): `scan` and `identify` both work, and return
+byte-for-byte what the PEAK adapter and the USB-CAN Analyzer return.
+
+Its answer to the `V` probe is a product banner rather than the four hex digits the
+protocol describes:
+
+```
+WeAct Studio V1.0.0.5_f655d0fb\r
+```
+
+Which is fine — `bring_up` treats anything that is not a bare CR or a BEL as
+unsolicited and keeps waiting for the verdict. Worth knowing before concluding an
+adapter is not slcan because its version string looks wrong.
+
 The adapter appears as a virtual COM port and needs no vendor DLL, only its
 USB-serial driver.
 

@@ -34,15 +34,34 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(180);
 /// How often the wait loop wakes to beat the heartbeat and check for a stop.
 const WAIT_TICK: Duration = Duration::from_millis(50);
 
+/// One motor to visit, and what it is.
+#[derive(Debug, Clone)]
+pub struct BatchMotor {
+    pub id: u8,
+    /// This motor's own model, where it is known.
+    ///
+    /// Per motor rather than one for the batch, because the model sets the MIT
+    /// quantisation range and that spans 21-fold across the RobStride family: an
+    /// RS-04 driven with RS-00 scales reports every torque about 7 times too
+    /// small. A scan usually knows each motor's model, and using one figure from
+    /// a form for all of them threw that away — measured on 2026-08-07, where a
+    /// batch of two RS-04s run as RS-00 returned Kt 0.24 and 0.20 N·m/A against
+    /// the 1.52 and 1.60 the same motors had given minutes earlier.
+    ///
+    /// `None` falls back to [`BatchSpec::model`].
+    pub model: Option<String>,
+}
+
 /// What to measure, and on which motors.
 #[derive(Debug, Clone)]
 pub struct BatchSpec {
-    /// Connection settings shared by every motor. Only the id varies.
+    /// Connection settings shared by every motor. Only the id and model vary.
     pub driver: DriverKind,
     pub interface: String,
     pub bus: BusKind,
+    /// Used for any motor whose own model is unknown.
     pub model: String,
-    pub motor_ids: Vec<u8>,
+    pub motors: Vec<BatchMotor>,
     /// Runs performed on each motor, in order.
     pub runs: Vec<CharacterizeJob>,
     pub envelope: RunEnvelope,
@@ -145,7 +164,7 @@ impl Batch {
 pub fn spawn(spec: BatchSpec) -> Batch {
     let progress = Arc::new(Mutex::new(BatchProgress {
         running: true,
-        motor_count: spec.motor_ids.len(),
+        motor_count: spec.motors.len(),
         run_count: spec.runs.len() + usize::from(spec.measure_kt_first),
         ..Default::default()
     }));
@@ -168,10 +187,11 @@ pub fn spawn(spec: BatchSpec) -> Batch {
 }
 
 fn run(spec: BatchSpec, progress: &Mutex<BatchProgress>, cancel: &AtomicBool) {
-    for (mi, &motor_id) in spec.motor_ids.iter().enumerate() {
+    for (mi, motor) in spec.motors.iter().enumerate() {
         if cancel.load(Ordering::Acquire) {
             return;
         }
+        let motor_id = motor.id;
         if let Ok(mut p) = progress.lock() {
             p.motor_index = mi;
             p.motor_id = motor_id;
@@ -182,7 +202,10 @@ fn run(spec: BatchSpec, progress: &Mutex<BatchProgress>, cancel: &AtomicBool) {
             kind: spec.driver,
             interface: spec.interface.clone(),
             motor_id,
-            model: spec.model.clone(),
+            // This motor's own model wins over the batch's fallback. Getting it
+            // wrong is not a small error: it mis-scales every torque the run
+            // reports, and nothing downstream can tell.
+            model: motor.model.clone().unwrap_or_else(|| spec.model.clone()),
             bus_kind: spec.bus,
             ..DriverConfig::default()
         };
@@ -412,7 +435,10 @@ mod tests {
             interface: String::new(),
             bus: BusKind::Can,
             model: "rs04".to_string(),
-            motor_ids: ids,
+            motors: ids
+                .into_iter()
+                .map(|id| BatchMotor { id, model: None })
+                .collect(),
             runs,
             envelope: RunEnvelope {
                 max_torque_nm: 3.0,
@@ -533,6 +559,41 @@ mod tests {
         assert_eq!(p.results.len(), 2, "both attempted: {:?}", p.results);
         assert!(p.results.iter().all(|r| !r.ok && r.run == "connect"));
         assert_eq!(p.error, None, "a per-motor failure is not a batch failure");
+    }
+
+    /// Each motor's own model must be used, not the batch's fallback.
+    ///
+    /// The fallback here is a preset the simulator rejects, so a motor that
+    /// carries its own model opens and one that does not fails — which is a
+    /// direct read on which value reached the driver. Cheaper and less ambiguous
+    /// than inspecting scaling, and it is scaling this protects: an RS-04 opened
+    /// with RS-00's MIT range reports every torque about 7 times too small, with
+    /// nothing downstream able to tell (2026-08-07).
+    #[test]
+    fn each_motor_opens_with_its_own_model() {
+        let mut spec = sim_spec(vec![], vec![quick_breakaway()]);
+        spec.model = "not-a-preset".to_string();
+        spec.motors = vec![
+            BatchMotor {
+                id: 1,
+                model: Some("rs04".to_string()),
+            },
+            BatchMotor { id: 2, model: None },
+        ];
+        let p = wait_done(&spawn(spec), Duration::from_secs(60));
+
+        assert_eq!(p.results.len(), 2, "{:?}", p.results);
+        let by_id = |id: u8| p.results.iter().find(|r| r.motor_id == id).unwrap();
+        assert!(
+            by_id(1).ok,
+            "the motor with its own model should have opened: {:?}",
+            by_id(1)
+        );
+        assert!(
+            !by_id(2).ok && by_id(2).run == "connect",
+            "the motor without one should have fallen back and failed: {:?}",
+            by_id(2)
+        );
     }
 
     #[test]

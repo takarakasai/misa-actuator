@@ -90,6 +90,17 @@ pub trait CanBus: Send {
         0
     }
 
+    /// How many error / status / remote-request frames the backend has dropped
+    /// on the way to the caller.
+    ///
+    /// Not data, so callers never see them, but counted because a frame
+    /// discarded without a record cannot be ruled out as the explanation for
+    /// anything. Normally zero: error frames are not even delivered unless
+    /// [`OpenOptions::allow_error_frames`] asked for them.
+    fn rx_skipped(&self) -> u64 {
+        0
+    }
+
     /// Short backend name, for logs and error messages.
     fn backend_name(&self) -> &'static str;
 
@@ -123,6 +134,10 @@ impl CanBus for Box<dyn CanBus> {
         (**self).rx_overruns()
     }
 
+    fn rx_skipped(&self) -> u64 {
+        (**self).rx_skipped()
+    }
+
     fn backend_name(&self) -> &'static str {
         (**self).backend_name()
     }
@@ -141,6 +156,28 @@ pub struct OpenOptions {
     pub fd: bool,
     /// Initial receive timeout.
     pub timeout: Duration,
+    /// Receive without participating: no transmissions, and **no
+    /// acknowledgement**.
+    ///
+    /// Required of anything watching a bus it is not part of. On CAN the
+    /// acknowledge slot is asserted by *any* node that received the frame
+    /// correctly, so an ordinary second node acknowledges on the real
+    /// recipient's behalf — which is exactly the observation a bus monitor is
+    /// there to make. Without this a monitor does not watch the bus, it
+    /// changes it.
+    ///
+    /// Only the PCAN backend implements it; the others reject it rather than
+    /// silently listening as a participant.
+    pub listen_only: bool,
+    /// Deliver error frames instead of discarding them.
+    ///
+    /// Off by default because the drivers want data frames and nothing else.
+    /// Worth turning on when the question is whether the wire is corrupting
+    /// traffic, since a controller that detects an error signals it and the
+    /// sender retransmits — so corruption shows up as error frames and delay
+    /// rather than as loss, and none of that is visible while these are
+    /// dropped.
+    pub allow_error_frames: bool,
 }
 
 impl Default for OpenOptions {
@@ -148,6 +185,8 @@ impl Default for OpenOptions {
         Self {
             fd: false,
             timeout: DEFAULT_TIMEOUT,
+            listen_only: false,
+            allow_error_frames: false,
         }
     }
 }
@@ -170,6 +209,18 @@ impl OpenOptions {
         self.timeout = timeout;
         self
     }
+
+    /// Watch the bus without joining it — see [`Self::listen_only`].
+    pub fn listening_only(mut self) -> Self {
+        self.listen_only = true;
+        self
+    }
+
+    /// Also deliver error frames — see [`Self::allow_error_frames`].
+    pub fn allowing_error_frames(mut self) -> Self {
+        self.allow_error_frames = true;
+        self
+    }
 }
 
 /// Open whatever `spec` names. See [`InterfaceSpec`] for the grammar.
@@ -180,6 +231,19 @@ pub fn open(spec: &str, opts: &OpenOptions) -> Result<Box<dyn CanBus>> {
 /// Open an already-parsed spec.
 pub fn open_spec(spec: &InterfaceSpec, opts: &OpenOptions) -> Result<Box<dyn CanBus>> {
     spec.require_available()?;
+    // Refuse rather than come up as a participant. A monitor that quietly
+    // acknowledges frames is worse than no monitor: it changes the bus it was
+    // opened to observe, and nothing downstream would say so.
+    if opts.listen_only && spec.backend != Backend::Pcan {
+        return Err(Error::bad_spec(
+            &spec.raw,
+            format!(
+                "{} cannot listen without acknowledging; only the PCAN backend \
+                 implements listen-only",
+                spec.backend.name()
+            ),
+        ));
+    }
     log::debug!(
         "opening CAN interface {:?} via {} (fd={})",
         spec.raw,

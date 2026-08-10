@@ -85,7 +85,7 @@ pub mod scan;
 pub use bus::{AnyCanBus, CanBus, CanFrame, DamiaoBus};
 /// Re-exported for sharing one bus across motors — see the multi-motor docs.
 pub use misa_actuator::Shared;
-pub use driver::DamiaoMotor;
+pub use driver::{DamiaoMotor, REGISTER_READ_ATTEMPTS};
 pub use error::{Error, Result};
 pub use scan::{probe_one, scan_bus_on, ScanProgress};
 

@@ -100,6 +100,31 @@ struct Cli {
     #[arg(long, default_value_t = 100)]
     timeout_ms: u64,
 
+    /// Attempts per register read. Pass 1 to measure the motor's raw loss rate.
+    ///
+    /// The default retries, because register reads were observed going
+    /// unanswered about one time in seven over CAN-FD. But the retry and a fix
+    /// to the receive path landed in the same commit, so which one stopped the
+    /// dropouts was never established. Setting this to 1 takes the retry back
+    /// out without a rebuild — see doc/handover.md §9 for the procedure and how
+    /// to read the result alongside the overrun count reported after each run.
+    #[arg(long, default_value_t = damiao_driver::REGISTER_READ_ATTEMPTS)]
+    read_attempts: u32,
+
+    /// Pause this many ms before every register read.
+    ///
+    /// Diagnostic, for telling apart the two remaining explanations of the
+    /// CAN-FD dropouts. Signal-integrity loss should not care how far apart the
+    /// requests are; a motor that cannot keep up should drop fewer of them when
+    /// they are spaced out. Sweeping the bit rate cannot answer this — the
+    /// motor offers only 1 and 5 Mbit/s, and both ends must agree on the data
+    /// phase, so there is no intermediate point to measure at.
+    ///
+    /// Combine with `--read-attempts 1`, or the retry hides what is being
+    /// measured.
+    #[arg(long, default_value_t = 0)]
+    read_gap_ms: u64,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -114,6 +139,30 @@ enum Command {
         /// Last CAN_ID to probe.
         #[arg(long, default_value_t = 16)]
         to: u8,
+    },
+    /// Watch the bus without joining it, decoding what goes past.
+    ///
+    /// Receive-only, and on PCAN also acknowledge-only-never: the channel is
+    /// opened listen-only, so it does not acknowledge frames on the real
+    /// recipient's behalf. That matters more than it sounds. On CAN any node
+    /// that received a frame correctly asserts the acknowledge bit, so an
+    /// ordinary second adapter would answer for a motor that missed the frame —
+    /// and whether the motor missed it is exactly the question a monitor is
+    /// there to settle.
+    ///
+    /// Intended for a second channel while another process talks to the motor
+    /// on the first. Run it on the same wire (both adapters on the same CAN_H /
+    /// CAN_L, still exactly two terminations) and compare: a request that
+    /// appears here but draws no reply was received by the motor and ignored by
+    /// its firmware; a request that never appears was dropped before the wire,
+    /// on our side.
+    Dump {
+        /// Stop after this many seconds. Runs until Ctrl-C when omitted.
+        #[arg(long)]
+        duration: Option<f32>,
+        /// Also deliver error frames, if the adapter allows it.
+        #[arg(long)]
+        allow_error_frames: bool,
     },
     /// Enable the motor (required before motion).
     Enable,
@@ -421,6 +470,16 @@ fn main() -> Result<()> {
         .with_context(|| format!("unknown DAMIAO model: {}", cli.model))?;
     let timeout = Duration::from_millis(cli.timeout_ms);
 
+    // Handled before a motor exists: this one deliberately never transmits, so
+    // it must not go through the paths that bind and configure a motor.
+    if let Command::Dump {
+        duration,
+        allow_error_frames,
+    } = &cli.command
+    {
+        return dump(&cli, *duration, *allow_error_frames);
+    }
+
     // The bus type is chosen at runtime; dispatch into a generic runner so the
     // command logic is written once for both transports.
     if cli.fd_link_classic_frames {
@@ -444,6 +503,95 @@ fn main() -> Result<()> {
             .with_context(|| format!("failed to open CAN interface {}", cli.interface))?;
         configure(&mut motor, &cli, timeout)?;
         run_and_report(&mut motor, &cli)
+    }
+}
+
+/// Watch the bus without joining it.
+///
+/// Deliberately built on `misa_can` directly rather than on `DamiaoMotor`: the
+/// motor handle exists to talk, and everything it does on the way up — binding
+/// an id, confirming a mode — puts frames on the wire. A monitor that emits
+/// anything is not a monitor.
+fn dump(cli: &Cli, duration: Option<f32>, allow_error_frames: bool) -> Result<()> {
+    let mut opts = misa_can::OpenOptions {
+        fd: cli.fd || cli.fd_link_classic_frames,
+        // Short, so Ctrl-C and the duration limit stay responsive between reads.
+        timeout: Duration::from_millis(50),
+        ..Default::default()
+    }
+    .listening_only();
+    if allow_error_frames {
+        opts = opts.allowing_error_frames();
+    }
+
+    let mut bus = misa_can::open(&cli.interface, &opts)
+        .with_context(|| format!("failed to open {} for listening", cli.interface))?;
+    println!("listening on {} — Ctrl-C to stop", bus.description());
+    println!("not transmitting and not acknowledging: this channel does not answer for the motor");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst)).ok();
+
+    let start = Instant::now();
+    let deadline = duration.map(|s| start + Duration::from_secs_f32(s));
+    let mut frames = 0u64;
+
+    while !stop.load(Ordering::SeqCst) {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
+        match bus.recv() {
+            Ok(frame) => {
+                frames += 1;
+                let t = start.elapsed().as_secs_f64();
+                let id = frame.raw_id();
+                let data = frame.data();
+                let hex: Vec<String> = data.iter().map(|b| format!("{b:02X}")).collect();
+                println!(
+                    "{t:9.4}  id 0x{id:03X}  {:2}B  {:<24}  {}",
+                    data.len(),
+                    hex.join(" "),
+                    describe_frame(id, data),
+                );
+            }
+            Err(misa_can::Error::Timeout) => continue,
+            Err(e) => return Err(anyhow::anyhow!("receive failed: {e}")),
+        }
+    }
+
+    println!("\n{frames} frame(s) in {:.2} s", start.elapsed().as_secs_f64());
+    let skipped = bus.rx_skipped();
+    let overruns = bus.rx_overruns();
+    println!(
+        "error/status/RTR frames discarded: {skipped}{}",
+        if skipped == 0 && !allow_error_frames {
+            "  (error frames are not delivered without --allow-error-frames)"
+        } else {
+            ""
+        }
+    );
+    println!("receive overruns reported: {overruns}");
+    Ok(())
+}
+
+/// Name a frame in DAMIAO terms, so a capture can be read without a manual.
+fn describe_frame(id: u32, data: &[u8]) -> String {
+    // Requests go to the shared config id; the first byte is the target motor
+    // and the third selects read (0x33) or write (0x55).
+    if id == 0x7FF && data.len() >= 4 {
+        let target = u16::from(data[0]) | (u16::from(data[1]) << 8);
+        let rid = data[3];
+        return match data[2] {
+            0x33 => format!("READ  motor {target} RID {rid}"),
+            0x55 => format!("WRITE motor {target} RID {rid} (int)"),
+            0x00..=0x32 => format!("request motor {target} RID {rid} (cmd 0x{:02X})", data[2]),
+            other => format!("request motor {target} RID {rid} (cmd 0x{other:02X})"),
+        };
+    }
+    match damiao_driver::protocol::register::parse_reg_reply(data) {
+        Some(reply) => format!("reply motor {} RID {}", reply.can_id, reply.rid),
+        None => String::new(),
     }
 }
 
@@ -478,6 +626,25 @@ fn configure<B: DamiaoBus>(
     motor.set_timeout(timeout)?;
     // Match feedback on the requested Master ID (default 0).
     motor.set_master_id(cli.master_id);
+    motor.set_register_read_attempts(cli.read_attempts);
+    motor.set_register_read_gap(Duration::from_millis(cli.read_gap_ms));
+    if cli.read_gap_ms > 0 {
+        eprintln!(
+            "note: pausing {} ms before every register read. Compare the unanswered count \
+             against a run with no gap — if it falls, the motor was not keeping up rather \
+             than the wire corrupting frames.",
+            cli.read_gap_ms
+        );
+    }
+    if cli.read_attempts != damiao_driver::REGISTER_READ_ATTEMPTS {
+        eprintln!(
+            "note: register reads will be attempted {} time(s) instead of the default {}. \
+             A timeout now means the motor did not answer once, not that it failed to \
+             answer repeatedly.",
+            cli.read_attempts,
+            damiao_driver::REGISTER_READ_ATTEMPTS
+        );
+    }
 
     if cli.refresh_kt {
         match motor.refresh_torque_constant()? {
@@ -520,6 +687,9 @@ fn configure<B: DamiaoBus>(
 
 fn run<B: DamiaoBus>(motor: &mut DamiaoMotor<B>, cli: &Cli) -> Result<()> {
     match &cli.command {
+        // Handled in `main` before a motor is bound, because binding one
+        // transmits and this command must not.
+        Command::Dump { .. } => unreachable!("dump is dispatched before the motor is opened"),
         Command::Scan { from, to } => {
             if to < from {
                 bail!("--to must be >= --from");

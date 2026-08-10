@@ -40,7 +40,13 @@ const MODE_SWITCH_RETRIES: u32 = 20;
 /// Attempts per register read — see [`DamiaoMotor::read_register`] for the
 /// measurements behind this. Three, because the observed loss is independent
 /// per attempt: at one in seven, three tries leaves about one read in 350.
-const REGISTER_READ_ATTEMPTS: u32 = 3;
+///
+/// Overridable per motor with [`DamiaoMotor::set_register_read_attempts`]:
+/// setting it to 1 is how the retry is taken back out to find out what the
+/// underlying loss rate actually is, which is still an open question (see
+/// `doc/handover.md` §4 and §9). Editing this constant for that would mean a
+/// rebuild between measurements and a change to remember to undo.
+pub const REGISTER_READ_ATTEMPTS: u32 = 3;
 
 /// Pause before re-asking for a register the motor did not answer.
 const REGISTER_RETRY_GAP: Duration = Duration::from_millis(5);
@@ -74,6 +80,10 @@ pub struct DamiaoMotor<B: DamiaoBus = AnyCanBus> {
     /// [`DamiaoMotor::refresh_torque_constant`]; see that method for why it is
     /// not read eagerly.
     torque_constant: Option<f32>,
+    /// Attempts per register read. [`REGISTER_READ_ATTEMPTS`] unless changed.
+    register_read_attempts: u32,
+    /// Deliberate pause before each register read. Zero unless set.
+    register_read_gap: Duration,
 }
 
 impl DamiaoMotor<AnyCanBus> {
@@ -151,7 +161,45 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
             soft_zero: 0.0,
             last_cmd: None,
             torque_constant: None,
+            register_read_attempts: REGISTER_READ_ATTEMPTS,
+            register_read_gap: Duration::ZERO,
         }
+    }
+
+    /// Pause before every register read, to test whether the loss depends on
+    /// how fast requests arrive.
+    ///
+    /// Zero by default, which is the behaviour everything else relies on. The
+    /// point of setting it is diagnostic: signal-integrity loss should not care
+    /// how far apart the requests are, while a motor that cannot keep up
+    /// should drop fewer of them. That comparison is available where a bit-rate
+    /// sweep is not — the motor offers only 1 Mbit/s and 5 Mbit/s, and both
+    /// ends must agree on the data phase, so there is nothing in between to
+    /// measure at.
+    pub fn set_register_read_gap(&mut self, gap: Duration) {
+        self.register_read_gap = gap;
+    }
+
+    /// The current pacing — see [`Self::set_register_read_gap`].
+    pub fn register_read_gap(&self) -> Duration {
+        self.register_read_gap
+    }
+
+    /// How many times a register read is attempted before it is a timeout.
+    ///
+    /// Set this to 1 to see the motor's raw loss rate. The retry was added and
+    /// the `ReadOutcome` receive-path bug was fixed in the same commit, so
+    /// which of the two actually stopped the CAN-FD dropouts has never been
+    /// established — `doc/handover.md` §9 is the procedure, and it starts by
+    /// taking the retry away. Clamped to at least one attempt: zero would turn
+    /// every read into an immediate timeout.
+    pub fn set_register_read_attempts(&mut self, attempts: u32) {
+        self.register_read_attempts = attempts.max(1);
+    }
+
+    /// The current setting — see [`Self::set_register_read_attempts`].
+    pub fn register_read_attempts(&self) -> u32 {
+        self.register_read_attempts
     }
 
     // -- accessors --
@@ -592,8 +640,30 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
     /// `0x7FF` transmit echoes. Replies are matched on `can_id` + `rid`.
     fn recv_reg_reply(&mut self, rid: u8) -> Result<RegReply> {
         let start = Instant::now();
+        // Counted, because a timeout with something discarded and a timeout
+        // with nothing received are different failures with different causes,
+        // and this loop used to report them identically. "The reply never
+        // comes" was inferred from raising the timeout, which cannot
+        // distinguish a reply that never arrives from one that arrives
+        // carrying a RID we are not waiting for.
+        let mut discarded_replies = 0u32;
+        let mut discarded_other = 0u32;
+        let mut last_seen_rid = None;
+
         loop {
             if start.elapsed() > self.timeout {
+                if discarded_replies > 0 || discarded_other > 0 {
+                    log::warn!(
+                        "RID {rid} on motor {}: timed out having discarded {} \
+                         register reply/replies (last was for RID {:?}) and {} other \
+                         frame(s). The reply may have arrived unmatched rather than \
+                         not at all.",
+                        self.can_id,
+                        discarded_replies,
+                        last_seen_rid,
+                        discarded_other
+                    );
+                }
                 return Err(Error::Timeout {
                     motor_id: self.can_id,
                 });
@@ -604,9 +674,29 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
                     if frame.can_id == REGISTER_ID {
                         continue;
                     }
-                    if let Some(reply) = parse_reg_reply(&frame.data) {
-                        if reply.can_id == self.can_id && reply.rid == rid {
-                            return Ok(reply);
+                    match parse_reg_reply(&frame.data) {
+                        Some(reply) if reply.can_id == self.can_id && reply.rid == rid => {
+                            return Ok(reply)
+                        }
+                        Some(reply) => {
+                            discarded_replies += 1;
+                            last_seen_rid = Some(reply.rid);
+                            log::debug!(
+                                "while waiting for RID {rid} on motor {}: discarded a \
+                                 register reply for RID {} from motor {}",
+                                self.can_id,
+                                reply.rid,
+                                reply.can_id
+                            );
+                        }
+                        None => {
+                            discarded_other += 1;
+                            log::debug!(
+                                "while waiting for RID {rid}: discarded a non-register \
+                                 frame (id 0x{:03X}, {} bytes)",
+                                frame.can_id,
+                                frame.data.len()
+                            );
                         }
                     }
                 }
@@ -619,21 +709,42 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
     /// Read a register (RID). Request goes to `0x7FF`; the reply arrives on the
     /// motor's Master ID.
     ///
-    /// Retries, because the motor drops requests. Measured on a DM4310 over
-    /// CAN-FD at 1 Mbit/s arbitration and 5 Mbit/s data: roughly one read in
-    /// seven goes unanswered, at random registers, with **no bus errors
-    /// reported by the adapter** and every request confirmed transmitted.
-    /// Raising the timeout tenfold changes nothing, so the reply is not late —
-    /// it never comes. The same reads over classic CAN do not drop, which
-    /// points at the motor's firmware not keeping up once requests arrive at
-    /// FD speed rather than at anything on the host side.
+    /// Retries, because reads go unanswered. Measured on a DM4310 over CAN-FD
+    /// at 1 Mbit/s arbitration and 5 Mbit/s data, 2026-08-03, with the retry
+    /// disabled: **31/190, 30/190 and 29/190 unanswered** at inter-read gaps of
+    /// 0, 5 and 20 ms — about 16% regardless, so the loss does not depend on how
+    /// fast requests arrive. No receive-queue overrun and no bus error was
+    /// reported in any run.
+    ///
+    /// The losses are **not random**, which an earlier note here claimed. In
+    /// read order they recur with a period of roughly eleven reads, usually as
+    /// two failures two apart, with the phase differing per run. The period is
+    /// counted in reads rather than in time: a failed read costs the full
+    /// timeout, so a 20 ms gap nearly doubles a run's duration without changing
+    /// the count.
+    ///
+    /// What that leaves is a structural gap in request/reply handling rather
+    /// than the wire or the request rate. See `recv_reg_reply`, which until
+    /// 2026-08-03 discarded unmatched frames without a trace — so "the reply
+    /// never comes" had never actually been distinguished from "a reply comes
+    /// bearing a RID nobody is waiting for".
     ///
     /// A register read has no side effects, so retrying is free of risk, and
     /// the alternative is handing callers a "timeout" that means nothing more
     /// than "ask again".
     pub fn read_register(&mut self, rid: u8) -> Result<RegReply> {
+        // Pacing, when asked for. Whether the loss depends on how fast requests
+        // arrive is what separates "the firmware cannot keep up" from "the wire
+        // corrupts frames" — the bit rate cannot be swept for that, because the
+        // motor only offers 1 Mbit/s and 5 Mbit/s and both ends have to agree
+        // on the data phase. Spacing the requests needs no reconfiguration at
+        // either end.
+        if !self.register_read_gap.is_zero() {
+            thread::sleep(self.register_read_gap);
+        }
+
         let mut last = None;
-        for attempt in 0..REGISTER_READ_ATTEMPTS {
+        for attempt in 0..self.register_read_attempts.max(1) {
             if attempt > 0 {
                 // A short gap as well as a retry: if the motor is behind,
                 // asking again immediately is asking at the same rate.

@@ -52,6 +52,13 @@ const PCAN_ERROR_QOVERRUN: u32 = 0x0000_0040;
 /// investigation (`doc/handover.md` §4), and it never was.
 const PCAN_ERROR_ANYOVERRUN: u32 = PCAN_ERROR_OVERRUN | PCAN_ERROR_QOVERRUN;
 
+// Configuration parameters for `CAN_SetValue`, from PCANBasic.h. A wrong code
+// here is loud rather than silent: the call returns a status and every use
+// below checks it.
+const PCAN_LISTEN_ONLY: u8 = 0x08;
+const PCAN_ALLOW_ERROR_FRAMES: u8 = 0x20;
+const PCAN_PARAMETER_ON: u32 = 0x01;
+
 const PCAN_MESSAGE_STANDARD: u8 = 0x00;
 const PCAN_MESSAGE_RTR: u8 = 0x01;
 const PCAN_MESSAGE_EXTENDED: u8 = 0x02;
@@ -511,6 +518,12 @@ pub struct PcanBackend {
     /// number instead of an impression. The log line says which side lost
     /// them; this is just how often.
     rx_overruns: u64,
+    /// Error / status / RTR frames dropped on the way to the caller.
+    ///
+    /// These were discarded with no record at all, which made them impossible
+    /// to rule out as an explanation for anything. Normally zero, because the
+    /// driver does not ask for them — see [`OpenOptions::allow_error_frames`].
+    rx_skipped: u64,
 }
 
 // The channel handle is a plain integer and the event is owned exclusively by
@@ -554,6 +567,59 @@ impl PcanBackend {
             });
         }
 
+        // Listen-only before anything else, and fatal if it is refused. A
+        // monitor that silently came up as a participant would acknowledge
+        // frames on the real recipient's behalf, which quietly invalidates the
+        // measurement it was opened to make.
+        if opts.listen_only {
+            let mut on = PCAN_PARAMETER_ON;
+            let st = unsafe {
+                (api.set_value)(
+                    channel,
+                    PCAN_LISTEN_ONLY,
+                    &mut on as *mut u32 as *mut c_void,
+                    std::mem::size_of::<u32>() as u32,
+                )
+            };
+            if st != PCAN_ERROR_OK {
+                unsafe { (api.uninitialize)(channel) };
+                return Err(Error::Driver {
+                    api: "CAN_SetValue(PCAN_LISTEN_ONLY)",
+                    message: format!(
+                        "{} on {channel_name}: this adapter will not listen without \
+                         acknowledging, so it cannot watch a bus without altering it",
+                        status_text(api, st)
+                    ),
+                    code: st,
+                });
+            }
+            log::info!("PCAN {channel_name}: listen-only — not transmitting, not acknowledging");
+        }
+
+        // Error frames are a diagnostic, so a refusal is worth saying out loud
+        // but not worth failing over: the caller still gets the data frames it
+        // asked for.
+        if opts.allow_error_frames {
+            let mut on = PCAN_PARAMETER_ON;
+            let st = unsafe {
+                (api.set_value)(
+                    channel,
+                    PCAN_ALLOW_ERROR_FRAMES,
+                    &mut on as *mut u32 as *mut c_void,
+                    std::mem::size_of::<u32>() as u32,
+                )
+            };
+            if st == PCAN_ERROR_OK {
+                log::info!("PCAN {channel_name}: error frames will be delivered");
+            } else {
+                log::warn!(
+                    "PCAN {channel_name}: could not enable error frames ({}); \
+                     corruption on the wire will stay invisible",
+                    status_text(api, st)
+                );
+            }
+        }
+
         // Install the RX event so recv() can block instead of spin. Losing
         // this is not fatal — we fall back to polling — but it costs CPU, so
         // say something.
@@ -588,6 +654,7 @@ impl PcanBackend {
             timeout: opts.timeout,
             rx_event,
             rx_overruns: 0,
+            rx_skipped: 0,
         })
     }
 
@@ -611,6 +678,36 @@ impl PcanBackend {
         }
     }
 
+    /// Record a frame the caller will never see.
+    ///
+    /// Error, status and RTR frames are not data and the drivers do not want
+    /// them, but dropping them without a trace made them unfalsifiable as an
+    /// explanation. The first one says what it was; after that only the count
+    /// grows, because on a noisy bus this would otherwise become the noise.
+    fn note_skipped(&mut self, msgtype: u8, id: u32) {
+        self.rx_skipped += 1;
+        let kind = if msgtype & PCAN_MESSAGE_ERRFRAME != 0 {
+            "error"
+        } else if msgtype & PCAN_MESSAGE_STATUS != 0 {
+            "status"
+        } else {
+            "remote-request"
+        };
+        if self.rx_skipped == 1 {
+            log::warn!(
+                "PCAN {}: discarded a {kind} frame (id 0x{id:X}, msgtype 0x{msgtype:02X}). \
+                 Further ones are counted, not logged — see CanBus::rx_skipped.",
+                self.channel_name
+            );
+        } else {
+            log::debug!(
+                "PCAN {}: discarded a {kind} frame (id 0x{id:X}), {} so far",
+                self.channel_name,
+                self.rx_skipped
+            );
+        }
+    }
+
     /// A single `CAN_Read`/`CAN_ReadFD` call.
     fn read_one(&mut self) -> Result<ReadOutcome> {
         if self.fd {
@@ -631,6 +728,7 @@ impl PcanBackend {
                 return Ok(ReadOutcome::Empty);
             }
             if msg.msgtype & (PCAN_MESSAGE_ERRFRAME | PCAN_MESSAGE_STATUS | PCAN_MESSAGE_RTR) != 0 {
+                self.note_skipped(msg.msgtype, msg.id);
                 return Ok(ReadOutcome::Skipped);
             }
             let len = dlc_to_len(msg.dlc);
@@ -655,6 +753,7 @@ impl PcanBackend {
                 return Ok(ReadOutcome::Empty);
             }
             if msg.msgtype & (PCAN_MESSAGE_ERRFRAME | PCAN_MESSAGE_STATUS | PCAN_MESSAGE_RTR) != 0 {
+                self.note_skipped(msg.msgtype, msg.id);
                 return Ok(ReadOutcome::Skipped);
             }
             let len = (msg.len as usize).min(8);
@@ -827,6 +926,10 @@ impl CanBus for PcanBackend {
 
     fn rx_overruns(&self) -> u64 {
         self.rx_overruns
+    }
+
+    fn rx_skipped(&self) -> u64 {
+        self.rx_skipped
     }
 
     fn backend_name(&self) -> &'static str {

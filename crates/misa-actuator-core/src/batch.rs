@@ -268,8 +268,23 @@ fn run(spec: BatchSpec, progress: &Mutex<BatchProgress>, cancel: &AtomicBool) {
         // measure zero, and a batch is the one place nobody can type a value in
         // between motors.
         let mut envelope = spec.envelope;
+        // Precedence, most deliberate first: a ceiling chosen for this motor,
+        // then whatever the batch was given, then what the motor says about
+        // itself. The last one exists because the per-model table cannot cover
+        // a family whose limits are not enumerable — a MyActuator has no model
+        // list, so it always arrived with nothing and fell back to the gentle
+        // 1 N·m, which cut a velocity sweep short the moment its torque figures
+        // stopped being amps (2026-08-08).
         if let Some(nm) = motor.max_torque_nm {
             envelope.max_torque_nm = nm;
+        } else if envelope.max_torque_nm <= 0.0 {
+            if let Some(nm) = session.suggested_max_torque_nm() {
+                envelope.max_torque_nm = nm;
+                log::info!(
+                    "batch motor {motor_id}: using {nm:.2} N·m, the ceiling its own \
+                     registers imply"
+                );
+            }
         }
         // Ramping runs are scaled to this motor's ceiling too, or a ramp sized
         // for the largest motor on the bus would spend every run on a small one

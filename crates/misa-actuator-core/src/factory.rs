@@ -167,6 +167,29 @@ pub fn known_models(kind: DriverKind) -> Vec<&'static str> {
     }
 }
 
+/// A ceiling from what a MyActuator says it can pull, or `None` if it will not
+/// say.
+///
+/// `max_current × KT_OUT / 10` — a tenth of peak, the same rule
+/// [`suggested_torque_limits`] applies to RobStride's MIT scale. The difference
+/// is the source: this is two registers the motor reported, not a figure
+/// transcribed from a datasheet, and on an RMD-X4-P36-36 they cross-check
+/// (`rated_current 8.62 A × 1.1 = 9.5 N·m`, a plausible rated torque).
+///
+/// `None` rather than a guess when the register will not answer: the gentle
+/// default is at least a known quantity, and inventing a ceiling for a motor
+/// that would not state its own limit is the wrong direction to err.
+fn myactuator_ceiling<B: myactuator_driver::MyActuatorBus>(
+    motor: &mut MyActuatorMotor<B>,
+    kt_nm_per_a: f32,
+) -> Option<f32> {
+    let amps = motor
+        .read_param(myactuator_driver::ParamIndex::MaxCurrent)
+        .ok()?;
+    let nm = amps * kt_nm_per_a / 10.0;
+    (nm.is_finite() && nm > 0.0).then_some(nm)
+}
+
 /// A characterization torque ceiling to start from, keyed by model name (N·m).
 ///
 /// One tenth of the model's MIT quantisation full scale. **That scale is a peak
@@ -229,6 +252,19 @@ pub struct IdentityReport {
     pub observed: String,
     /// Set when the readings contradict the selected model.
     pub warning: Option<String>,
+    /// A characterization torque ceiling this motor's own registers imply (N·m).
+    ///
+    /// Only some families can say. RobStride's suggestion comes from a static
+    /// table keyed by model name, because nothing on the wire gives it; a
+    /// MyActuator reports its current limit and its `KT_OUT`, so the figure is
+    /// derived from what the motor says about itself rather than looked up.
+    ///
+    /// Needed because the table cannot cover a family whose limits are not
+    /// enumerable: without it a MyActuator always started at the gentle 1 N·m,
+    /// which was survivable only while its torque figures were secretly amps.
+    /// The moment the units were corrected, a velocity sweep on an RMD-X4 was
+    /// cut off by that ceiling (2026-08-08).
+    pub suggested_max_torque_nm: Option<f32>,
 }
 
 impl IdentityReport {
@@ -404,6 +440,12 @@ pub fn build_actuator_checked(
                 match motor.refresh_torque_constant() {
                     Ok(kt) => IdentityReport {
                         observed: format!("KT_OUT {kt} N·m/A"),
+                        // A tenth of what this motor says it can pull, which is
+                        // the same rule the RobStride table follows against its
+                        // MIT scale — except this figure is a register the motor
+                        // reported rather than an entry someone wrote down. An
+                        // RMD-X4-P36-36 reports 31 A, so 31 × 1.1 / 10 ≈ 3.4 N·m.
+                        suggested_max_torque_nm: myactuator_ceiling(&mut motor, kt),
                         ..IdentityReport::default()
                     },
                     Err(e) => IdentityReport {
@@ -500,7 +542,7 @@ fn robstride_named_identity(
         (None, None) => None,
     };
 
-    IdentityReport { observed, warning }
+    IdentityReport { observed, warning, suggested_max_torque_nm: None }
 }
 
 /// Ask a RobStride motor whether the selected model is even possible.
@@ -590,6 +632,7 @@ pub(crate) fn robstride_identity<B: robstride_driver::RobstrideBus>(
             Some(v) => IdentityReport {
                 observed: format!("motor firmware version {v}"),
                 warning: None,
+                suggested_max_torque_nm: None,
             },
             None => IdentityReport::default(),
         };
@@ -630,7 +673,7 @@ pub(crate) fn robstride_identity<B: robstride_driver::RobstrideBus>(
     } else {
         log::info!("{observed}; consistent with {label}");
     }
-    IdentityReport { observed, warning }
+    IdentityReport { observed, warning, suggested_max_torque_nm: None }
 }
 
 /// Read a DAMIAO motor's real MIT ranges out of `PMAX`/`VMAX`/`TMAX`.
@@ -682,6 +725,7 @@ pub(crate) fn damiao_identity<B: damiao_driver::DamiaoBus>(
             IdentityReport {
                 observed,
                 warning: model_warning,
+                suggested_max_torque_nm: None,
             }
         }
         Err(e) => IdentityReport {
@@ -690,6 +734,7 @@ pub(crate) fn damiao_identity<B: damiao_driver::DamiaoBus>(
                 "could not read PMAX/VMAX/TMAX ({e}); MIT scaling falls back to the \
                  defaults for the selected model, which no manual states"
             )),
+            suggested_max_torque_nm: None,
         },
     }
 }

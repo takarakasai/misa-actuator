@@ -32,6 +32,9 @@ pub struct Session {
     watchdog: Option<JoinHandle<()>>,
     description: String,
     motor_id: u8,
+    /// A ceiling this motor's own registers implied at open, where the family
+    /// can say. See [crate::factory::IdentityReport::suggested_max_torque_nm].
+    suggested_max_torque_nm: Option<f32>,
 }
 
 impl Session {
@@ -96,6 +99,7 @@ impl Session {
             watchdog: Some(watchdog),
             description,
             motor_id,
+            suggested_max_torque_nm: identity.suggested_max_torque_nm,
         })
     }
 
@@ -106,6 +110,12 @@ impl Session {
 
     pub fn motor_id(&self) -> u8 {
         self.motor_id
+    }
+
+    /// A characterization ceiling this motor's own registers imply, where the
+    /// family can say. `None` means fall back to whatever the caller has.
+    pub fn suggested_max_torque_nm(&self) -> Option<f32> {
+        self.suggested_max_torque_nm
     }
 
     /// Queue a discrete command.

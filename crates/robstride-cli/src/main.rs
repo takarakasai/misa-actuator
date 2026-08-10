@@ -805,11 +805,14 @@ fn run(cli: Cli) -> Result<()> {
             let timeout_per_id = Duration::from_millis(*timeout);
             let mut last_id: u8 = 0;
             let results = {
-                let mut cb = |idx: usize, total: usize, motor_id: u8| {
+                let mut cb = |idx: usize, total: usize, motor_id: u8| -> bool {
                     if motor_id != 0 && motor_id != last_id {
                         last_id = motor_id;
                         eprint!("\rprobing {idx}/{total} (id={motor_id})   ");
                     }
+                    // Nothing here cancels: Ctrl-C ends the process, and a CLI
+                    // sweep has no other reason to stop early.
+                    true
                 };
                 scan_bus(
                     &cli.interface,

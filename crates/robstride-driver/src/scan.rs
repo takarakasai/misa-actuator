@@ -19,8 +19,16 @@ pub struct ScanResult {
     pub payload: Vec<u8>,
 }
 
-/// Progress callback signature for [`scan_bus`]. Reports `(index, total, motor_id)`.
-pub type ScanProgress<'a> = &'a mut dyn FnMut(usize, usize, u8);
+/// Progress callback for [`scan_bus`]. Reports `(index, total, motor_id)` before
+/// each id is probed, and **returns whether to keep going**.
+///
+/// Returning `false` stops the sweep and hands back whatever was found so far —
+/// a cancelled scan that discarded its hits would be worse than one that could
+/// not be cancelled. The signal rides on the callback rather than a separate
+/// abort flag because the callback is already invoked once per id, which is
+/// exactly the granularity a stop needs: an id in flight still costs its own
+/// timeout, and nothing here can interrupt a blocking `recv`.
+pub type ScanProgress<'a> = &'a mut dyn FnMut(usize, usize, u8) -> bool;
 
 /// Scan a SocketCAN interface for motors that respond to `GET_DEVICE_ID`.
 pub fn scan_bus(
@@ -49,7 +57,12 @@ pub fn scan_bus_on<B: RobstrideBus>(
 
     for (idx, &motor_id) in ids.iter().enumerate() {
         if let Some(cb) = on_progress.as_mut() {
-            cb(idx, total, motor_id);
+            if !cb(idx, total, motor_id) {
+                // Return what was found rather than an error: the ids already
+                // swept are real results, and a caller that asked to stop is
+                // not asking to throw them away.
+                return Ok(found);
+            }
         }
 
         let (can_id, data) = build_ping_frame(host_id, motor_id);

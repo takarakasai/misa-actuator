@@ -437,7 +437,12 @@ impl ScanStep<'_> {
 }
 
 /// Callback fed one [`ScanStep`] per id probed.
-pub type ScanProgress<'a> = &'a mut dyn FnMut(ScanStep<'_>);
+///
+/// **Returns whether to keep going.** `false` ends the sweep and returns the
+/// hits found so far, so a cancelled scan still reports what it saw. The stop
+/// takes effect between ids: the one in flight still costs its own timeout,
+/// because a blocking `recv` cannot be interrupted from here.
+pub type ScanProgress<'a> = &'a mut dyn FnMut(ScanStep<'_>) -> bool;
 
 pub fn scan_for_motors(req: &ScanRequest) -> Result<Vec<ScanHit>> {
     scan_for_motors_with(req, None)
@@ -507,17 +512,21 @@ pub fn scan_for_motors_with(
         // One adapter per family, so each family's own `(index, total)` is
         // widened into a position across the whole scan.
         let family = driver.as_str();
-        let mut relay = |index: usize, total: usize, motor_id: u8| {
-            if let Some(cb) = progress.as_mut() {
-                cb(ScanStep {
+        let mut cancelled = false;
+        let mut relay = |index: usize, total: usize, motor_id: u8| -> bool {
+            let go = match progress.as_mut() {
+                Some(cb) => cb(ScanStep {
                     family,
                     family_index,
                     family_count,
                     index,
                     total,
                     motor_id,
-                });
-            }
+                }),
+                None => true,
+            };
+            cancelled = !go;
+            go
         };
         match driver {
             DriverKind::Robstride => {
@@ -566,6 +575,12 @@ pub fn scan_for_motors_with(
             }
             // Not reachable: filtered by SCANNABLE above.
             DriverKind::Sim | DriverKind::Lkmotor => {}
+        }
+        // A cancel stops the whole scan, not just this family. Carrying on to
+        // the next one would mean a stop that took several more sweeps to take
+        // effect, which is not a stop.
+        if cancelled {
+            break;
         }
     }
     Ok(hits)

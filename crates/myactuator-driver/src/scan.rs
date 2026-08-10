@@ -13,7 +13,13 @@ use crate::bus::MyActuatorBus;
 use crate::error::{Error, Result};
 
 /// Optional progress callback: `(index, total, motor_id)` before each probe.
-pub type ScanProgress<'a> = &'a mut dyn FnMut(usize, usize, u8);
+///
+/// **Returns whether to keep going.** `false` ends the sweep and hands back what
+/// was found so far — a cancel that discarded the hits would be worse than no
+/// cancel. Per id is the finest granularity available: an id already in flight
+/// still costs its own timeout, since nothing here can interrupt a blocking
+/// `recv`.
+pub type ScanProgress<'a> = &'a mut dyn FnMut(usize, usize, u8) -> bool;
 
 /// Probe each id in `id_range` and return those that answered. Ids outside
 /// 1..=32 are skipped (never probed, never reported).
@@ -63,7 +69,9 @@ pub fn scan_bus_on<B: MyActuatorBus>(
 
     for (idx, &motor_id) in ids.iter().enumerate() {
         if let Some(cb) = on_progress.as_mut() {
-            cb(idx, total, motor_id);
+            if !cb(idx, total, motor_id) {
+                return Ok(found);
+            }
         }
         if probe_one(bus, motor_id, timeout_per_id)? {
             found.push(motor_id);

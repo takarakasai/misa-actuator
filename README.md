@@ -62,6 +62,10 @@ bulk/single parameter-table reads used to fetch firmware version etc.).
 
 ## Architecture
 
+The summary below is the layer view. For the full picture — a process/thread
+diagram, the channel design between the UI and the motor worker, and every loop
+period in one table — see [`doc/architecture.md`](doc/architecture.md).
+
 `misa_actuator::Actuator` is the SI-unit motor-control trait that
 applications speak. Each motor family has its own internal **bus** trait
 (e.g. `LkBus`, `RobstrideBus`, `DamiaoBus`, `MyActuatorBus`) so that the

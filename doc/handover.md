@@ -21,6 +21,7 @@
 
 | 文書 | 内容 |
 |---|---|
+| [`architecture.md`](architecture.md) | **プロセス／スレッド構成とレイヤ構成**。§3 が設計判断なのに対し、あちらは構造そのもの |
 | [`data/*.csv`](data/) | 摩擦測定の生データ（3 機種 × static/kinetic） |
 | [`rs04-myactuator-data-map.md`](rs04-myactuator-data-map.md) | RS-04 と MyActuator のレジスタ対応 |
 | `crates/misa-actuator-tui/doc/vendor-identity-coverage.md` | **機種識別の可否マトリクス**。§4 の主題の要約 |

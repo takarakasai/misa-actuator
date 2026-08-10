@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use misa_actuator::Actuator;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::factory::{BusKind, DriverKind, IdentityReport, MODEL_UNSPECIFIED};
 
@@ -317,6 +317,253 @@ pub fn build_multi(cfg: &MultiConfig) -> Result<BuiltBus> {
         motors: built,
         bus: shared,
     })
+}
+
+/// One motor found by [`scan_for_motors`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanHit {
+    pub driver: DriverKind,
+    pub motor_id: u8,
+    /// The model, where the protocol lets us ask. `None` means **unknown**, not
+    /// "the default": on RobStride an unrecognised firmware major returns no
+    /// answer rather than a guess, and a guess there would pick a MIT range that
+    /// differs 21-fold across the family.
+    pub model: Option<String>,
+    /// What the identification was based on, for the operator to judge.
+    pub evidence: Option<String>,
+}
+
+/// Which vendors a scan should probe, and how far.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanRequest {
+    pub interface: String,
+    #[serde(default = "default_bus_kind")]
+    pub bus: BusKind,
+    /// Families to probe. Empty means every CAN family.
+    #[serde(default)]
+    pub drivers: Vec<DriverKind>,
+    #[serde(default = "default_scan_from")]
+    pub from: u8,
+    #[serde(default = "default_scan_to")]
+    pub to: u8,
+    /// Per-id timeout. Short, because a scan pays it for every silent id.
+    #[serde(default = "default_scan_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_scan_from() -> u8 {
+    1
+}
+
+fn default_scan_to() -> u8 {
+    32
+}
+
+fn default_scan_timeout_ms() -> u64 {
+    30
+}
+
+/// Whether probing this family energises a motor.
+///
+/// **DAMIAO does.** It has no broadcast ping that every motor answers, so the
+/// probe is an enable frame, a listen, and a disable frame. No MIT command is
+/// sent, so no torque is commanded, but the motor is briefly energised and may
+/// twitch — and `doc/handover.md` section 2 records that `disable` is not a
+/// latched safe state on a DM-J4310. The other two families read and nothing
+/// more.
+///
+/// Exposed so a UI can say this **before** the button is pressed rather than
+/// after.
+pub fn probe_energises_motor(driver: DriverKind) -> bool {
+    matches!(driver, DriverKind::Damiao)
+}
+
+/// Every CAN family, in probe order: the read-only ones first.
+///
+/// Order matters for a mixed bus. Doing the harmless probes first means a scan
+/// that is interrupted, or that the operator stops after seeing enough, has
+/// energised nothing.
+pub const SCANNABLE: &[DriverKind] = &[
+    DriverKind::Robstride,
+    DriverKind::Myactuator,
+    DriverKind::Damiao,
+];
+
+/// Probe one wire for motors of several families.
+///
+/// Opens the bus, probes, and closes it again — so it must not run while a
+/// [`crate::multi_session::MultiSession`] holds the same channel. A PCAN channel
+/// has one owner and the second open fails with `PCAN_ERROR_NETINUSE`, which is
+/// the same reason two sessions cannot share a wire.
+///
+/// The vendor is always reported. The model is reported only when the protocol
+/// answers, because the alternative is presenting a guess as a reading.
+pub fn scan_for_motors(req: &ScanRequest) -> Result<Vec<ScanHit>> {
+    if req.to < req.from {
+        bail!("scan range is inverted: {}..{}", req.from, req.to);
+    }
+    let drivers: Vec<DriverKind> = if req.drivers.is_empty() {
+        SCANNABLE.to_vec()
+    } else {
+        // Keep the caller's selection but impose the safe order.
+        SCANNABLE
+            .iter()
+            .copied()
+            .filter(|d| req.drivers.contains(d))
+            .collect()
+    };
+    if drivers.is_empty() {
+        bail!("no scannable families were selected (LK Motor is RS485, not CAN)");
+    }
+
+    let opts = match req.bus {
+        BusKind::Can => misa_can::OpenOptions::classic(),
+        BusKind::CanFd => misa_can::OpenOptions::fd(),
+    }
+    .with_timeout(Duration::from_millis(req.timeout_ms));
+    let bus = misa_can::open(&req.interface, &opts)
+        .with_context(|| format!("failed to open {} to scan", req.interface))?;
+    let shared = SharedCanBus::new(bus);
+    let timeout = Duration::from_millis(req.timeout_ms);
+    let range = req.from..=req.to;
+
+    let mut hits = Vec::new();
+    for driver in drivers {
+        match driver {
+            DriverKind::Robstride => {
+                let mut adapter = robstride_driver::CanBus::new(shared.clone());
+                let found = robstride_driver::scan_bus_on(
+                    &mut adapter,
+                    robstride_driver::DEFAULT_HOST_ID,
+                    range.clone(),
+                    timeout,
+                    None,
+                )
+                .unwrap_or_default();
+                for r in found {
+                    hits.push(robstride_hit(&shared, r.motor_id, timeout));
+                }
+            }
+            DriverKind::Myactuator => {
+                let mut adapter = myactuator_driver::CanBus::new(shared.clone());
+                let found = myactuator_driver::scan_bus_on(
+                    &mut adapter,
+                    range.clone(),
+                    timeout,
+                    None,
+                )
+                .unwrap_or_default();
+                for id in found {
+                    hits.push(ScanHit {
+                        driver: DriverKind::Myactuator,
+                        motor_id: id,
+                        model: None,
+                        evidence: Some("answered a Status1 read".into()),
+                    });
+                }
+            }
+            DriverKind::Damiao => {
+                let mut adapter = match req.bus {
+                    BusKind::Can => damiao_driver::CanBus::new(shared.clone()),
+                    BusKind::CanFd => damiao_driver::CanBus::new_fd(shared.clone()),
+                };
+                let found =
+                    damiao_driver::scan_bus_on(&mut adapter, range.clone(), timeout, None)
+                        .unwrap_or_default();
+                for id in found {
+                    hits.push(damiao_hit(&shared, req.bus, id, timeout));
+                }
+            }
+            // Not reachable: filtered by SCANNABLE above.
+            DriverKind::Sim | DriverKind::Lkmotor => {}
+        }
+    }
+    Ok(hits)
+}
+
+/// Identify a RobStride that answered, from its firmware version.
+///
+/// The motor has to be constructed with *some* model before it can be asked
+/// anything, and the model is what we are trying to find out. RS-04 is used as a
+/// placeholder and **only `read_version` is called on it** — that read carries no
+/// scaled quantity, so the placeholder cannot corrupt the answer. Anything that
+/// scales torque or position must wait until the real model is known.
+fn robstride_hit(shared: &SharedCanBus, motor_id: u8, timeout: Duration) -> ScanHit {
+    let mut motor = robstride_driver::Motor::with_bus(
+        robstride_driver::CanBus::new(shared.clone()),
+        motor_id,
+        robstride_driver::MotorModel::Rs04,
+    );
+    let _ = motor.set_timeout(timeout);
+
+    match motor.read_version() {
+        Ok(v) => {
+            let named = robstride_driver::MotorModel::from_firmware_version(v.version);
+            match named {
+                Some((model, line)) => ScanHit {
+                    driver: DriverKind::Robstride,
+                    motor_id,
+                    model: Some(line.catalogue_name(model).to_string()),
+                    evidence: Some(format!("firmware {v}")),
+                },
+                // Deliberately no fallback. An unrecognised major means the
+                // version-to-model table has moved on, and naming a model here
+                // would be a guess about the MIT range.
+                None => ScanHit {
+                    driver: DriverKind::Robstride,
+                    motor_id,
+                    model: None,
+                    evidence: Some(format!(
+                        "firmware {v}, which no known model claims - pick the model by hand"
+                    )),
+                },
+            }
+        }
+        Err(e) => ScanHit {
+            driver: DriverKind::Robstride,
+            motor_id,
+            model: None,
+            evidence: Some(format!("answered a ping, but the version read failed: {e}")),
+        },
+    }
+}
+
+/// Identify a DAMIAO from its reduction ratio, which names the model exactly.
+fn damiao_hit(
+    shared: &SharedCanBus,
+    bus: BusKind,
+    motor_id: u8,
+    timeout: Duration,
+) -> ScanHit {
+    let adapter = match bus {
+        BusKind::Can => damiao_driver::CanBus::new(shared.clone()),
+        BusKind::CanFd => damiao_driver::CanBus::new_fd(shared.clone()),
+    };
+    // A placeholder model again, and again only a register read is issued: the
+    // gear ratio is not a scaled quantity.
+    let mut motor = damiao_driver::DamiaoMotor::with_bus(
+        adapter,
+        motor_id,
+        damiao_driver::MotorModel::Dm4310,
+    );
+    let _ = motor.set_timeout(timeout);
+
+    match motor.identify_model() {
+        Ok(model) => ScanHit {
+            driver: DriverKind::Damiao,
+            motor_id,
+            model: Some(model.name().to_string()),
+            evidence: Some("reduction ratio (RID 20)".into()),
+        },
+        Err(e) => ScanHit {
+            driver: DriverKind::Damiao,
+            motor_id,
+            model: None,
+            evidence: Some(format!("answered a probe, but the gear-ratio read failed: {e}")),
+        },
+    }
 }
 
 /// Refuse DAMIAO pairs whose feedback cannot be attributed.
@@ -641,6 +888,60 @@ mod tests {
     #[test]
     fn an_empty_list_is_refused() {
         assert!(build_multi(&cfg(Vec::new())).is_err());
+    }
+
+    /// The order is a safety property, not a preference: the read-only probes
+    /// run before the one that energises a motor, so a scan stopped early has
+    /// energised nothing.
+    #[test]
+    fn the_energising_probe_runs_last() {
+        let damiao_at = SCANNABLE.iter().position(|&d| d == DriverKind::Damiao);
+        assert_eq!(damiao_at, Some(SCANNABLE.len() - 1));
+        for &d in &SCANNABLE[..SCANNABLE.len() - 1] {
+            assert!(!probe_energises_motor(d), "{d:?} was expected to be read-only");
+        }
+        assert!(probe_energises_motor(DriverKind::Damiao));
+    }
+
+    /// LK Motor is RS485 and the simulator has no wire, so neither is scannable
+    /// here. Worth pinning: silently including them would produce a scan that
+    /// cannot work.
+    #[test]
+    fn only_can_families_are_scannable() {
+        assert!(!SCANNABLE.contains(&DriverKind::Lkmotor));
+        assert!(!SCANNABLE.contains(&DriverKind::Sim));
+    }
+
+    /// Selecting nothing scannable is refused rather than returning an empty
+    /// list, which would read as "no motors on the bus".
+    #[test]
+    fn selecting_no_scannable_family_is_an_error() {
+        let req = ScanRequest {
+            interface: "pcan:usb1".into(),
+            bus: BusKind::Can,
+            drivers: vec![DriverKind::Lkmotor],
+            from: 1,
+            to: 8,
+            timeout_ms: 10,
+        };
+        let err = scan_for_motors(&req).unwrap_err().to_string();
+        assert!(err.contains("no scannable families"), "{err}");
+        // Refused before the bus is touched.
+        assert!(!err.contains("failed to open"), "{err}");
+    }
+
+    #[test]
+    fn an_inverted_range_is_refused() {
+        let req = ScanRequest {
+            interface: "pcan:usb1".into(),
+            bus: BusKind::Can,
+            drivers: Vec::new(),
+            from: 20,
+            to: 3,
+            timeout_ms: 10,
+        };
+        let err = scan_for_motors(&req).unwrap_err().to_string();
+        assert!(err.contains("inverted"), "{err}");
     }
 
     #[test]

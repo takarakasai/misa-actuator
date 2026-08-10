@@ -256,10 +256,21 @@ fn run(spec: BatchSpec, progress: &Mutex<BatchProgress>, cancel: &AtomicBool) {
         // being aborted by its envelope just short of finishing. Half, because
         // the envelope judges *measured* torque and a ramp that reaches it trips
         // it — the two ceilings must not meet.
+        //
+        // Clamped against the ceiling *in force*, not the raw field: 0 there
+        // means "use the gentle default", and feeding it through as a number
+        // capped every ramp at 0 N·m. A simulator batch then reported
+        // "breakaway torque not reached below 0.000 N·m" — the run did exactly
+        // what it was told and told nobody anything (2026-08-07).
+        let effective_ceiling = if envelope.max_torque_nm > 0.0 {
+            envelope.max_torque_nm
+        } else {
+            misa_sysid::SafetyLimits::gentle().max_torque_nm
+        };
         let runs: Vec<CharacterizeJob> = spec
             .runs
             .iter()
-            .map(|r| clamp_ramp(*r, envelope.max_torque_nm))
+            .map(|r| clamp_ramp(*r, effective_ceiling))
             .collect();
         if spec.measure_kt_first {
             let kt_run = kt_job(envelope);
@@ -318,6 +329,13 @@ const RAMP_FRACTION: f32 = 0.5;
 /// it — this exists to stop one figure chosen for a large motor being applied to
 /// a small one, not to push every run to the maximum.
 fn clamp_ramp(job: CharacterizeJob, ceiling_nm: f32) -> CharacterizeJob {
+    // A zero or absurd ceiling would cap every ramp at zero, which is a run
+    // that cannot measure anything and says so only in its result. Callers
+    // resolve "use the default" before getting here; this refuses to turn a
+    // sentinel into a limit.
+    if !(ceiling_nm > 0.0) {
+        return job;
+    }
     let cap = ceiling_nm * RAMP_FRACTION;
     match job {
         CharacterizeJob::Breakaway {
@@ -706,6 +724,12 @@ mod tests {
         // Only ever lowered: a deliberately gentle run is not pushed up to the
         // envelope just because there is room.
         assert_eq!(clamp_ramp(ramp(0.5), 12.0), ramp(0.5));
+
+        // A sentinel ceiling is not a limit. Passing the raw "0 means use the
+        // default" field through capped every ramp at zero, and the run then
+        // reported "not reached below 0.000 N·m" — obeyed exactly, and useless.
+        assert_eq!(clamp_ramp(ramp(6.0), 0.0), ramp(6.0));
+        assert_eq!(clamp_ramp(ramp(6.0), f32::NAN), ramp(6.0));
 
         // Runs that do not ramp against a ceiling are untouched.
         let sweep = CharacterizeJob::VelocitySweep {

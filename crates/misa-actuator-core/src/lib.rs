@@ -58,6 +58,7 @@ pub mod factory;
 pub mod multi;
 pub mod multi_session;
 pub mod protocol;
+pub(crate) mod safety;
 pub mod session;
 pub(crate) mod worker;
 

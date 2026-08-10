@@ -8,7 +8,7 @@
 //! - if the UI dies, the command channel closes, the worker notices and
 //!   disables the motor on its way out — no supervision required
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,6 +17,7 @@ use misa_actuator::realtime::{sleep_until, TimerResolutionGuard};
 use misa_actuator::{Actuator, Error as ActuatorError};
 
 use crate::protocol::*;
+use crate::safety::Safety;
 
 /// How many consecutive bus failures before the worker gives up and stops the
 /// motor. A single timeout is routine; twenty in a row means the motor is gone
@@ -48,17 +49,17 @@ fn excitation_of(job: &ChirpJob) -> misa_sysid::Excitation {
     }
 }
 
-/// Codes for [`Shared::stop_reason`].
-pub(crate) const STOP_NONE: u8 = 0;
-pub(crate) const STOP_USER: u8 = 1;
-pub(crate) const STOP_WATCHDOG: u8 = 2;
-
 /// State shared between the session handle, the watchdog and the worker.
 ///
-/// Deliberately all atomics plus one small mutex: the UI thread touches this
-/// on every frame, and a contended lock there would show up as jank.
+/// The stop flag, watchdog, heartbeat and rate clamp are in
+/// [`crate::safety::Safety`], shared with every other kind of session — see that
+/// module for why they are not duplicated here. What is left is the one motor's
+/// setpoint, which is what actually differs from a multi-motor session.
+///
+/// Deliberately atomics plus one small mutex: the UI thread touches this on
+/// every frame, and a contended lock there would show up as jank.
 pub(crate) struct Shared {
-    pub(crate) started: Instant,
+    pub(crate) safety: Arc<Safety>,
     pub(crate) setpoint: Mutex<Setpoint>,
     /// Whether anything has deliberately written a setpoint yet.
     ///
@@ -67,119 +68,17 @@ pub(crate) struct Shared {
     /// target, seeding would be overwriting intent — and worse, racing it,
     /// since the setpoint is written immediately while commands are queued.
     pub(crate) setpoint_touched: AtomicBool,
-    pub(crate) streaming: AtomicBool,
-    /// A long-running measurement is in progress. The worker's loop is blocked
-    /// for its duration, so this is how anything else knows the motor is being
-    /// driven.
-    pub(crate) job_active: AtomicBool,
-    /// Set by the UI or the watchdog, consumed by the worker. Separate from
-    /// the command channel so a stop can never queue behind other work — and
-    /// handed straight to `misa-sysid` as its abort flag, so it cuts a chirp
-    /// short too.
-    pub(crate) stop: AtomicBool,
-    pub(crate) stop_reason: AtomicU8,
-    pub(crate) rate_millihz: AtomicU32,
-    pub(crate) last_heartbeat_ms: AtomicU64,
-    /// 0 disables the watchdog.
-    pub(crate) watchdog_ms: AtomicU64,
-    /// Cleared on shutdown so the watchdog thread knows to exit.
-    pub(crate) alive: AtomicBool,
 }
 
 impl Shared {
     pub(crate) fn new(rate_hz: f32, watchdog: Option<Duration>) -> Self {
         Self {
-            started: Instant::now(),
+            safety: Arc::new(Safety::new(rate_hz, watchdog)),
             setpoint: Mutex::new(Setpoint::default()),
             setpoint_touched: AtomicBool::new(false),
-            streaming: AtomicBool::new(false),
-            job_active: AtomicBool::new(false),
-            stop: AtomicBool::new(false),
-            stop_reason: AtomicU8::new(STOP_NONE),
-            rate_millihz: AtomicU32::new(rate_to_millihz(rate_hz)),
-            last_heartbeat_ms: AtomicU64::new(0),
-            watchdog_ms: AtomicU64::new(
-                watchdog.map(|d| d.as_millis() as u64).unwrap_or(0),
-            ),
-            alive: AtomicBool::new(true),
         }
     }
 
-    pub(crate) fn now_ms(&self) -> u64 {
-        self.started.elapsed().as_millis() as u64
-    }
-
-    pub(crate) fn beat(&self) {
-        self.last_heartbeat_ms.store(self.now_ms(), Ordering::Release);
-    }
-
-    /// Ask the worker to stop. The reason is stored first so whoever consumes
-    /// the flag never sees a stop without knowing why.
-    pub(crate) fn request_stop(&self, reason: u8) {
-        self.stop_reason.store(reason, Ordering::Release);
-        self.stop.store(true, Ordering::Release);
-    }
-
-    /// Consume a pending stop, if there is one.
-    pub(crate) fn take_stop(&self) -> Option<StopReason> {
-        if !self.stop.swap(false, Ordering::AcqRel) {
-            return None;
-        }
-        Some(match self.stop_reason.swap(STOP_NONE, Ordering::AcqRel) {
-            STOP_WATCHDOG => StopReason::Watchdog,
-            _ => StopReason::UserRequest,
-        })
-    }
-
-    /// Whether the motor is actually being driven, and so whether the watchdog
-    /// has anything to protect against.
-    pub(crate) fn is_driving(&self) -> bool {
-        self.streaming.load(Ordering::Acquire) || self.job_active.load(Ordering::Acquire)
-    }
-
-    /// `true` if the UI has gone quiet while the motor is being driven.
-    pub(crate) fn watchdog_tripped(&self) -> bool {
-        if !self.is_driving() {
-            return false;
-        }
-        let limit = self.watchdog_ms.load(Ordering::Relaxed);
-        if limit == 0 {
-            return false;
-        }
-        let last = self.last_heartbeat_ms.load(Ordering::Acquire);
-        self.now_ms().saturating_sub(last) > limit
-    }
-
-    fn period(&self) -> Duration {
-        let hz = self.rate_millihz.load(Ordering::Relaxed) as f32 / 1000.0;
-        Duration::from_secs_f32(1.0 / hz.clamp(MIN_RATE_HZ, MAX_RATE_HZ))
-    }
-}
-
-/// How often the watchdog thread re-checks. Fine enough that the effective
-/// timeout is the configured one plus a tick, coarse enough to be free.
-pub(crate) const WATCHDOG_POLL: Duration = Duration::from_millis(50);
-
-/// The watchdog runs on its own thread rather than inside the worker's loop.
-///
-/// That is not tidiness — it is the only arrangement that works. A chirp owns
-/// the worker's loop for tens of seconds, during which a loop-based check
-/// would never run, and a hung UI would leave the motor being excited with
-/// nobody watching. A separate thread keeps checking regardless of what the
-/// worker is busy with, and the flag it sets is the same one `misa-sysid`
-/// reads as its abort.
-pub(crate) fn watchdog_loop(shared: Arc<Shared>) {
-    while shared.alive.load(Ordering::Acquire) {
-        if shared.watchdog_tripped() && !shared.stop.load(Ordering::Acquire) {
-            log::warn!("watchdog: no heartbeat from the UI — stopping the motor");
-            shared.request_stop(STOP_WATCHDOG);
-        }
-        std::thread::sleep(WATCHDOG_POLL);
-    }
-}
-
-pub(crate) fn rate_to_millihz(hz: f32) -> u32 {
-    (hz.clamp(MIN_RATE_HZ, MAX_RATE_HZ) * 1000.0) as u32
 }
 
 /// An in-progress bus scan, advanced one id per tick so the UI keeps painting
@@ -276,7 +175,7 @@ impl Worker {
             }
 
             // The watchdog thread sets the same flag, with its own reason.
-            if let Some(reason) = self.shared.take_stop() {
+            if let Some(reason) = self.shared.safety.take_stop() {
                 self.halt(reason);
             }
 
@@ -289,7 +188,7 @@ impl Worker {
             self.flush_if_due();
             self.status_if_due();
 
-            next_tick += self.shared.period();
+            next_tick += self.shared.safety.period();
             let now = Instant::now();
             if next_tick < now {
                 // Overran: re-base rather than accumulating debt and then
@@ -332,7 +231,7 @@ impl Worker {
                 Err(e) => self.fault("enable", e),
             },
             Command::Disable => {
-                self.shared.streaming.store(false, Ordering::Release);
+                self.shared.safety.set_streaming(false);
                 match self.actuator.disable() {
                     Ok(()) => {
                         self.enabled = false;
@@ -368,7 +267,7 @@ impl Worker {
                 // uses. Streaming has to stop for the same reason a scan
                 // stops it, and saying so beats leaving the operator to
                 // wonder why the motor went limp mid-read.
-                if self.shared.streaming.swap(false, Ordering::AcqRel) {
+                if self.shared.safety.take_streaming() {
                     self.log(
                         LogLevel::Info,
                         "streaming paused while reading parameters".to_string(),
@@ -407,7 +306,7 @@ impl Worker {
                 let to = to.max(from);
                 // Scanning while driving would interleave probes with control
                 // frames on the same wire.
-                self.shared.streaming.store(false, Ordering::Release);
+                self.shared.safety.set_streaming(false);
                 self.scan = Some(ScanState {
                     from,
                     to,
@@ -430,15 +329,11 @@ impl Worker {
                     // Refresh the heartbeat as streaming begins, so the
                     // watchdog does not fire on a stale timestamp from before
                     // the UI started beating.
-                    self.shared.beat();
-                    self.shared.streaming.store(on, Ordering::Release);
+                    self.shared.safety.beat();
+                    self.shared.safety.set_streaming(on);
                 }
             }
-            Command::SetRate { hz } => {
-                self.shared
-                    .rate_millihz
-                    .store(rate_to_millihz(hz), Ordering::Relaxed);
-            }
+            Command::SetRate { hz } => self.shared.safety.set_rate(hz),
             Command::StartJob { spec } => self.run_job(spec),
             // Handled by the caller so it can break the loop.
             Command::Shutdown => unreachable!("shutdown is handled in run()"),
@@ -447,7 +342,7 @@ impl Worker {
 
     /// One control or poll transaction. `Some(reason)` ends the session.
     fn control_step(&mut self) -> Option<StopReason> {
-        let streaming = self.shared.streaming.load(Ordering::Acquire);
+        let streaming = self.shared.safety.is_streaming();
 
         let result = if streaming && self.enabled {
             let sp = *self.shared.setpoint.lock().unwrap();
@@ -544,12 +439,12 @@ impl Worker {
 
         // Starting with a stop already pending would abort instantly and look
         // like a failure.
-        let _ = self.shared.take_stop();
-        self.shared.streaming.store(false, Ordering::Release);
-        self.shared.job_active.store(true, Ordering::Release);
+        let _ = self.shared.safety.take_stop();
+        self.shared.safety.set_streaming(false);
+        self.shared.safety.set_job_active(true);
         // The UI may have been idle up to now; without this the watchdog would
         // fire on a stale timestamp the moment the job arms it.
-        self.shared.beat();
+        self.shared.safety.beat();
         let _ = self.events.send(Event::JobStarted { spec });
         self.log(
             LogLevel::Info,
@@ -576,7 +471,7 @@ impl Worker {
         // actuator is borrowed mutably for the whole run.
         let telemetry = self.telemetry.clone();
         let events = self.events.clone();
-        let started = self.shared.started;
+        let started = self.shared.safety.started();
         let duration_s = job.duration_s;
 
         let mut pending: Vec<Sample> = Vec::with_capacity(256);
@@ -589,7 +484,7 @@ impl Worker {
             &chirp,
             excitation_of(&job),
             job.rate_hz,
-            &self.shared.stop,
+            self.shared.safety.abort_flag(),
             &mut |s| {
                 count += 1;
                 pending.push(Sample {
@@ -626,7 +521,7 @@ impl Worker {
 
         // Whatever happened, the run left the motor disabled (`run_chirp`
         // commands a safe stop on every exit path) and the job is over.
-        self.shared.job_active.store(false, Ordering::Release);
+        self.shared.safety.set_job_active(false);
         self.enabled = false;
         if !pending.is_empty() {
             let n = pending.len();
@@ -640,7 +535,7 @@ impl Worker {
         // A stop that arrived during the run has already done its job by
         // aborting the sweep; consuming it here keeps the main loop from
         // halting a motor that is already stopped and reporting it twice.
-        let aborted = self.shared.take_stop().is_some();
+        let aborted = self.shared.safety.take_stop().is_some();
 
         match result {
             Ok(log) => {
@@ -714,10 +609,10 @@ impl Worker {
     /// every exit path.
     #[allow(clippy::type_complexity)]
     fn run_characterize(&mut self, run: CharacterizeJob) {
-        let _ = self.shared.take_stop();
-        self.shared.streaming.store(false, Ordering::Release);
-        self.shared.job_active.store(true, Ordering::Release);
-        self.shared.beat();
+        let _ = self.shared.safety.take_stop();
+        self.shared.safety.set_streaming(false);
+        self.shared.safety.set_job_active(true);
+        self.shared.safety.beat();
         let _ = self.events.send(Event::JobStarted {
             spec: JobSpec::Characterize(run),
         });
@@ -746,7 +641,7 @@ impl Worker {
                     return_sweep,
                     ..misa_sysid::LoadMapSpec::symmetric(0.5, 2)
                 };
-                misa_sysid::run_load_map(self.actuator.as_mut(), &spec, limits, &self.shared.stop)
+                misa_sysid::run_load_map(self.actuator.as_mut(), &spec, limits, self.shared.safety.abort_flag())
                     .map(load_map_data)
             }
             CharacterizeJob::Breakaway {
@@ -765,14 +660,14 @@ impl Worker {
                     rate_hz,
                     ..misa_sysid::BreakawaySpec::slow(max_torque_nm, direction)
                 };
-                misa_sysid::run_breakaway(self.actuator.as_mut(), &spec, limits, &self.shared.stop)
+                misa_sysid::run_breakaway(self.actuator.as_mut(), &spec, limits, self.shared.safety.abort_flag())
                     .map(breakaway_data)
             }
         };
 
-        self.shared.job_active.store(false, Ordering::Release);
+        self.shared.safety.set_job_active(false);
         self.enabled = false;
-        let aborted = self.shared.take_stop().is_some();
+        let aborted = self.shared.safety.take_stop().is_some();
 
         match outcome {
             Ok((data, note)) => {
@@ -858,7 +753,7 @@ impl Worker {
 
     /// Stop driving the motor, for a reason that is not the end of the session.
     fn halt(&mut self, reason: StopReason) {
-        self.shared.streaming.store(false, Ordering::Release);
+        self.shared.safety.set_streaming(false);
         self.scan = None;
         match self.actuator.disable() {
             Ok(()) => self.enabled = false,
@@ -904,7 +799,7 @@ impl Worker {
 
     fn sample(&self, fb: misa_actuator::MotorFeedback, commanded: f32) -> Sample {
         Sample {
-            t_s: self.shared.started.elapsed().as_secs_f64(),
+            t_s: self.shared.safety.elapsed().as_secs_f64(),
             commanded,
             position_rad: fb.position_rad,
             velocity_rad_s: fb.velocity_rad_per_s,

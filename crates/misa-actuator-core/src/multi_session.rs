@@ -26,7 +26,7 @@
 //! section 2. With several motors the wrong assumption is more expensive, not
 //! less.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -39,9 +39,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::multi::{build_multi, MotorSpec, MultiConfig};
 use crate::protocol::{
-    ControlMode, LogLevel, Setpoint, StopReason, DEFAULT_RATE_HZ, DEFAULT_WATCHDOG, MAX_RATE_HZ,
-    MIN_RATE_HZ, STATUS_INTERVAL, TELEMETRY_INTERVAL,
+    ControlMode, LogLevel, Setpoint, StopReason, DEFAULT_RATE_HZ, DEFAULT_WATCHDOG,
+    STATUS_INTERVAL, TELEMETRY_INTERVAL,
 };
+use crate::safety::{self, Safety};
 
 /// How many snapshots may be in flight before the worker drops them.
 ///
@@ -193,15 +194,16 @@ pub enum MultiEvent {
 // Shared state
 // ---------------------------------------------------------------------------
 
-const STOP_NONE: u8 = 0;
-const STOP_USER: u8 = 1;
-const STOP_WATCHDOG: u8 = 2;
-
-/// How often the watchdog re-checks.
-const WATCHDOG_POLL: Duration = Duration::from_millis(50);
-
+/// Per-motor state shared between the handle and the worker.
+///
+/// The stop flag, the watchdog, the heartbeat and the rate clamp are **not**
+/// here: they live in [`crate::safety::Safety`], one copy for every kind of
+/// session. That is a direct consequence of 2026-08-05, when the GUI's STOP
+/// button turned out to reach only the single-motor session because the two
+/// implementations of "stop" had drifted apart. What remains here is what
+/// genuinely differs from one motor to several — a setpoint per motor.
 struct Shared {
-    started: Instant,
+    safety: Arc<Safety>,
     /// One setpoint per motor, in the same order as the configuration.
     ///
     /// Overwritten rather than queued, for the reason the single-motor session
@@ -210,55 +212,11 @@ struct Shared {
     /// Whether a caller has chosen a target for this motor yet.
     ///
     /// One flag per motor, because seeding is per motor: a four-motor wire has
-    /// four shafts resting in four different places. Same purpose as the
-    /// single-motor session's single flag — see [`Worker::seed_position`].
+    /// four shafts resting in four different places.
     setpoints_touched: Vec<AtomicBool>,
-    streaming: AtomicBool,
-    stop: AtomicBool,
-    stop_reason: AtomicU8,
-    rate_millihz: AtomicU32,
-    last_heartbeat_ms: AtomicU64,
-    watchdog_ms: AtomicU64,
-    alive: AtomicBool,
 }
 
 impl Shared {
-    fn now_ms(&self) -> u64 {
-        self.started.elapsed().as_millis() as u64
-    }
-
-    fn beat(&self) {
-        self.last_heartbeat_ms
-            .store(self.now_ms(), Ordering::Release);
-    }
-
-    fn request_stop(&self, reason: u8) {
-        self.stop_reason.store(reason, Ordering::Release);
-        self.stop.store(true, Ordering::Release);
-    }
-
-    fn take_stop(&self) -> Option<StopReason> {
-        if !self.stop.swap(false, Ordering::AcqRel) {
-            return None;
-        }
-        Some(match self.stop_reason.swap(STOP_NONE, Ordering::AcqRel) {
-            STOP_WATCHDOG => StopReason::Watchdog,
-            _ => StopReason::UserRequest,
-        })
-    }
-
-    fn watchdog_tripped(&self) -> bool {
-        if !self.streaming.load(Ordering::Acquire) {
-            return false;
-        }
-        let limit = self.watchdog_ms.load(Ordering::Relaxed);
-        if limit == 0 {
-            return false;
-        }
-        let last = self.last_heartbeat_ms.load(Ordering::Acquire);
-        self.now_ms().saturating_sub(last) > limit
-    }
-
     /// Point one motor's position setpoint at where its shaft actually is, but
     /// only while nobody has chosen a target for it.
     ///
@@ -278,21 +236,6 @@ impl Shared {
         if let Ok(mut guard) = self.setpoints.lock() {
             guard[i].position_rad = position_rad;
         }
-    }
-
-    fn period(&self) -> Duration {
-        let hz = self.rate_millihz.load(Ordering::Relaxed) as f32 / 1000.0;
-        Duration::from_secs_f32(1.0 / hz.clamp(MIN_RATE_HZ, MAX_RATE_HZ))
-    }
-}
-
-fn watchdog_loop(shared: Arc<Shared>) {
-    while shared.alive.load(Ordering::Acquire) {
-        if shared.watchdog_tripped() && !shared.stop.load(Ordering::Acquire) {
-            log::warn!("multi watchdog: no heartbeat from the UI — stopping every motor");
-            shared.request_stop(STOP_WATCHDOG);
-        }
-        std::thread::sleep(WATCHDOG_POLL);
     }
 }
 
@@ -331,18 +274,10 @@ impl MultiSession {
         let description = describe(cfg, &specs);
 
         let shared = Arc::new(Shared {
-            started: Instant::now(),
+            safety: Arc::new(Safety::new(rate_hz, watchdog)),
             setpoints: Mutex::new(vec![Setpoint::default(); motors.len()]),
             setpoints_touched: (0..motors.len()).map(|_| AtomicBool::new(false)).collect(),
-            streaming: AtomicBool::new(false),
-            stop: AtomicBool::new(false),
-            stop_reason: AtomicU8::new(STOP_NONE),
-            rate_millihz: AtomicU32::new(rate_to_millihz(rate_hz)),
-            last_heartbeat_ms: AtomicU64::new(0),
-            watchdog_ms: AtomicU64::new(watchdog.map_or(0, |d| d.as_millis() as u64)),
-            alive: AtomicBool::new(true),
         });
-        shared.beat();
 
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (evt_tx, evt_rx) = mpsc::channel();
@@ -355,11 +290,12 @@ impl MultiSession {
             .context("failed to spawn the multi-motor worker thread")?;
 
         // Its own thread for the same reason as the single-motor watchdog: a
-        // long transaction must not be able to postpone the check.
-        let wd_shared = shared.clone();
+        // long transaction must not be able to postpone the check. Same loop,
+        // too — there is only one now.
+        let wd_safety = shared.safety.clone();
         let watchdog = std::thread::Builder::new()
             .name("motors-watchdog".to_string())
-            .spawn(move || watchdog_loop(wd_shared))
+            .spawn(move || crate::safety::watchdog_loop(wd_safety, "every motor"))
             .context("failed to spawn the watchdog thread")?;
 
         Ok(Self {
@@ -419,27 +355,23 @@ impl MultiSession {
     /// A flag, not a command, so it cannot queue behind a pass that is already
     /// under way.
     pub fn stop(&self) {
-        self.shared.request_stop(STOP_USER);
+        self.shared.safety.request_stop(safety::STOP_USER);
     }
 
     pub fn heartbeat(&self) {
-        self.shared.beat();
+        self.shared.safety.beat();
     }
 
     pub fn set_watchdog(&self, watchdog: Option<Duration>) {
-        self.shared
-            .watchdog_ms
-            .store(watchdog.map_or(0, |d| d.as_millis() as u64), Ordering::Relaxed);
+        self.shared.safety.set_watchdog(watchdog);
     }
 
     pub fn set_rate(&self, hz: f32) {
-        self.shared
-            .rate_millihz
-            .store(rate_to_millihz(hz), Ordering::Relaxed);
+        self.shared.safety.set_rate(hz);
     }
 
     pub fn is_streaming(&self) -> bool {
-        self.shared.streaming.load(Ordering::Acquire)
+        self.shared.safety.is_streaming()
     }
 
     pub fn poll_events(&self) -> Vec<MultiEvent> {
@@ -466,7 +398,7 @@ impl MultiSession {
             }
         }
         // After the worker, so a worker still winding down keeps its protection.
-        self.shared.alive.store(false, Ordering::Release);
+        self.shared.safety.retire();
         if let Some(w) = self.watchdog.take() {
             let _ = w.join();
         }
@@ -477,10 +409,6 @@ impl Drop for MultiSession {
     fn drop(&mut self) {
         self.shutdown();
     }
-}
-
-fn rate_to_millihz(hz: f32) -> u32 {
-    (hz.clamp(MIN_RATE_HZ, MAX_RATE_HZ) * 1000.0) as u32
 }
 
 fn describe(cfg: &MultiConfig, specs: &[MotorSpec]) -> String {
@@ -636,14 +564,14 @@ impl Worker {
                 }
             }
 
-            if let Some(reason) = self.shared.take_stop() {
+            if let Some(reason) = self.shared.safety.take_stop() {
                 self.halt(reason);
             }
 
             self.pass();
             self.flush_if_due();
 
-            next_tick += self.shared.period();
+            next_tick += self.shared.safety.period();
             let now = Instant::now();
             if next_tick < now {
                 next_tick = now;
@@ -670,7 +598,7 @@ impl Worker {
     /// single overrun of up to one timeout is still possible. Per-motor timeouts
     /// need the transport-level change noted in `crate::multi`.
     fn pass(&mut self) {
-        let streaming = self.shared.streaming.load(Ordering::Acquire);
+        let streaming = self.shared.safety.is_streaming();
         let setpoints = self
             .shared
             .setpoints
@@ -683,8 +611,7 @@ impl Worker {
             return;
         }
         let start = self.next_start % n;
-        let deadline = Instant::now() + self.shared.period();
-        let mut serviced = 0usize;
+        let deadline = Instant::now() + self.shared.safety.period();
         let mut resume_at = start;
 
         for k in 0..n {
@@ -693,19 +620,18 @@ impl Worker {
 
             // Checked per motor, not per pass: a stop must not wait for the
             // rest of the wire to be serviced first.
-            if self.shared.stop.load(Ordering::Acquire) {
+            if self.shared.safety.stop_pending() {
                 break;
             }
-            // At least one motor per pass, or a permanently slow first motor
-            // would starve everyone forever.
-            if serviced > 0 && Instant::now() >= deadline {
+            // At least one motor per pass — `k > 0` says exactly that — or a
+            // permanently slow first motor would starve everyone forever.
+            if k > 0 && Instant::now() >= deadline {
                 self.starved += 1;
                 break;
             }
 
             let sp = setpoints.get(i).copied().unwrap_or_default();
             self.service(i, sp, streaming);
-            serviced += 1;
             resume_at = (i + 1) % n;
         }
 
@@ -850,11 +776,11 @@ impl Worker {
                 }
             }
             MultiCommand::SetStreaming { on } => {
-                self.shared.streaming.store(on, Ordering::Release);
+                self.shared.safety.set_streaming(on);
                 // Beat on the way in, so enabling streaming does not trip the
                 // watchdog on the very next check because the last heartbeat
                 // predates it.
-                self.shared.beat();
+                self.shared.safety.beat();
                 self.log(
                     LogLevel::Info,
                     if on {
@@ -926,7 +852,7 @@ impl Worker {
     }
 
     fn halt(&mut self, reason: StopReason) {
-        self.shared.streaming.store(false, Ordering::Release);
+        self.shared.safety.set_streaming(false);
         self.disable_all();
         self.log(LogLevel::Warn, format!("stopped every motor ({reason:?})"));
     }
@@ -945,7 +871,7 @@ impl Worker {
             .map(|g| g.iter().map(|sp| sp.primary()).collect())
             .unwrap_or_default();
         let snapshot = MultiSnapshot {
-            t_s: self.shared.started.elapsed().as_secs_f64(),
+            t_s: self.shared.safety.elapsed().as_secs_f64(),
             motors: self
                 .motors
                 .iter()
@@ -998,7 +924,7 @@ impl Worker {
 
     /// Always leaves every motor stopped, whatever ended the loop.
     fn finish(mut self, reason: StopReason) {
-        self.shared.streaming.store(false, Ordering::Release);
+        self.shared.safety.set_streaming(false);
         for i in 0..self.motors.len() {
             let id = self.motors[i].spec.motor_id;
             if let Err(e) = self.motors[i].actuator.disable() {
@@ -1222,16 +1148,9 @@ mod tests {
     #[test]
     fn a_resting_shaft_is_not_commanded_to_zero() {
         let shared = Shared {
-            started: Instant::now(),
+            safety: Arc::new(Safety::new(DEFAULT_RATE_HZ, None)),
             setpoints: Mutex::new(vec![Setpoint::default(); 2]),
             setpoints_touched: (0..2).map(|_| AtomicBool::new(false)).collect(),
-            streaming: AtomicBool::new(false),
-            stop: AtomicBool::new(false),
-            stop_reason: AtomicU8::new(STOP_NONE),
-            rate_millihz: AtomicU32::new(rate_to_millihz(DEFAULT_RATE_HZ)),
-            last_heartbeat_ms: AtomicU64::new(0),
-            watchdog_ms: AtomicU64::new(0),
-            alive: AtomicBool::new(true),
         };
         let target_of = |i: usize| shared.setpoints.lock().unwrap()[i].position_rad;
 
@@ -1265,8 +1184,10 @@ mod tests {
     #[test]
     fn choosing_a_target_marks_it_as_chosen() {
         let s = MultiSession::connect(&sim_cfg(&[1, 2])).unwrap();
-        let mut sp = Setpoint::default();
-        sp.position_rad = 0.5;
+        let sp = Setpoint {
+            position_rad: 0.5,
+            ..Setpoint::default()
+        };
         s.set_setpoint(2, sp).unwrap();
         assert!(
             s.shared.setpoints_touched[1].load(Ordering::Acquire),
@@ -1390,7 +1311,7 @@ mod tests {
             snap.achieved_rate_hz
         );
         assert!(
-            snap.achieved_rate_hz <= MAX_RATE_HZ,
+            snap.achieved_rate_hz <= crate::protocol::MAX_RATE_HZ,
             "rate was {}",
             snap.achieved_rate_hz
         );

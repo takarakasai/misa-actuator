@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 
 use crate::factory::{build_actuator_checked, DriverConfig};
 use crate::protocol::*;
-use crate::worker::{rate_to_millihz, Shared, Worker};
+use crate::worker::{Shared, Worker};
 
 /// How many telemetry batches may be in flight before the worker starts
 /// dropping them. Four frames of slack: enough to ride out a slow repaint,
@@ -57,7 +57,7 @@ impl Session {
         let description = describe(cfg);
 
         let shared = Arc::new(Shared::new(rate_hz, watchdog));
-        shared.beat();
+        
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
         let (evt_tx, evt_rx) = mpsc::channel::<Event>();
@@ -81,10 +81,10 @@ impl Session {
         // worker's loop, because a measurement job owns that loop for tens of
         // seconds and a loop-based check would simply not run during exactly
         // the window that matters most.
-        let watchdog_shared = shared.clone();
+        let watchdog_safety = shared.safety.clone();
         let watchdog = std::thread::Builder::new()
             .name(format!("motor-{motor_id}-watchdog"))
-            .spawn(move || crate::worker::watchdog_loop(watchdog_shared))
+            .spawn(move || crate::safety::watchdog_loop(watchdog_safety, "the motor"))
             .context("failed to spawn the watchdog thread")?;
 
         Ok(Self {
@@ -145,12 +145,12 @@ impl Session {
     /// checks before every transaction — and which `misa-sysid` reads as its
     /// abort, so it also cuts a running measurement short.
     pub fn stop(&self) {
-        self.shared.request_stop(crate::worker::STOP_USER);
+        self.shared.safety.request_stop(crate::safety::STOP_USER);
     }
 
     /// Whether a measurement job is running.
     pub fn is_job_running(&self) -> bool {
-        self.shared.job_active.load(Ordering::Acquire)
+        self.shared.safety.job_active()
     }
 
     /// Tell the worker the UI is still alive.
@@ -160,26 +160,21 @@ impl Session {
     /// behaviour you want when the thing that was supposed to be steering has
     /// stopped running.
     pub fn heartbeat(&self) {
-        self.shared.beat();
+        self.shared.safety.beat();
     }
 
     /// Change the watchdog interval, or disable it with `None`.
     pub fn set_watchdog(&self, watchdog: Option<Duration>) {
-        self.shared.watchdog_ms.store(
-            watchdog.map(|d| d.as_millis() as u64).unwrap_or(0),
-            Ordering::Relaxed,
-        );
+        self.shared.safety.set_watchdog(watchdog);
     }
 
     /// Change the worker's tick rate without a round trip through the queue.
     pub fn set_rate(&self, hz: f32) {
-        self.shared
-            .rate_millihz
-            .store(rate_to_millihz(hz), Ordering::Relaxed);
+        self.shared.safety.set_rate(hz);
     }
 
     pub fn is_streaming(&self) -> bool {
-        self.shared.streaming.load(Ordering::Acquire)
+        self.shared.safety.is_streaming()
     }
 
     /// Take every event the worker has emitted since the last call.
@@ -217,7 +212,7 @@ impl Session {
         }
         // Only now: the watchdog has to outlive the worker, or a worker still
         // winding down from a job would lose its protection partway through.
-        self.shared.alive.store(false, Ordering::Release);
+        self.shared.safety.retire();
         if let Some(watchdog) = self.watchdog.take() {
             let _ = watchdog.join();
         }

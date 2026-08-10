@@ -225,7 +225,7 @@ pre.mermaid svg { max-width: 100%; height: auto; }
 <h3 id="1.4-停止経路は-3-系統ある">1.4 停止経路は 3 系統ある</h3>
 
 <pre class="mermaid">flowchart LR
-    U[&quot;STOP ボタン / Esc&quot;] --&gt;|&quot;stop フラグ&quot;| F
+    U[&quot;STOP ボタン / Esc / エラーバウンダリ&quot;] --&gt;|&quot;stop_all: 両スロット&quot;| F
     WD2[&quot;watchdog&lt;br/&gt;心拍途絶 750 ms&quot;] --&gt;|&quot;stop フラグ&quot;| F
     F[&quot;Shared.stop AtomicBool&lt;br/&gt;+ 理由コード&quot;] --&gt; W2[&quot;worker: 全トランザクションの前に確認&quot;]
     F --&gt;|&quot;同じフラグを abort として読む&quot;| SY[&quot;misa-sysid&lt;br/&gt;実行中の chirp を中断&quot;]
@@ -239,7 +239,12 @@ pre.mermaid svg { max-width: 100%; height: auto; }
 <li><strong>Drop</strong> — <code>shutdown()</code> は「フラグ→Shutdown コマンド→worker を join」の順。 watchdog は<strong>worker より後に</strong>落とす。ジョブから抜けかけの worker が途中で保護を失わないため（<a href="../crates/misa-actuator-core/src/session.rs#L205-L224">session.rs:205-224</a>）</li>
 </ol>
 
-<p><strong><code>MultiSession</code> も同じ 3 系統</strong>で、加えて 1 つ規則がある: <strong><code>disable_all()</code> は失敗しても次のモータに進む</strong>。途中で <code>?</code> を返すと、応答しない 1 台のせいで <strong>残りが通電したまま</strong>になる。停止は「全部に届く」ことが要件なので、最初のエラーで抜けてはいけない。</p>
+<p><strong><code>MultiSession</code> も同じ 3 系統</strong>で、加えて 2 つ規則がある。どちらも「<strong>停止は全部に届かなければ停止ではない</strong>」の系。</p>
+
+<ol>
+<li><strong><code>disable_all()</code> は失敗しても次のモータに進む。</strong> 途中で <code>?</code> を返すと、応答しない 1 台のせいで<strong>残りが通電したまま</strong>になる</li>
+<li><strong>GUI の停止経路は必ず <code>AppState::stop_all()</code> を通る</strong> — セッションのスロットは 2 つあるので、<strong>片方だけ止める stop は事故になる</strong>。2026-08-05 に実機でそれを踏んだ（右上の STOP・Esc・エラーバウンダリの 3 つが揃って multi に届いていなかった）。 <code>stop</code> と <code>multi_stop</code> は名前を 2 つ残して<strong>挙動を同一</strong>にしてある。 <strong>スロットを増やすなら <code>stop_all</code> にも足すこと</strong>（handover §2）</li>
+</ol>
 
 <p><strong>ただし</strong>: これらは<strong>ソフトウェアの停止経路</strong>であって、モータが無励磁でラッチされることを意味しない。handover §2 を読むこと。</p>
 

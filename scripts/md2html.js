@@ -336,7 +336,7 @@ pre.mermaid svg { max-width: 100%; height: auto; }
 }
 `;
 
-function page({ title, bodyHtml, toc, source, mermaidHref, generatedAt }) {
+function page({ title, bodyHtml, toc, source, mermaidHref }) {
   const tocHtml = toc.length
     ? `<nav class="toc"><strong>目次</strong><ul>${toc
         .map(
@@ -357,10 +357,14 @@ function page({ title, bodyHtml, toc, source, mermaidHref, generatedAt }) {
 
   Source : ${source}
   Command: node scripts/md2html.js ${source}
-  Built  : ${generatedAt}
 
   Every edit made here is destroyed the next time the command above runs.
   Change the markdown instead.
+
+  Deliberately carries no build timestamp: the output is committed, so a stamp
+  would put a diff in every regeneration whether or not the source changed —
+  and then the diff stops meaning "the document changed". The markdown's own
+  history already says when.
 -->
 <style>${CSS}</style>
 </head>
@@ -430,7 +434,6 @@ function build(mdPath) {
       toc,
       source: path.relative(process.cwd(), abs).replace(/\\/g, "/"),
       mermaidHref: "assets/mermaid.min.js",
-      generatedAt: new Date().toISOString().replace("T", " ").slice(0, 16) + " UTC",
     }),
     "utf8",
   );

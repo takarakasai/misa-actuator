@@ -179,6 +179,30 @@ pub enum CharacterizeJob {
         /// two directions instead of hiding inside one curve.
         return_sweep: bool,
     },
+    /// Traverse at a constant slow speed and split the torque by direction:
+    /// **kinetic** friction, as opposed to the static friction
+    /// [`Self::Breakaway`] measures.
+    ///
+    /// Sweeping both ways is what makes the split possible. In steady motion the
+    /// torque is load ± friction, so the half-difference between the two
+    /// directions is friction and the half-sum is load. One direction alone
+    /// cannot separate them, which is why `return_sweep` defaults on and turning
+    /// it off is reported rather than assumed.
+    ///
+    /// **Needs working torque feedback.** Some RobStride firmware reports
+    /// `MeasuredTorque` as a constant 0 (`doc/handover.md` §4); there the run
+    /// completes and every reading is zero, so the result is checked and
+    /// reported as "no torque was reported" rather than as a frictionless joint.
+    VelocitySweep {
+        /// Traverse ± this far around the current position.
+        half_span_rad: f32,
+        /// Slow enough that inertia does not contribute.
+        speed_rad_s: f32,
+        rate_hz: f32,
+        return_sweep: bool,
+        /// Speed bins the friction curve is averaged into.
+        bins: u32,
+    },
     /// Ramp torque until the shaft breaks loose. The torque it goes at is the
     /// stiction the motor has to overcome before it can move at all.
     Breakaway {
@@ -194,6 +218,7 @@ impl CharacterizeJob {
     pub fn name(&self) -> &'static str {
         match self {
             CharacterizeJob::LoadMap { .. } => "load map",
+            CharacterizeJob::VelocitySweep { .. } => "velocity sweep",
             CharacterizeJob::Breakaway { .. } => "breakaway",
         }
     }
@@ -706,6 +731,37 @@ mod tests {
         assert!(json.contains("\"job\":\"chirp\""), "{json}");
         assert!(json.contains("\"durationS\":10.0"), "{json}");
         assert!(json.contains("\"excitation\":\"position\""), "{json}");
+
+        // A characterization run is the same nesting again, and the two friction
+        // runs are the pair most easily confused: one measures static friction,
+        // the other kinetic, and they differ only by the tag.
+        let json = serde_json::to_string(&Event::JobStarted {
+            spec: JobSpec::Characterize(CharacterizeJob::Breakaway {
+                ramp_nm_per_s: 0.2,
+                max_torque_nm: 1.0,
+                positive: true,
+                rate_hz: 200.0,
+            }),
+        })
+        .unwrap();
+        assert!(json.contains("\"job\":\"characterize\""), "{json}");
+        assert!(json.contains("\"run\":\"breakaway\""), "{json}");
+        assert!(json.contains("\"rampNmPerS\":0.2"), "{json}");
+
+        let json = serde_json::to_string(&Event::JobStarted {
+            spec: JobSpec::Characterize(CharacterizeJob::VelocitySweep {
+                half_span_rad: 0.2,
+                speed_rad_s: 0.05,
+                rate_hz: 200.0,
+                return_sweep: true,
+                bins: 12,
+            }),
+        })
+        .unwrap();
+        assert!(json.contains("\"run\":\"velocity-sweep\""), "{json}");
+        assert!(json.contains("\"halfSpanRad\":0.2"), "{json}");
+        assert!(json.contains("\"speedRadS\":0.05"), "{json}");
+        assert!(json.contains("\"returnSweep\":true"), "{json}");
 
         let json = serde_json::to_string(&Event::JobProgress {
             elapsed_s: 1.5,

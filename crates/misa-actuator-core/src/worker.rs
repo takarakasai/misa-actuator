@@ -637,6 +637,27 @@ impl Worker {
                 misa_sysid::run_load_map(self.actuator.as_mut(), &spec, limits, self.shared.safety.abort_flag())
                     .map(load_map_data)
             }
+            CharacterizeJob::VelocitySweep {
+                half_span_rad,
+                speed_rad_s,
+                rate_hz,
+                return_sweep,
+                bins,
+            } => {
+                let spec = misa_sysid::VelocitySweepSpec {
+                    speed_rad_s,
+                    half_span_rad,
+                    rate_hz,
+                    return_sweep,
+                };
+                misa_sysid::run_velocity_sweep(
+                    self.actuator.as_mut(),
+                    &spec,
+                    limits,
+                    self.shared.safety.abort_flag(),
+                )
+                .map(|v| velocity_sweep_data(v, (bins as usize).max(1)))
+            }
             CharacterizeJob::Breakaway {
                 ramp_nm_per_s,
                 max_torque_nm,
@@ -936,6 +957,95 @@ fn load_map_data(m: misa_sysid::LoadMap) -> (CharacterizeData, String) {
 /// and on a shaft that has not moved yet the feedback has little to report.
 /// Measured torque rides alongside as the second series, so the gap between
 /// what was asked for and what the motor registered stays visible.
+/// Kinetic friction and load, both against position.
+///
+/// The plotted curve is the binned split rather than the raw log: the raw samples
+/// are torque against position for two directions, which is the *input* to the
+/// split, not its answer. There is no speed axis — the traverse holds one speed,
+/// which is what makes the split valid.
+///
+/// Both halves are plotted because they come from the same subtraction and are
+/// only meaningful together: friction is the half-difference between the
+/// directions, load the half-sum.
+fn velocity_sweep_data(v: misa_sysid::VelocitySweep, bins: usize) -> (CharacterizeData, String) {
+    // `(position, static_load, kinetic_friction)` per bin both passes visited.
+    let curve = v.friction_curve(bins);
+    let x: Vec<f32> = curve.iter().map(|(pos, _, _)| *pos).collect();
+    let y: Vec<f32> = curve.iter().map(|(_, _, fric)| *fric).collect();
+    let load_series: Vec<f32> = curve.iter().map(|(_, load, _)| *load).collect();
+
+    let friction = v.mean_kinetic_friction_nm(bins);
+    let load = v.peak_static_load_nm(bins);
+    let achieved = v.mean_speed_rad_s();
+
+    let mut summary = vec![("samples".to_string(), v.points.len().to_string())];
+    // Torque that is identically zero is the signature of firmware that reports
+    // none (handover §4), not of a frictionless joint. Say which.
+    let no_torque = v.points.iter().all(|p| p.torque_nm == 0.0);
+    summary.push((
+        "kinetic friction".to_string(),
+        match friction {
+            Some(_) if no_torque => "no torque was reported — pass a Kt".to_string(),
+            Some(f) => format!("{f:.3} N·m"),
+            None => "not measured".to_string(),
+        },
+    ));
+    summary.push((
+        "load (half-sum)".to_string(),
+        match load {
+            Some(_) if no_torque => "no torque was reported".to_string(),
+            Some(l) => format!("{l:.3} N·m"),
+            None => "not measured".to_string(),
+        },
+    ));
+    summary.push((
+        "mean speed".to_string(),
+        match achieved {
+            Some(s) => format!("{s:.4} rad/s of {:.4} commanded", v.spec.speed_rad_s),
+            None => "not measured".to_string(),
+        },
+    ));
+    if !v.spec.return_sweep {
+        // Without the return sweep the split has nothing to subtract, so the
+        // number above is load plus friction, not friction.
+        summary.push((
+            "single direction".to_string(),
+            "load and friction are not separated".to_string(),
+        ));
+    }
+    // A traverse that stalled was not in steady motion, so the split is void
+    // whatever the arithmetic produced.
+    let stalled = achieved.is_some_and(|a| a < v.spec.speed_rad_s * 0.5);
+    if stalled {
+        summary.push((
+            "stalled".to_string(),
+            "achieved under half the commanded speed — the split is void".to_string(),
+        ));
+    }
+
+    let note = match friction {
+        Some(_) if no_torque => "ran, but the motor reported no torque".to_string(),
+        Some(f) if stalled => format!("{f:.3} N·m, but the traverse stalled"),
+        Some(f) => format!("kinetic friction {f:.3} N·m"),
+        None => "no friction estimate".to_string(),
+    };
+
+    (
+        CharacterizeData {
+            x_label: "position [rad]".to_string(),
+            y_label: "torque [N·m]".to_string(),
+            x: x.clone(),
+            y,
+            series: "kinetic friction".to_string(),
+            x2: (!load_series.is_empty()).then_some(x),
+            y2: (!load_series.is_empty()).then_some(load_series),
+            series2: Some("load".to_string()),
+            summary,
+        },
+        note,
+    )
+}
+
 fn breakaway_data(b: misa_sysid::Breakaway) -> (CharacterizeData, String) {
     let x: Vec<f32> = b.points.iter().map(|p| p.t_s).collect();
     let y: Vec<f32> = b.points.iter().map(|p| p.cmd).collect();

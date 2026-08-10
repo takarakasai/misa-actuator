@@ -71,9 +71,14 @@ Linux/SocketCAN 専用だったワークスペースを Windows に移植し、�
 
 ### 補足
 
-- 現在のインストーラは接続失敗バナー（`6d42be7`）より前のビルド。再ビルドが要る
+- インストーラは 2026-08-02 に再ビルド済みで、接続失敗バナー（`6d42be7`）が入っている。
+  `misa-actuator_0.1.0_x64-setup.exe`（2.57 MB）と自己完結 exe（11.4 MB）。
+  **ユーザー単位インストール**（`INSTALLMODE currentUser`、マニフェストは `asInvoker`）
+  なので昇格は不要で、`%LOCALAPPDATA%\misa-actuator` と HKCU にしか触らない
 - `crates/` と `ui/src/` に **TODO/FIXME/`#[ignore]` は 1 件も無い**。
-  隠れたバックログは無く、§9 の表が全部
+  隠れたバックログは無く、§9 の表が全部。なお `cargo test --workspace` が報告する
+  ignored 1 件は `misa-actuator/src/shared.rs` の ` ```ignore ` doc fence（説明用の
+  断片）であって、無効化されたテストではない
 - `misa-actuator-gui` は `default-members` 外。素の `cargo test` では 9 テストが
   走らない。`cargo test --workspace` なら走る（`ui/dist` のビルドが先に要る）
 
@@ -375,9 +380,13 @@ FD 化後、レジスタ読みが **11〜15%** 無応答になった（n は記�
 **除外しきれていない仮説**:
 - `send()` の成功は**キュー受理**であってバス到達でも ACK でもない
   （`CAN_WriteFD` の戻り値を見ているだけ）
-- **ホスト側 RX キュー溢れは監視していない。** `pcan.rs` に
-  `PCAN_ERROR_QOVERRUN` の定数が存在しない。「バスエラー無し」はホストキューの
-  取りこぼしを否定しない
+- ~~**ホスト側 RX キュー溢れは監視していない。**~~ **2026-08-02 に監視を実装した。**
+  `pcan.rs` が `PCAN_ERROR_QOVERRUN`（0x40、ホストキュー）と `PCAN_ERROR_OVERRUN`
+  （0x02、コントローラ）を検出し、**どちら側が落としたかを名指しして warn を出し、
+  回数を数える**（`CanBus::rx_overruns()`）。
+  なお**過去の観測はこの監視が無い状態で取ったもの**なので、当時ホストキューが
+  溢れていたかどうかは分からないままである。「バスエラー無し」はホストキューの
+  取りこぼしを否定しない — **これが今回の再測定で初めて切り分けられる**
 - 散発的な CRC/form エラーはコントローラが再送し、エラーカウンタが 96 を
   超えるまで `BUSLIGHT` は立たない。**「バスエラー無し」は信号品質も否定しない**
 
@@ -598,8 +607,7 @@ RobStride の param table と MyActuator の `0xC0`。ここにしかない値�
 
 | | 状態 |
 |---|---|
-| **OneDrive の外へ移動 → 再ビルド** | 接続失敗バナーがまだインストーラに入っていない |
-| **DAMIAO FD 欠落の再測定** | 下記。**30 分で片が付き、価値が高い** |
+| **DAMIAO FD 欠落の再測定** | 下記。**30 分で片が付き、価値が高い**。`PCAN_ERROR_QOVERRUN` の監視は 2026-08-02 に実装済みなので、step 4 まで一度に走らせられる |
 | `webviewInstallMode` の判断 | 配布先の Windows バージョン次第 |
 | LK Motor の実機接続 | RS485 アダプタが `/dev/ttyUSB*` に出るところから |
 | SLCAN 実機検証 | **DM-J4310 では検証できない**（FD 非対応）。RobStride か MyActuator で |
@@ -612,11 +620,27 @@ RobStride の param table と MyActuator の `0xC0`。ここにしかない値�
 
 再送と `ReadOutcome` 修正が同一コミットに入っており、どちらが効いたか分からない。
 
-1. `REGISTER_READ_ATTEMPTS` を 1 に戻す（`ReadOutcome` 修正は残す）
-2. `damiao-cli --fd -m 16 info` を 10 回、無応答数を数える
-3. ゼロなら**原因は `try_read` のバグ**で、モータのファームウェアは無罪。
-   再送は不要になる
-4. 残るなら `PCAN_ERROR_QOVERRUN`（0x40）の監視を足してから再測定
+**QOVERRUN の監視は 2026-08-02 に実装済み**（[`crates/misa-can/src/backend/pcan.rs`](../crates/misa-can/src/backend/pcan.rs)）
+なので、旧 step 4 を待たずに**1 回の測定で 3 つの仮説を同時に切り分けられる**。
+
+1. `REGISTER_READ_ATTEMPTS`（`damiao-driver/src/driver.rs`）を 1 に戻す
+   （`ReadOutcome` 修正は残す）
+2. `damiao-cli --fd -m 16 info` を 10 回。**無応答数と、stderr の overrun 警告を
+   両方数える。** `damiao-cli` の既定ログレベルは `warn` なので、警告は何もせずに出る
+
+読み方:
+
+| 無応答 | overrun 警告 | 結論 |
+|---|---|---|
+| 0 | — | **原因は `try_read` のバグ**。モータのファームウェアは無罪で、再送は不要 |
+| 残る | **出る** | **ホスト側で落ちている。** バスもファームも無罪。読み出しの頻度か、キューの深さか、こちらの読み遅れ |
+| 残る | 出ない | ホストキューは白。ファームウェアの取りこぼし説と配線説が残る。次は `CAN_WriteFD` の戻り値が**キュー受理でしかない**点（§4）へ |
+
+3 行目に落ちた場合だけ、まだ切り分けが残る。**1 行目と 2 行目はこれで確定する。**
+
+なお `rx_overruns()` は `CanBus` トレイトの既定実装つきメソッドなので、
+SLCAN / SocketCAN では常に 0 を返す。**0 は「報告が無い」であって
+「起きていない」ではない** — PCAN 以外で測っても意味は無い。
 
 ### RS-04 Sysid
 

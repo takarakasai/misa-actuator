@@ -72,6 +72,24 @@ pub trait CanBus: Send {
         false
     }
 
+    /// How many times the transport has reported frames lost before this
+    /// process could read them.
+    ///
+    /// Defaults to `0` on backends with no way to tell, so a caller can always
+    /// ask. **`0` therefore means "none reported", not "none happened"** — say
+    /// which when reporting it.
+    ///
+    /// Kept separate from the error path on purpose. A host-side receive-queue
+    /// overrun loses data with every bus-health indicator clear: the frames
+    /// arrived intact and were dropped above the wire. A missing reply is then
+    /// indistinguishable from one the motor never sent, which is precisely the
+    /// ambiguity left open in the DAMIAO CAN-FD investigation — where "the
+    /// adapter reported no bus errors" was taken as evidence and could not
+    /// have been. See `doc/handover.md` §4.
+    fn rx_overruns(&self) -> u64 {
+        0
+    }
+
     /// Short backend name, for logs and error messages.
     fn backend_name(&self) -> &'static str;
 
@@ -99,6 +117,10 @@ impl CanBus for Box<dyn CanBus> {
 
     fn supports_fd(&self) -> bool {
         (**self).supports_fd()
+    }
+
+    fn rx_overruns(&self) -> u64 {
+        (**self).rx_overruns()
     }
 
     fn backend_name(&self) -> &'static str {

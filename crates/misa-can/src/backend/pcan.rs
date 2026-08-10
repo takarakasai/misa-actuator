@@ -36,6 +36,22 @@ const PCAN_ERROR_BUSPASSIVE: u32 = 0x0004_0000;
 const PCAN_ERROR_ANYBUSERR: u32 =
     PCAN_ERROR_BUSLIGHT | PCAN_ERROR_BUSHEAVY | PCAN_ERROR_BUSOFF | PCAN_ERROR_BUSPASSIVE;
 
+/// The CAN controller's own buffer was read too late: frames were lost inside
+/// the adapter, before the driver ever saw them.
+const PCAN_ERROR_OVERRUN: u32 = 0x0000_0002;
+/// The *host* receive queue overran: frames reached the driver and were
+/// dropped before this process got round to reading them.
+const PCAN_ERROR_QOVERRUN: u32 = 0x0000_0040;
+/// Either kind of loss.
+///
+/// Worth its own name because these bits are the one failure mode the bus
+/// error counters cannot see. A host-side queue overrun happens entirely
+/// above the wire: every frame arrived intact, the controller is happy, and
+/// `PCAN_ERROR_ANYBUSERR` stays clear while data goes missing. "No bus
+/// errors" was used as evidence against exactly this in the DAMIAO CAN-FD
+/// investigation (`doc/handover.md` §4), and it never was.
+const PCAN_ERROR_ANYOVERRUN: u32 = PCAN_ERROR_OVERRUN | PCAN_ERROR_QOVERRUN;
+
 const PCAN_MESSAGE_STANDARD: u8 = 0x00;
 const PCAN_MESSAGE_RTR: u8 = 0x01;
 const PCAN_MESSAGE_EXTENDED: u8 = 0x02;
@@ -223,6 +239,65 @@ fn api() -> Result<&'static PcanApi> {
 }
 
 /// Ask the driver to describe a status code, falling back to the raw value.
+/// What a `CAN_Read` status means, once the overrun bits are set aside.
+///
+/// Split out from the reporting so the bit handling can be tested without a
+/// driver, an adapter or a bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadStatus {
+    /// A message was read and nothing is wrong.
+    Ok,
+    /// Nothing waiting in the queue.
+    Empty,
+    /// The controller has taken itself off the bus. Not recoverable here.
+    BusOff,
+    /// Bus trouble that the controller is still riding out.
+    BusError,
+    /// Something else the driver calls an error.
+    Fatal,
+}
+
+/// Where an overrun lost frames, or `None` if the status reports no loss.
+///
+/// Reported separately from [`ReadStatus`] because an overrun can accompany
+/// any of those: it does not describe how the call went, it says how much
+/// never made it to the caller.
+fn overrun_kind(status: u32) -> Option<&'static str> {
+    // Check the host queue first: when both are set, the nearer one is the
+    // one that has already swallowed the frames, so it is the more useful
+    // thing to name.
+    if status & PCAN_ERROR_QOVERRUN != 0 {
+        Some("host receive queue")
+    } else if status & PCAN_ERROR_OVERRUN != 0 {
+        Some("CAN controller buffer")
+    } else {
+        None
+    }
+}
+
+/// Classify a `CAN_Read` status.
+///
+/// The overrun bits are masked out first, deliberately. An overrun means data
+/// was lost, not that the read failed — a status carrying nothing else is a
+/// successful read that happens to come with bad news, and turning it into an
+/// error would end the session over frames that are already gone.
+fn classify_read_status(status: u32) -> ReadStatus {
+    let status = status & !PCAN_ERROR_ANYOVERRUN;
+    if status & PCAN_ERROR_QRCVEMPTY != 0 {
+        return ReadStatus::Empty;
+    }
+    if status == PCAN_ERROR_OK {
+        return ReadStatus::Ok;
+    }
+    if status & PCAN_ERROR_BUSOFF != 0 {
+        return ReadStatus::BusOff;
+    }
+    if status & PCAN_ERROR_ANYBUSERR != 0 {
+        return ReadStatus::BusError;
+    }
+    ReadStatus::Fatal
+}
+
 fn status_text(api: &PcanApi, status: u32) -> String {
     if let Some(f) = api.get_error_text {
         let mut buf = [0u8; 256];
@@ -429,6 +504,13 @@ pub struct PcanBackend {
     /// Auto-reset event PCAN signals on every received frame, or null if the
     /// driver refused to install one (then [`Self::recv`] polls instead).
     rx_event: Handle,
+    /// How many reads reported frames lost before this process could take
+    /// them — see [`PCAN_ERROR_ANYOVERRUN`].
+    ///
+    /// Counted rather than merely logged so a measurement run can state a
+    /// number instead of an impression. The log line says which side lost
+    /// them; this is just how often.
+    rx_overruns: u64,
 }
 
 // The channel handle is a plain integer and the event is owned exclusively by
@@ -505,6 +587,7 @@ impl PcanBackend {
             fd: opts.fd,
             timeout: opts.timeout,
             rx_event,
+            rx_overruns: 0,
         })
     }
 
@@ -585,36 +668,49 @@ impl PcanBackend {
         }
     }
 
-    /// A read status carries bus health alongside the queue state: warn about
-    /// the former, only fail on something genuinely unrecoverable.
-    fn check_read_status(&self, status: u32) -> Result<()> {
-        if status == PCAN_ERROR_OK || status & PCAN_ERROR_QRCVEMPTY != 0 {
-            return Ok(());
-        }
-        if status & PCAN_ERROR_ANYBUSERR != 0 {
-            if status & PCAN_ERROR_BUSOFF != 0 {
-                return Err(Error::Driver {
-                    api: "CAN_Read",
-                    message: format!(
-                        "{} is bus-off — check termination, wiring and that every \
-                         node agrees on {} bit/s",
-                        self.channel_name, self.bitrate
-                    ),
-                    code: status,
-                });
-            }
+    /// A read status carries bus health and frame loss alongside the queue
+    /// state: report both, only fail on something genuinely unrecoverable.
+    fn check_read_status(&mut self, status: u32) -> Result<()> {
+        // Loss first, and independently of how the read itself went. This is
+        // the case "no bus errors were reported" cannot rule out, so it is
+        // said out loud every time rather than inferred later from silence.
+        if let Some(where_) = overrun_kind(status) {
+            self.rx_overruns += 1;
             log::warn!(
-                "PCAN {}: bus error ({})",
+                "PCAN {}: {} overran — frames were dropped before this process \
+                 read them ({} so far). A reply that never arrives after this \
+                 was lost here, not on the wire.",
                 self.channel_name,
-                status_text(self.api, status)
+                where_,
+                self.rx_overruns
             );
-            return Ok(());
         }
-        Err(Error::Driver {
-            api: "CAN_Read",
-            message: format!("{} on {}", status_text(self.api, status), self.channel_name),
-            code: status,
-        })
+
+        match classify_read_status(status) {
+            ReadStatus::Ok | ReadStatus::Empty => Ok(()),
+            ReadStatus::BusOff => Err(Error::Driver {
+                api: "CAN_Read",
+                message: format!(
+                    "{} is bus-off — check termination, wiring and that every \
+                     node agrees on {} bit/s",
+                    self.channel_name, self.bitrate
+                ),
+                code: status,
+            }),
+            ReadStatus::BusError => {
+                log::warn!(
+                    "PCAN {}: bus error ({})",
+                    self.channel_name,
+                    status_text(self.api, status)
+                );
+                Ok(())
+            }
+            ReadStatus::Fatal => Err(Error::Driver {
+                api: "CAN_Read",
+                message: format!("{} on {}", status_text(self.api, status), self.channel_name),
+                code: status,
+            }),
+        }
     }
 }
 
@@ -729,6 +825,10 @@ impl CanBus for PcanBackend {
         self.fd
     }
 
+    fn rx_overruns(&self) -> u64 {
+        self.rx_overruns
+    }
+
     fn backend_name(&self) -> &'static str {
         "pcan"
     }
@@ -759,6 +859,87 @@ impl Drop for PcanBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An overrun says data was lost, not that the call failed. Classifying it
+    /// as an error would end a session over frames that are already gone —
+    /// and, worse, would report a driver failure where the honest answer is
+    /// "some replies will be missing".
+    #[test]
+    fn an_overrun_alone_is_still_a_successful_read() {
+        assert_eq!(classify_read_status(PCAN_ERROR_QOVERRUN), ReadStatus::Ok);
+        assert_eq!(classify_read_status(PCAN_ERROR_OVERRUN), ReadStatus::Ok);
+        assert_eq!(
+            classify_read_status(PCAN_ERROR_QOVERRUN | PCAN_ERROR_QRCVEMPTY),
+            ReadStatus::Empty,
+        );
+    }
+
+    /// An overrun must never mask a condition that does need acting on.
+    #[test]
+    fn an_overrun_does_not_hide_a_bus_fault() {
+        assert_eq!(
+            classify_read_status(PCAN_ERROR_QOVERRUN | PCAN_ERROR_BUSOFF),
+            ReadStatus::BusOff,
+        );
+        assert_eq!(
+            classify_read_status(PCAN_ERROR_OVERRUN | PCAN_ERROR_BUSHEAVY),
+            ReadStatus::BusError,
+        );
+    }
+
+    /// Which side dropped the frames decides whether the wire is even a
+    /// suspect, so the two must not be conflated.
+    #[test]
+    fn overrun_names_the_side_that_lost_the_frames() {
+        assert_eq!(
+            overrun_kind(PCAN_ERROR_QOVERRUN),
+            Some("host receive queue")
+        );
+        assert_eq!(
+            overrun_kind(PCAN_ERROR_OVERRUN),
+            Some("CAN controller buffer")
+        );
+        // Both set: name the host queue, the nearer of the two.
+        assert_eq!(
+            overrun_kind(PCAN_ERROR_OVERRUN | PCAN_ERROR_QOVERRUN),
+            Some("host receive queue"),
+        );
+    }
+
+    /// The whole point of the exercise: a clean bus and an empty-looking read
+    /// must not report loss, or the counter means nothing.
+    #[test]
+    fn ordinary_statuses_report_no_loss() {
+        for status in [
+            PCAN_ERROR_OK,
+            PCAN_ERROR_QRCVEMPTY,
+            PCAN_ERROR_BUSLIGHT,
+            PCAN_ERROR_BUSHEAVY,
+            PCAN_ERROR_BUSOFF,
+            PCAN_ERROR_BUSPASSIVE,
+        ] {
+            assert_eq!(overrun_kind(status), None, "status {status:#X}");
+        }
+    }
+
+    /// Bit 0x40 is `PCAN_ERROR_QOVERRUN` and 0x02 is `PCAN_ERROR_OVERRUN` in
+    /// PCANBasic.h. Nothing at run time will complain if these drift — the
+    /// counter would simply stay at zero and the investigation would conclude
+    /// the wrong thing.
+    #[test]
+    fn overrun_bits_match_pcan_basic() {
+        assert_eq!(PCAN_ERROR_OVERRUN, 0x0000_0002);
+        assert_eq!(PCAN_ERROR_QOVERRUN, 0x0000_0040);
+        // Distinct from the queue-empty bit next to it.
+        assert_ne!(PCAN_ERROR_QOVERRUN, PCAN_ERROR_QRCVEMPTY);
+        assert_eq!(PCAN_ERROR_ANYOVERRUN & PCAN_ERROR_ANYBUSERR, 0);
+    }
+
+    #[test]
+    fn unknown_status_is_still_an_error() {
+        // 0x100 = PCAN_ERROR_REGTEST.
+        assert_eq!(classify_read_status(0x0000_0100), ReadStatus::Fatal);
+    }
 
     #[test]
     fn channel_names_resolve() {

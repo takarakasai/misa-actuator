@@ -359,6 +359,32 @@ Tauri 版には `assets/index-*.js` の名前が入っているが cargo 版に�
 バイナリだけなら `crates/misa-actuator-gui` で
 `..\..\ui\node_modules\.bin\tauri build --no-bundle`。
 
+#### 接続フロー: Scan は Connect より先（2026-08-06 に直した）
+
+**以前は循環していた。** Connect には MOTOR ID が必要で、ID を知るには Scan、
+Scan には Connect が必要（`ConsoleTab` の Scan が `disabled={!connected}`）。
+**id 96 の RS-03 は既定の id 1 で connect が失敗するので、GUI から到達不可能だった。**
+
+**現在**: Scan は接続状態に応じて経路を変える。
+
+| 状態 | 経路 |
+|---|---|
+| 未接続 | **自分でバスを開いて probe して閉じる**（`multi_scan`、Multi タブと同じ）。model も id も不要 |
+| 接続中 | セッションがチャネルを所有しているのでワーカー経由（従来） |
+
+**両方要るのは 1 チャネルの所有者が 1 つだから。** 未接続用の実装は Multi タブの
+ために書かれていて、**問題が起きるタブに提供されていなかっただけ**だった。
+
+**見つかった行はクリックできて、MOTOR ID と MODEL の両方が埋まる。** probe は
+どうせ identity を読むので、推測が必要だった 2 つのフィールドこそスキャンが答えを
+持っている。
+
+**共有している状態**（`App` の `ConnectionForm` と `ScanRange`）:
+driver / interface / bus / motorId / model / スキャンレンジ / スキャン結果。
+**INTERFACE はバーと Multi タブで二重に入力させていた** — バスは 1 つで、
+チャネルの所有者も 1 つなので、別の値にしても意味が無い。
+**タブを切り替えても発見結果は残る**（機械についての事実であって、タブの持ち物ではない）。
+
 #### Multi タブ（2026-08-05 追加）
 
 `ui/src/components/MultiTab.tsx`。スキャン → 選択 → 接続 → 一括 Enable/Disable →

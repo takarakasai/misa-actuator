@@ -122,6 +122,12 @@ pub struct MultiSnapshot {
     /// Worth surfacing: the alternative is a rate that quietly stops meaning
     /// what it says.
     pub starved_passes: u64,
+    /// Leftover frames discarded before transactions, cumulative.
+    ///
+    /// Near zero on a healthy wire. Climbing means frames are arriving unasked
+    /// for, or replies are arriving after their reader gave up — the first thing
+    /// to look at when readings seem stale.
+    pub drained_frames: u64,
 }
 
 /// A one-off instruction to the multi-motor worker.
@@ -276,7 +282,8 @@ impl MultiSession {
     ) -> Result<Self> {
         // On the calling thread, so a bad interface or a mistyped model is an
         // ordinary error return rather than an event some time later.
-        let motors = build_multi(cfg).context("failed to open the motors")?;
+        let built = build_multi(cfg).context("failed to open the motors")?;
+        let (motors, bus) = (built.motors, built.bus);
         let specs: Vec<MotorSpec> = motors.iter().map(|m| m.spec.clone()).collect();
         let description = describe(cfg, &specs);
 
@@ -297,7 +304,7 @@ impl MultiSession {
         let (evt_tx, evt_rx) = mpsc::channel();
         let (snap_tx, snap_rx) = mpsc::sync_channel(SNAPSHOT_DEPTH);
 
-        let worker = Worker::new(motors, shared.clone(), cmd_rx, evt_tx, snap_tx);
+        let worker = Worker::new(motors, bus, shared.clone(), cmd_rx, evt_tx, snap_tx);
         let join = std::thread::Builder::new()
             .name("motors".to_string())
             .spawn(move || worker.run())
@@ -494,6 +501,9 @@ impl MotorState {
 
 struct Worker {
     motors: Vec<MotorState>,
+    /// The shared wire, for draining leftovers before a transaction. `None` when
+    /// every motor is simulated and there is no wire.
+    bus: Option<crate::multi::SharedCanBus>,
     shared: Arc<Shared>,
     commands: Receiver<MultiCommand>,
     events: Sender<MultiEvent>,
@@ -509,11 +519,18 @@ struct Worker {
     /// Passes that ended early on the budget. Reported so a UI can say the rate
     /// is limited by the wire rather than by the configured tick.
     starved: u64,
+    /// Leftover frames discarded before transactions.
+    ///
+    /// Expected to be near zero on a healthy wire. A number that climbs means
+    /// frames are arriving that nobody asked for, or replies are arriving after
+    /// their reader gave up — either way it is the thing to look at first.
+    drained: u64,
 }
 
 impl Worker {
     fn new(
         motors: Vec<crate::multi::BuiltMotor>,
+        bus: Option<crate::multi::SharedCanBus>,
         shared: Arc<Shared>,
         commands: Receiver<MultiCommand>,
         events: Sender<MultiEvent>,
@@ -541,6 +558,7 @@ impl Worker {
                     status_misses: 0,
                 })
                 .collect(),
+            bus,
             shared,
             commands,
             events,
@@ -550,6 +568,7 @@ impl Worker {
             last_flush: now,
             next_start: 0,
             starved: 0,
+            drained: 0,
         }
     }
 
@@ -650,11 +669,19 @@ impl Worker {
     fn service(&mut self, i: usize, sp: Setpoint, streaming: bool) {
         // Disjoint field borrows: the motor is borrowed mutably while the event
         // sender is borrowed immutably.
-        let m = &mut self.motors[i];
-        if m.faults >= CONSECUTIVE_FAULT_LIMIT {
+        if self.motors[i].faults >= CONSECUTIVE_FAULT_LIMIT {
             return;
         }
 
+        // Clear the wire first, so the next frame read is the answer to what
+        // this turn is about to ask. A feedback frame carries no sequence
+        // number, so a leftover one would otherwise be taken as the current
+        // position — see `SharedCanBus::drain_stale`.
+        if let Some(bus) = self.bus.as_mut() {
+            self.drained += bus.drain_stale();
+        }
+
+        let m = &mut self.motors[i];
         let outcome = if streaming && m.enabled {
             if m.active_mode != Some(sp.mode) {
                 match m.actuator.set_run_mode(sp.mode.into()) {
@@ -885,6 +912,7 @@ impl Worker {
             achieved_rate_hz: self.passes as f32 / elapsed,
             dropped: self.dropped,
             starved_passes: self.starved,
+            drained_frames: self.drained,
         };
         self.passes = 0;
         self.last_flush = Instant::now();
@@ -1114,6 +1142,17 @@ mod tests {
             t.is_nan() || t > -273.15,
             "temperature was {t}, which is neither a reading nor an absence"
         );
+    }
+
+    /// A simulated set has no wire, so nothing can be drained and nothing can
+    /// be starved. Pins that both counters mean "this happened" rather than
+    /// carrying a default that looks like a measurement.
+    #[test]
+    fn a_simulated_set_drains_nothing_and_starves_nobody() {
+        let s = MultiSession::connect(&sim_cfg(&[1, 2])).unwrap();
+        let snap = wait_for_snapshot(&s);
+        assert_eq!(snap.drained_frames, 0);
+        assert_eq!(snap.starved_passes, 0);
     }
 
     /// A pass visits every motor, so adding motors divides the per-motor rate.

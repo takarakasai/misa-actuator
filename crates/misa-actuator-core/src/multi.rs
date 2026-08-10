@@ -64,6 +64,40 @@ impl SharedCanBus {
     fn lock(&self) -> std::sync::MutexGuard<'_, Box<dyn misa_can::CanBus>> {
         self.0.lock().unwrap_or_else(|p| p.into_inner())
     }
+
+    /// Discard whatever is already queued, and say how much there was.
+    ///
+    /// Called immediately before a transaction, so the next frame read is the
+    /// one this transaction asked for. Without it a leftover frame is taken as
+    /// the answer: a register reply is caught by its RID, but **a feedback frame
+    /// carries no sequence number**, so a duplicate or late one is accepted as
+    /// the current position. Duplicated feedback frames were observed on the
+    /// bench on 2026-08-03 (`doc/handover.md` section 4), so this is not
+    /// hypothetical.
+    ///
+    /// Non-blocking: the timeout is set to zero, which makes `recv` attempt one
+    /// read and return. Bounded, so a busy wire cannot hold the worker here.
+    ///
+    /// The count is returned rather than logged per frame. A discard nobody can
+    /// see is a discard nobody can rule out, and per-frame logging on a busy
+    /// wire becomes the noise it was meant to expose.
+    pub fn drain_stale(&mut self) -> u64 {
+        const MAX_DRAIN: usize = 64;
+        let mut bus = self.lock();
+        let restore = bus.timeout();
+        if bus.set_timeout(Duration::ZERO).is_err() {
+            return 0;
+        }
+        let mut drained = 0;
+        for _ in 0..MAX_DRAIN {
+            match bus.recv() {
+                Ok(_) => drained += 1,
+                Err(_) => break,
+            }
+        }
+        let _ = bus.set_timeout(restore);
+        drained
+    }
 }
 
 impl misa_can::CanBus for SharedCanBus {
@@ -197,13 +231,35 @@ impl std::fmt::Debug for BuiltMotor {
     }
 }
 
+/// What [`build_multi`] produces: the motors, and the wire they share.
+///
+/// The bus comes back because the session needs it for
+/// [`SharedCanBus::drain_stale`] — the drivers each hold a clone, but none of
+/// them owns the wire on everyone's behalf, and draining is a property of the
+/// wire rather than of any one motor. `None` when every motor is simulated.
+pub struct BuiltBus {
+    pub motors: Vec<BuiltMotor>,
+    pub bus: Option<SharedCanBus>,
+}
+
+// By hand, because a `dyn CanBus` is not `Debug`. The motors and whether a wire
+// was opened are the parts worth printing.
+impl std::fmt::Debug for BuiltBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuiltBus")
+            .field("motors", &self.motors)
+            .field("bus", &self.bus.as_ref().map(|_| "shared"))
+            .finish()
+    }
+}
+
 /// Open one wire and build every motor on it.
 ///
 /// Simulated motors are built without touching the bus, so a mixed
 /// configuration is allowed and a fully simulated one needs no interface at all.
 /// That is deliberate: a multi-motor UI has to be developable without four
 /// motors on a bench.
-pub fn build_multi(cfg: &MultiConfig) -> Result<Vec<BuiltMotor>> {
+pub fn build_multi(cfg: &MultiConfig) -> Result<BuiltBus> {
     if cfg.motors.is_empty() {
         bail!("no motors were listed");
     }
@@ -257,7 +313,10 @@ pub fn build_multi(cfg: &MultiConfig) -> Result<Vec<BuiltMotor>> {
     for spec in &cfg.motors {
         built.push(build_one(spec, cfg, shared.as_ref())?);
     }
-    Ok(built)
+    Ok(BuiltBus {
+        motors: built,
+        bus: shared,
+    })
 }
 
 /// Refuse DAMIAO pairs whose feedback cannot be attributed.
@@ -478,11 +537,15 @@ mod tests {
     #[test]
     fn simulated_motors_need_no_bus() {
         let built = build_multi(&cfg(vec![sim(1), sim(2), sim(3)])).unwrap();
-        assert_eq!(built.len(), 3);
-        assert_eq!(built[2].spec.motor_id, 3);
+        assert_eq!(built.motors.len(), 3);
+        assert_eq!(built.motors[2].spec.motor_id, 3);
         // Each motor answers as itself, not as the preset's own id.
-        assert_eq!(built[0].actuator.motor_id(), 1);
-        assert_eq!(built[1].actuator.motor_id(), 2);
+        assert_eq!(built.motors[0].actuator.motor_id(), 1);
+        assert_eq!(built.motors[1].actuator.motor_id(), 2);
+        assert!(
+            built.bus.is_none(),
+            "a simulated set must not have opened a wire"
+        );
     }
 
     /// Two motors answering to one id produce feedback that cannot be

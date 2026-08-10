@@ -524,6 +524,8 @@ pub struct PcanBackend {
     /// to rule out as an explanation for anything. Normally zero, because the
     /// driver does not ask for them — see [`OpenOptions::allow_error_frames`].
     rx_skipped: u64,
+    /// The adapter's timestamp for the most recent frame, in µs.
+    last_rx_timestamp_us: Option<u64>,
 }
 
 // The channel handle is a plain integer and the event is owned exclusively by
@@ -655,6 +657,7 @@ impl PcanBackend {
             rx_event,
             rx_overruns: 0,
             rx_skipped: 0,
+            last_rx_timestamp_us: None,
         })
     }
 
@@ -731,6 +734,8 @@ impl PcanBackend {
                 self.note_skipped(msg.msgtype, msg.id);
                 return Ok(ReadOutcome::Skipped);
             }
+            // CAN_ReadFD's timestamp is already microseconds.
+            self.last_rx_timestamp_us = Some(ts);
             let len = dlc_to_len(msg.dlc);
             Ok(ReadOutcome::Frame(Frame::from_raw(
                 msg.id,
@@ -756,6 +761,11 @@ impl PcanBackend {
                 self.note_skipped(msg.msgtype, msg.id);
                 return Ok(ReadOutcome::Skipped);
             }
+            // Classic CAN_Read splits it across three fields.
+            self.last_rx_timestamp_us = Some(
+                (u64::from(ts.millis_overflow) << 32 | u64::from(ts.millis)) * 1_000
+                    + u64::from(ts.micros),
+            );
             let len = (msg.len as usize).min(8);
             Ok(ReadOutcome::Frame(Frame::from_raw(
                 msg.id,
@@ -930,6 +940,10 @@ impl CanBus for PcanBackend {
 
     fn rx_skipped(&self) -> u64 {
         self.rx_skipped
+    }
+
+    fn last_rx_timestamp_us(&self) -> Option<u64> {
+        self.last_rx_timestamp_us
     }
 
     fn backend_name(&self) -> &'static str {

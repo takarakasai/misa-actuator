@@ -544,7 +544,14 @@ fn dump(cli: &Cli, duration: Option<f32>, allow_error_frames: bool) -> Result<()
         match bus.recv() {
             Ok(frame) => {
                 frames += 1;
-                let t = start.elapsed().as_secs_f64();
+                // The adapter's timestamp, not this process's. A burst drained
+                // from the receive queue would otherwise look spread out, which
+                // is the difference between "the motor answered twice" and "we
+                // were handed a queued pair".
+                let t = match bus.last_rx_timestamp_us() {
+                    Some(us) => us as f64 / 1e6,
+                    None => start.elapsed().as_secs_f64(),
+                };
                 let id = frame.raw_id();
                 let data = frame.data();
                 let hex: Vec<String> = data.iter().map(|b| format!("{b:02X}")).collect();

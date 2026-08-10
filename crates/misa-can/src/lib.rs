@@ -101,6 +101,19 @@ pub trait CanBus: Send {
         0
     }
 
+    /// The adapter's own timestamp for the frame [`Self::recv`] just returned,
+    /// in microseconds since the channel was opened.
+    ///
+    /// `None` where the backend cannot say. Worth asking for when the question
+    /// is about wire timing: a timestamp taken in this process is taken after
+    /// queueing, scheduling and formatting, so a burst drained from the receive
+    /// queue looks spread out and two frames microseconds apart can be recorded
+    /// milliseconds apart. That is a difference between "the motor answered
+    /// twice" and "the adapter handed us a queued pair".
+    fn last_rx_timestamp_us(&self) -> Option<u64> {
+        None
+    }
+
     /// Short backend name, for logs and error messages.
     fn backend_name(&self) -> &'static str;
 
@@ -136,6 +149,10 @@ impl CanBus for Box<dyn CanBus> {
 
     fn rx_skipped(&self) -> u64 {
         (**self).rx_skipped()
+    }
+
+    fn last_rx_timestamp_us(&self) -> Option<u64> {
+        (**self).last_rx_timestamp_us()
     }
 
     fn backend_name(&self) -> &'static str {

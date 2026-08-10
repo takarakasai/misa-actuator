@@ -411,9 +411,15 @@ function build(mdPath) {
   const titleMatch = md.match(/^#\s+(.*)$/m);
   const title = titleMatch ? titleMatch[1].trim() : path.basename(abs, ".md");
 
+  // Not fetched automatically: a doc build that reaches for the network on its
+  // own is one that fails on the machine without a route to the registry.
   const assets = path.join(path.dirname(abs), "assets", "mermaid.min.js");
   if (!fs.existsSync(assets)) {
-    console.warn(`warning: ${path.relative(process.cwd(), assets)} is missing — diagrams will not render`);
+    console.warn(
+      `warning: ${path.relative(process.cwd(), assets).replace(/\\/g, "/")} is missing, ` +
+        "so the diagrams will render as plain text.\n" +
+        "         Run: node scripts/fetch-mermaid.js",
+    );
   }
 
   fs.writeFileSync(

@@ -34,3 +34,11 @@ crates/*/ref/sdk/
 /build.log
 /ui/vite.log
 /ui/vite.err
+
+# The mermaid bundle the generated HTML loads: 3.4 MB of vendor build output
+# that `node scripts/fetch-mermaid.js` reproduces byte for byte (exact version
+# pin + verified sha256), so the history does not need to carry it.
+# doc/assets/README.md records what gets fetched. The HTML itself *is*
+# committed — it is small, and diffing it shows what the markdown produced.
+/doc/assets/mermaid.min.js
+/doc/assets/mermaid-LICENSE.txt

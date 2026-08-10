@@ -767,6 +767,12 @@ impl Worker {
             abort_reason = abort;
         };
 
+        // The samples, kept aside before the mappers reduce each report to the
+        // two series the plot draws. Copied rather than borrowed because the
+        // report is consumed by the mapper in the same expression.
+        let mut samples: Vec<misa_sysid::Point> = Vec::new();
+        let mut keep = |ps: &[misa_sysid::Point]| samples.extend_from_slice(ps);
+
         let outcome = match run {
             CharacterizeJob::LoadMap {
                 from_rad,
@@ -796,6 +802,7 @@ impl Worker {
                 )
                     .map(|m| {
                         note_abort(m.abort);
+                        keep(&m.points);
                         load_map_data(m)
                     })
             }
@@ -827,6 +834,7 @@ impl Worker {
                 )
                 .map(|v| {
                     note_abort(v.abort);
+                    keep(&v.points);
                     velocity_sweep_data(v, (bins as usize).max(1))
                 })
             }
@@ -857,6 +865,7 @@ impl Worker {
                 )
                     .map(|b| {
                         note_abort(b.abort);
+                        keep(&b.points);
                         breakaway_data(b)
                     })
             }
@@ -892,6 +901,7 @@ impl Worker {
                 )
                 .map(|m| {
                     note_abort(m.abort);
+                    keep(&m.samples);
                     breakaway_map_data(m)
                 })
             }
@@ -946,6 +956,7 @@ impl Worker {
                 )
                     .map(|k| {
                         note_abort(k.abort);
+                        keep(&k.points);
                         let (data, note, kt) = kt_data(k);
                         fitted_kt = kt;
                         (data, note)
@@ -1004,6 +1015,7 @@ impl Worker {
                         if aborted { " (stopped early)" } else { "" }
                     ),
                 );
+                let csv_path = self.save_run(run.name(), &samples, &data.summary);
                 let _ = self.events.send(Event::CharacterizeFinished {
                     run,
                     // An empty series is not a measurement, and plotting one
@@ -1012,16 +1024,21 @@ impl Worker {
                     aborted,
                     fitted_kt,
                     suggested_torque_limit_nm,
+                    csv_path,
                 });
             }
             Err(e) => {
                 self.log(LogLevel::Error, format!("{} failed: {e}", run.name()));
+                // Still written. A run that failed part-way took the motor's
+                // time and its samples are how anyone works out why.
+                let csv_path = self.save_run(run.name(), &samples, &[]);
                 let _ = self.events.send(Event::CharacterizeFinished {
                     run,
                     data: None,
                     aborted,
                     fitted_kt: None,
                     suggested_torque_limit_nm,
+                    csv_path,
                 });
                 let _ = self.events.send(Event::JobFailed {
                     message: e.to_string(),
@@ -1194,6 +1211,59 @@ impl Worker {
             LogLevel::Error
         };
         self.log(level, format!("{what} failed: {e}"));
+    }
+
+    /// Write a finished run's samples, and say where they went.
+    ///
+    /// A failure here is logged and returns `None` rather than propagating: the
+    /// measurement on screen is valid whether or not the disk cooperated, and
+    /// throwing it away because a directory was read-only would be the worse
+    /// outcome by far.
+    fn save_run(
+        &self,
+        run: &str,
+        samples: &[misa_sysid::Point],
+        summary: &[(String, String)],
+    ) -> Option<String> {
+        if samples.is_empty() {
+            // Nothing was recorded, so there is no file worth leaving behind to
+            // be found later and mistaken for a run.
+            return None;
+        }
+        let dir = crate::export::data_dir();
+        let name = crate::export::run_file_name(
+            &crate::export::utc_stamp(crate::export::now_secs()),
+            run,
+            self.actuator.motor_id(),
+        );
+        match crate::export::write_run_csv(
+            &dir,
+            &name,
+            run,
+            self.actuator.motor_id(),
+            "",
+            summary,
+            samples,
+        ) {
+            Ok(path) => {
+                let shown = path.display().to_string();
+                self.log(
+                    LogLevel::Info,
+                    format!("{run}: {} samples saved to {shown}", samples.len()),
+                );
+                Some(shown)
+            }
+            Err(e) => {
+                self.log(
+                    LogLevel::Warn,
+                    format!(
+                        "{run}: could not save samples to {}: {e} — the result on screen is still valid",
+                        dir.display()
+                    ),
+                );
+                None
+            }
+        }
     }
 
     fn log(&self, level: LogLevel, message: impl Into<String>) {

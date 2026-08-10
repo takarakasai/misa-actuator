@@ -750,6 +750,15 @@ pub enum Event {
         /// field. Silently raising the limit would be the wrong favour.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         suggested_torque_limit_nm: Option<f32>,
+        /// Where the run's samples were written, if they were.
+        ///
+        /// Written without being asked: the plot keeps two derived series and
+        /// the samples behind them are dropped when the result is mapped, so a
+        /// run nobody exported is a run that has to be repeated. `None` means
+        /// the write failed — the reason is in the log, and the result on
+        /// screen is still valid.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        csv_path: Option<String>,
     },
     JobProgress {
         elapsed_s: f32,

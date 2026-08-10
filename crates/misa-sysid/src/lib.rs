@@ -66,7 +66,8 @@ pub use quasistatic::{
 };
 pub use quasistatic::{
     run_breakaway, run_kt, run_load_map, run_thermal, Breakaway, BreakawaySpec, Direction, KtSpec,
-    KtSweep, LoadMap, LoadMapSpec, Point, Thermal, ThermalSpec, write_points_csv,
+    KtSweep, LoadMap, LoadMapSpec, Point, Thermal, ThermalSpec, POINTS_CSV_HEADER,
+    write_points_csv,
 };
 pub use runner::{
     run_chirp, run_chirp_to_csv, run_chirp_with, ChirpLog, Excitation, RunReport, Sample,

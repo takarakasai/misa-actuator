@@ -19,14 +19,7 @@ use misa_actuator::{Actuator, Error as ActuatorError};
 use crate::protocol::*;
 use crate::safety::Safety;
 
-/// How many consecutive bus failures before the worker gives up and stops the
-/// motor. A single timeout is routine; twenty in a row means the motor is gone
-/// and continuing to command it is worse than admitting it.
-const CONSECUTIVE_FAULT_LIMIT: u32 = 20;
-
-/// Polling cadence while not streaming. The UI still wants live numbers, but
-/// an idle console has no business saturating the bus at the control rate.
-const IDLE_POLL: Duration = Duration::from_millis(50);
+use crate::safety::{CONSECUTIVE_FAULT_LIMIT, IDLE_POLL};
 
 /// Translate a job's channel selection into the sysid excitation, folding in
 /// whichever gains that channel actually uses.

@@ -36,6 +36,27 @@ pub(crate) const STOP_WATCHDOG: u8 = 2;
 /// timeout is the configured one plus a tick, coarse enough to be free.
 pub(crate) const WATCHDOG_POLL: Duration = Duration::from_millis(50);
 
+/// How many consecutive bus failures before a worker stops commanding a motor.
+///
+/// A single timeout is routine; twenty in a row means the motor is not listening
+/// and continuing to command it is worse than admitting it.
+///
+/// **What happens at the limit differs by session, on purpose, and is not here.**
+/// The single-motor worker stops driving but keeps the session alive — ending it
+/// made a recoverable mistake unrecoverable, because a wrong run mode is rejected
+/// on every tick and twenty rejections arrive in a tenth of a second. The
+/// multi-motor worker leaves *that* motor alone and keeps servicing the rest,
+/// because one dead motor on a four-motor wire must not take the other three
+/// down. Only the threshold is shared, because a threshold that differs between
+/// the two would be an accident rather than a decision.
+pub(crate) const CONSECUTIVE_FAULT_LIMIT: u32 = 20;
+
+/// Polling cadence for a motor that is not being driven.
+///
+/// The UI still wants live numbers, but an idle console has no business
+/// saturating the bus at the control rate.
+pub(crate) const IDLE_POLL: Duration = Duration::from_millis(50);
+
 /// Shared run/stop state, touched by the session handle, the watchdog and the
 /// worker.
 ///

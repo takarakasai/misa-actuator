@@ -51,14 +51,10 @@ use crate::safety::{self, Safety};
 /// worth nothing to it.
 const SNAPSHOT_DEPTH: usize = 2;
 
-/// Polling cadence for a motor that is not being driven.
-const IDLE_POLL: Duration = Duration::from_millis(50);
-
-/// Consecutive failures before a motor is left alone.
-///
-/// Per motor, not per session: one dead motor on a four-motor wire must not
-/// take the other three down with it.
-const CONSECUTIVE_FAULT_LIMIT: u32 = 20;
+// The threshold and the idle cadence are shared with the single-motor worker —
+// see `crate::safety`, which also records why the *policy* at the limit is not.
+// Here, hitting it leaves that one motor alone and keeps servicing the rest.
+use crate::safety::{CONSECUTIVE_FAULT_LIMIT, IDLE_POLL};
 
 // ---------------------------------------------------------------------------
 // Wire types

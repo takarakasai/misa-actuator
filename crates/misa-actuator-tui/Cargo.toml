@@ -9,6 +9,8 @@ description = "Driver-agnostic ratatui debug TUI for any misa-actuator-compatibl
 
 [dependencies]
 misa-actuator = { workspace = true }
+misa-can = { workspace = true }
+misa-actuator-core = { workspace = true, features = ["clap"] }
 lkmotor-driver = { workspace = true }
 robstride-driver = { workspace = true }
 damiao-driver = { workspace = true }

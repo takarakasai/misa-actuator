@@ -18,7 +18,7 @@ use lkmotor_driver::protocol::response::ControlParamValue;
 #[derive(Parser, Debug)]
 #[command(about = "Dump all readable control parameters (0xC0) for one motor")]
 struct Args {
-    #[arg(short, long, default_value = "/dev/ttyUSB0")]
+    #[arg(short, long, default_value = lkmotor_driver::default_serial_port())]
     device: String,
     #[arg(short, long, default_value_t = 1_000_000)]
     baud: u32,

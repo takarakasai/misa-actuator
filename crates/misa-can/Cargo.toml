@@ -1,0 +1,24 @@
+[package]
+name = "misa-can"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "OS-agnostic CAN / CAN-FD transport for the misa-actuator drivers (SocketCAN on Linux, PCAN-Basic on Windows, SLCAN everywhere)"
+
+[dependencies]
+embedded-can = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+# SLCAN talks to a USB-CAN adapter over a (virtual) serial port, so it is
+# available on every platform `serialport` supports.
+serialport = { workspace = true }
+
+# SocketCAN only exists on Linux. Keeping it in a target-scoped table means
+# Cargo never even resolves it for a Windows build.
+[target.'cfg(target_os = "linux")'.dependencies]
+socketcan = { workspace = true }
+
+# The PCAN backend loads PCANBasic.dll at run time through kernel32, so it
+# needs no build-time dependency at all — see `backend::pcan`.

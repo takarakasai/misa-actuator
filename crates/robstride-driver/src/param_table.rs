@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use robstride_protocol::{
     build_read_param_frame_ext, build_read_param_table_frame, lookup_param_type,
-    lookup_param_type_by_name, parse_param_table_frame, parse_read_param_reply, ParamType,
+    lookup_param_type_by_name, parse_param_table_frame, parse_read_param_reply, MotorModel,
+    ParamType,
 };
 
 use crate::bus::RobstrideBus;
@@ -27,6 +28,16 @@ impl<B: RobstrideBus> Motor<B> {
     /// table — see [`robstride_protocol::param_table`]'s "single-row read"
     /// section. Much cheaper than [`Self::read_param_table`]: a handful of
     /// reply frames instead of the full ~130-row stream.
+    ///
+    /// ⚠ **Known unreliable, and possibly harmful.** Measured against a real
+    /// RS-04 on 2026-08-02: reading `AppCodeName` returned `"moto"` where the
+    /// vendor tool shows `"motor"` — one sub-frame instead of two, so the
+    /// quiet-period heuristic below ends the read while the motor is still
+    /// streaming. Worse, on that unit every subsequent read timed out until
+    /// the motor was power-cycled, twice in a row. Cause unproven; this is the
+    /// only reverse-engineered exchange in the driver, and it is now kept off
+    /// any path a session depends on. Prefer [`Motor::read_version`], which is
+    /// documented and is a single frame each way.
     ///
     /// String-typed rows (the `0x1000`–`0x1007` boot/app info block) reply
     /// with 4 sub-frames (16 bytes). Numeric-typed rows (`0x2000+`) were
@@ -53,9 +64,15 @@ impl<B: RobstrideBus> Motor<B> {
         self.bus().set_timeout(poll_step)?;
         let deadline = Instant::now() + timeout;
 
-        loop {
+        // Collect in a closure-like loop that always falls through to the
+        // timeout restore below. Returning early from inside would leave the
+        // bus on the 50 ms poll step, and every later read on this motor —
+        // including ordinary control traffic — would then time out against a
+        // deadline nobody asked for. `read_param_table` avoids the same trap
+        // the same way.
+        let result = loop {
             if Instant::now() >= deadline {
-                break;
+                break Ok(());
             }
             let frame = match self.bus().recv() {
                 Ok(f) => f,
@@ -63,9 +80,9 @@ impl<B: RobstrideBus> Motor<B> {
                     if chunks.is_empty() {
                         continue; // still within the overall deadline — keep waiting
                     }
-                    break; // quiet period after data arrived — reply is done
+                    break Ok(()); // quiet period after data arrived — reply is done
                 }
-                Err(e) => return Err(e),
+                Err(e) => break Err(e),
             };
             let Some(reply) = parse_read_param_reply(frame.can_id, &frame.data) else {
                 continue;
@@ -74,9 +91,10 @@ impl<B: RobstrideBus> Motor<B> {
                 continue;
             }
             chunks.insert(reply.sub_index, reply.data);
-        }
+        };
         let default_timeout = self.timeout();
         self.bus().set_timeout(default_timeout)?;
+        result?;
 
         if chunks.is_empty() {
             return Err(Error::Timeout {
@@ -186,6 +204,66 @@ impl<B: RobstrideBus> Motor<B> {
             .collect())
     }
 
+    /// Ask the motor to name itself, and see whether a model designation
+    /// falls out.
+    ///
+    /// RobStride publishes no model register, so these free-text rows are the
+    /// only place on the bus where a motor could state what it is. Whether any
+    /// of them is populated is per-unit: the bench RS04 (AppCodeVersion
+    /// 0.4.1.32) returns non-ASCII bytes for `Name` and `BarCode`, which looks
+    /// like a factory that never wrote them. That makes this worth *trying*
+    /// and never worth *relying on* — a hit is a positive identification, a
+    /// miss is no evidence at all.
+    ///
+    /// Returns every row that answered, so a caller with no match can still
+    /// show the operator what came back instead of reporting nothing.
+    pub fn read_identity_strings(&mut self, timeout: Duration) -> Vec<IdentityString> {
+        // `AppCodeName` first, because it is the one that is actually
+        // written. Measured on real hardware: an EduLite05 reports
+        // `"EL_motor"` there while `Name` and `BarCode` are both `FF FF …`,
+        // and an RS-04 returns `FF FF FF FF` for `Name` too. The obvious
+        // candidate — a `Name` row a factory would stamp the model into — is
+        // erased flash on every unit seen so far.
+        const ROWS: &[(u16, &str)] = &[
+            (0x1007, "AppCodeName"),
+            (0x0000, "Name"),
+            (0x0001, "BarCode"),
+        ];
+        let mut out = Vec::new();
+        for &(function_code, label) in ROWS {
+            let Ok(raw) = self.read_single_param(function_code, timeout) else {
+                continue;
+            };
+            if raw.is_empty() {
+                continue;
+            }
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            let text = String::from_utf8_lossy(&raw[..end]).trim().to_string();
+            let model = MotorModel::find_in(&text);
+            out.push(IdentityString {
+                label,
+                function_code,
+                text,
+                raw,
+                model,
+            });
+        }
+        out
+    }
+
+    /// Read just `AppCodeName` (`FunctionCode 0x1007`) — the firmware build's
+    /// name for itself, e.g. `"EL_motor"` on an EduLite05.
+    ///
+    /// One row, five frames. This is the cheap version of
+    /// [`Self::read_identity_strings`] and the only one of those rows that has
+    /// been observed populated, so it is what a connect-time probe should use.
+    pub fn read_app_code_name(&mut self, timeout: Duration) -> Result<String> {
+        const APP_CODE_NAME: u16 = 0x1007;
+        let raw = self.read_single_param(APP_CODE_NAME, timeout)?;
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        Ok(String::from_utf8_lossy(&raw[..end]).trim().to_string())
+    }
+
     /// Convenience wrapper: read just `AppCodeVersion` (`FunctionCode
     /// 0x1003`) as a string (e.g. `"0.4.1.32"`) via the cheap single-row
     /// read — does not stream the whole table.
@@ -194,6 +272,45 @@ impl<B: RobstrideBus> Motor<B> {
         let raw = self.read_single_param(APP_CODE_VERSION, timeout)?;
         let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
         Ok(String::from_utf8_lossy(&raw[..end]).trim().to_string())
+    }
+}
+
+/// One free-text row a motor reported about itself, from
+/// [`Motor::read_identity_strings`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityString {
+    /// The manual's name for the row, e.g. `"Name"`.
+    pub label: &'static str,
+    pub function_code: u16,
+    /// Decoded up to the first NUL. Lossy — an unwritten row usually decodes
+    /// to replacement characters rather than to nothing.
+    pub text: String,
+    /// What actually arrived. Kept because the decoded form of an unwritten
+    /// row is unreadable, and the bytes are the only way to tell "the factory
+    /// left this blank" from "we are decoding it wrong".
+    pub raw: Vec<u8>,
+    /// The model found in [`Self::text`], if any.
+    pub model: Option<MotorModel>,
+}
+
+impl IdentityString {
+    /// Whether the text looks like something a human wrote, as opposed to the
+    /// noise an unwritten row returns.
+    pub fn is_printable(&self) -> bool {
+        !self.text.is_empty()
+            && self
+                .text
+                .chars()
+                .all(|c| c.is_ascii_graphic() || c == ' ')
+    }
+
+    /// The bytes as hex, for showing an operator a row we could not read.
+    pub fn raw_hex(&self) -> String {
+        self.raw
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 

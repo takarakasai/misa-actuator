@@ -11,6 +11,7 @@ description = "Command-line test app for Robstride CAN servo motors"
 robstride-driver = { workspace = true }
 robstride-protocol = { workspace = true }
 misa-actuator = { workspace = true }
+misa-can = { workspace = true }
 misa-sysid = { workspace = true, features = ["cli"] }
 log = { workspace = true }
 env_logger = "0.11"

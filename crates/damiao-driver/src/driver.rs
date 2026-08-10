@@ -14,6 +14,7 @@
 //! be given a unique `MST_ID` (see [`DamiaoMotor::write_register_int`] with
 //! [`Rid::MST_ID`]) or replies cannot be told apart.
 
+use std::thread;
 use std::time::{Duration, Instant};
 
 use damiao_protocol::{
@@ -24,7 +25,7 @@ use damiao_protocol::{
     REGISTER_ID,
 };
 
-use crate::bus::{DamiaoBus, SocketCanBus, SocketCanFdBus};
+use crate::bus::{AnyCanBus, DamiaoBus};
 use crate::error::{Error, Result};
 
 /// Default per-request timeout.
@@ -34,8 +35,16 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_millis(100);
 /// loop on `CTRL_MODE`).
 const MODE_SWITCH_RETRIES: u32 = 20;
 
+/// Attempts per register read — see [`DamiaoMotor::read_register`] for the
+/// measurements behind this. Three, because the observed loss is independent
+/// per attempt: at one in seven, three tries leaves about one read in 350.
+const REGISTER_READ_ATTEMPTS: u32 = 3;
+
+/// Pause before re-asking for a register the motor did not answer.
+const REGISTER_RETRY_GAP: Duration = Duration::from_millis(5);
+
 /// High-level DAMIAO motor handle.
-pub struct DamiaoMotor<B: DamiaoBus = SocketCanBus> {
+pub struct DamiaoMotor<B: DamiaoBus = AnyCanBus> {
     bus: B,
     /// The motor's listen CAN_ID (ESC_ID).
     can_id: u8,
@@ -65,13 +74,14 @@ pub struct DamiaoMotor<B: DamiaoBus = SocketCanBus> {
     torque_constant: Option<f32>,
 }
 
-impl DamiaoMotor<SocketCanBus> {
+impl DamiaoMotor<AnyCanBus> {
     /// Open a **classic CAN** interface and bind to one motor.
     ///
     /// `can_id` is the motor's CAN_ID; the Master ID defaults to
-    /// [`DEFAULT_MASTER_ID`] (`0`).
+    /// [`DEFAULT_MASTER_ID`] (`0`). See [`AnyCanBus::open`] for the accepted
+    /// interface forms (`can0`, `pcan:usb1`, `slcan:COM5`, ...).
     pub fn open(interface: &str, can_id: u8, model: MotorModel) -> Result<Self> {
-        let bus = SocketCanBus::open(interface)?;
+        let bus = AnyCanBus::open(interface)?;
         Ok(Self::with_bus(bus, can_id, model))
     }
 
@@ -84,16 +94,25 @@ impl DamiaoMotor<SocketCanBus> {
         master_id: u16,
         model: MotorModel,
     ) -> Result<Self> {
-        let bus = SocketCanBus::open(interface)?;
+        let bus = AnyCanBus::open(interface)?;
         Ok(Self::with_bus_and_master(bus, can_id, master_id, model))
     }
-}
 
-impl DamiaoMotor<SocketCanFdBus> {
-    /// Open a **CAN-FD** interface and bind to one motor. The interface must be
-    /// configured with `fd on` (see [`SocketCanFdBus`]).
+    /// Open a **CAN-FD** interface and bind to one motor — see
+    /// [`AnyCanBus::open_fd`] for what each transport requires.
     pub fn open_fd(interface: &str, can_id: u8, model: MotorModel) -> Result<Self> {
-        let bus = SocketCanFdBus::open(interface)?;
+        let bus = AnyCanBus::open_fd(interface)?;
+        Ok(Self::with_bus(bus, can_id, model))
+    }
+
+    /// Diagnostic: CAN-FD link, classic frames — see
+    /// [`AnyCanBus::open_fd_link_classic_frames`] for why this exists.
+    pub fn open_fd_link_classic_frames(
+        interface: &str,
+        can_id: u8,
+        model: MotorModel,
+    ) -> Result<Self> {
+        let bus = AnyCanBus::open_fd_link_classic_frames(interface)?;
         Ok(Self::with_bus(bus, can_id, model))
     }
 
@@ -104,7 +123,7 @@ impl DamiaoMotor<SocketCanFdBus> {
         master_id: u16,
         model: MotorModel,
     ) -> Result<Self> {
-        let bus = SocketCanFdBus::open(interface)?;
+        let bus = AnyCanBus::open_fd(interface)?;
         Ok(Self::with_bus_and_master(bus, can_id, master_id, model))
     }
 }
@@ -588,10 +607,62 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
 
     /// Read a register (RID). Request goes to `0x7FF`; the reply arrives on the
     /// motor's Master ID.
+    ///
+    /// Retries, because the motor drops requests. Measured on a DM4310 over
+    /// CAN-FD at 1 Mbit/s arbitration and 5 Mbit/s data: roughly one read in
+    /// seven goes unanswered, at random registers, with **no bus errors
+    /// reported by the adapter** and every request confirmed transmitted.
+    /// Raising the timeout tenfold changes nothing, so the reply is not late —
+    /// it never comes. The same reads over classic CAN do not drop, which
+    /// points at the motor's firmware not keeping up once requests arrive at
+    /// FD speed rather than at anything on the host side.
+    ///
+    /// A register read has no side effects, so retrying is free of risk, and
+    /// the alternative is handing callers a "timeout" that means nothing more
+    /// than "ask again".
     pub fn read_register(&mut self, rid: u8) -> Result<RegReply> {
-        let (id, data) = build_read_reg(self.can_id, rid);
-        self.send(id, &data)?;
-        self.recv_reg_reply(rid)
+        let mut last = None;
+        for attempt in 0..REGISTER_READ_ATTEMPTS {
+            if attempt > 0 {
+                // A short gap as well as a retry: if the motor is behind,
+                // asking again immediately is asking at the same rate.
+                thread::sleep(REGISTER_RETRY_GAP);
+                log::debug!("register {rid} unanswered, retry {attempt}");
+            }
+            let (id, data) = build_read_reg(self.can_id, rid);
+            self.send(id, &data)?;
+            match self.recv_reg_reply(rid) {
+                Ok(reply) => return Ok(reply),
+                Err(e @ Error::Timeout { .. }) => last = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or(Error::Timeout {
+            motor_id: self.can_id,
+        }))
+    }
+
+    /// Ask the motor which model it is, by reading its reduction ratio
+    /// (`GR`, RID 20).
+    ///
+    /// Exact, unlike anything available on RobStride: every distinct DM-J
+    /// motor has a distinct ratio, and `GR` is a read-only constant identified
+    /// at the factory rather than a setting that can be left unwritten. A real
+    /// DM-J4310 reports `10`.
+    ///
+    /// Worth noting what this is *not* needed for. MIT scaling comes from
+    /// `PMAX`/`VMAX`/`TMAX` via [`Self::refresh_limits_from_registers`], which
+    /// is authoritative regardless of model. This matters for the register
+    /// layout above RID `0x25` and for telling an operator what they have
+    /// plugged in.
+    pub fn identify_model(&mut self) -> Result<MotorModel> {
+        let gr = self.read_register(Rid::GR)?.as_f32();
+        MotorModel::from_gear_ratio(gr).ok_or_else(|| {
+            Error::InvalidResponse(format!(
+                "motor {} reports gear ratio {gr}, which matches no known DM-J model",
+                self.can_id
+            ))
+        })
     }
 
     /// Replace the MIT quantization limits with the motor's own
@@ -754,5 +825,20 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
             requested: mode as i32,
             actual: last_value,
         })
+    }
+}
+
+/// Leave the motor de-energised when the handle goes away.
+///
+/// Best-effort, and worth stating why it matters on this family in
+/// particular: the bench notes (§1.8) record that `disable` is *not* a latched
+/// safe state on a DM-J4310 — the next control frame re-energises it. So the
+/// guarantee here is only "this handle stops commanding and de-energises on
+/// its way out", not "the motor is now inert".
+impl<B: DamiaoBus> Drop for DamiaoMotor<B> {
+    fn drop(&mut self) {
+        if let Err(e) = self.disable() {
+            log::warn!("damiao: disable on drop failed for motor {}: {e}", self.can_id);
+        }
     }
 }

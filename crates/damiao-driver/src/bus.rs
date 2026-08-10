@@ -3,25 +3,21 @@
 //! DAMIAO traffic is carried as **standard 11-bit** CAN frames with an 8-byte
 //! payload. Crucially, the application protocol is *identical* on classic CAN
 //! and CAN-FD — same ids, same 8-byte payloads — so the only difference is the
-//! physical layer. The [`DamiaoBus`] trait captures the wire I/O, and we
-//! provide two concrete implementations:
+//! physical layer.
 //!
-//! - [`SocketCanBus`] — classic CAN (1 Mbps) via `socketcan::CanSocket`.
-//! - [`SocketCanFdBus`] — CAN-FD (1–5 Mbps) via `socketcan::CanFdSocket`,
-//!   sending BRS-enabled FD frames.
+//! [`DamiaoBus`] captures the wire I/O and [`CanBus`] adapts any
+//! [`misa_can`] transport to it. Which transport that is comes from the
+//! interface string: `can0` (Linux SocketCAN), `pcan:usb1` (PEAK, Windows) or
+//! `slcan:COM5` (USB-CAN dongle, classic CAN only).
 //!
 //! A single robot may run a classic-CAN bus and a CAN-FD bus side by side
-//! (e.g. mixing motor lots that only speak one or the other); pick the matching
-//! bus per interface. They are never mixed on the *same* wire.
+//! (e.g. mixing motor lots that only speak one or the other); pick the
+//! matching mode per interface. They are never mixed on the *same* wire.
 
-use std::io;
 use std::time::Duration;
 
-use socketcan::{
-    CanAnyFrame, CanFdFrame, CanFdSocket, CanSocket, EmbeddedFrame, Id, Socket, StandardId,
-};
-
 use misa_actuator::Shared;
+use misa_can::{OpenOptions, StandardId};
 
 use crate::error::{Error, Result};
 
@@ -56,8 +52,8 @@ pub trait DamiaoBus {
 /// motor a clone. Access is serialized by the mutex — drive the motors from a
 /// single control loop per bus (see the crate-level multi-motor docs).
 ///
-/// Note: [`DamiaoBus::set_timeout`] here affects the *shared* socket, so the
-/// last value set wins across all motors on the bus.
+/// Note: [`DamiaoBus::set_timeout`] here affects the *shared* transport, so
+/// the last value set wins across all motors on the bus.
 impl<B: DamiaoBus> DamiaoBus for Shared<B> {
     fn send(&mut self, can_id: u16, data: &[u8]) -> Result<()> {
         self.lock().send(can_id, data)
@@ -72,149 +68,135 @@ impl<B: DamiaoBus> DamiaoBus for Shared<B> {
     }
 }
 
-/// Build a standard-id from a `u16`, rejecting ids above 0x7FF.
-fn std_id(can_id: u16) -> Result<StandardId> {
-    StandardId::new(can_id).ok_or(Error::InvalidFrame("CAN ID exceeds 11 bits"))
+/// Adapter presenting any [`misa_can::CanBus`] as a [`DamiaoBus`].
+///
+/// `fd` decides how *outgoing* frames are framed. Incoming frames are
+/// accepted either way — a CAN-FD interface still receives classic frames, so
+/// feedback is handled uniformly regardless of how the motor framed its reply.
+pub struct CanBus<T: misa_can::CanBus> {
+    inner: T,
+    fd: bool,
 }
 
-/// Extract the standard id and payload from a received frame, or `None` for
-/// extended / non-data frames we don't care about.
-fn decode_std(id: Id, data: &[u8]) -> Option<CanFrame> {
-    match id {
-        Id::Standard(s) => Some(CanFrame {
-            can_id: s.as_raw(),
-            data: data.to_vec(),
-        }),
-        Id::Extended(_) => None,
-    }
-}
+/// The bus [`crate::DamiaoMotor::open`] and
+/// [`crate::DamiaoMotor::open_fd`] produce.
+pub type AnyCanBus = CanBus<Box<dyn misa_can::CanBus>>;
 
-/// SocketCAN-backed **classic CAN** implementation (Linux only).
-pub struct SocketCanBus {
-    socket: CanSocket,
-    timeout: Duration,
-}
-
-impl SocketCanBus {
-    /// Open a classic-CAN SocketCAN interface (e.g. `"can0"`).
+impl AnyCanBus {
+    /// Open `interface` in **classic CAN** mode (1 Mbit/s by default).
+    ///
+    /// | interface | transport |
+    /// |-----------|-----------|
+    /// | `can0` | Linux SocketCAN |
+    /// | `pcan:usb1` | PEAK PCAN-Basic (Windows) |
+    /// | `slcan:COM5` | USB-CAN adapter |
     pub fn open(interface: &str) -> Result<Self> {
-        let socket = CanSocket::open(interface)?;
-        let timeout = Duration::from_millis(100);
-        socket.set_read_timeout(timeout)?;
-        Ok(Self { socket, timeout })
+        Self::open_with(interface, &OpenOptions::classic())
     }
 
-    /// Borrow the underlying SocketCAN handle.
-    pub fn socket(&self) -> &CanSocket {
-        &self.socket
+    /// Open `interface` in **CAN-FD** mode, sending BRS-enabled FD frames so
+    /// the data phase runs at the data bitrate (5 Mbit/s by default; override
+    /// with e.g. `pcan:usb1@1M,2M`).
+    ///
+    /// SLCAN adapters cannot do FD and are rejected here. On Linux the link
+    /// must already be up with `fd on`:
+    ///
+    /// ```text
+    /// sudo ip link set can0 type can bitrate 1000000 dbitrate 5000000 fd on up
+    /// ```
+    pub fn open_fd(interface: &str) -> Result<Self> {
+        Self::open_with(interface, &OpenOptions::fd())
+    }
+
+    /// Open the link in **CAN-FD** mode but send **classic** frames on it.
+    ///
+    /// A diagnostic, not a mode anyone should run a motor in. When a motor
+    /// stops answering the moment you switch to `open_fd`, there are two
+    /// explanations — the motor is not configured for CAN-FD, or our FD
+    /// framing is wrong — and they call for completely different next steps.
+    /// This separates them: the link is initialised exactly as `open_fd` does,
+    /// so if the motor answers classic frames over it, the FD initialisation
+    /// and bit timing are fine and the motor is simply not an FD node.
+    pub fn open_fd_link_classic_frames(interface: &str) -> Result<Self> {
+        Ok(Self {
+            inner: misa_can::open(interface, &OpenOptions::fd()).map_err(map_err)?,
+            fd: false,
+        })
+    }
+
+    /// Open with explicit transport options.
+    pub fn open_with(interface: &str, opts: &OpenOptions) -> Result<Self> {
+        Ok(Self {
+            inner: misa_can::open(interface, opts).map_err(map_err)?,
+            fd: opts.fd,
+        })
     }
 }
 
-impl DamiaoBus for SocketCanBus {
+impl<T: misa_can::CanBus> CanBus<T> {
+    /// Wrap an already-open transport, framing sends as classic CAN.
+    pub fn new(inner: T) -> Self {
+        Self { inner, fd: false }
+    }
+
+    /// Wrap an already-open transport, framing sends as CAN-FD with BRS.
+    pub fn new_fd(inner: T) -> Self {
+        Self { inner, fd: true }
+    }
+
+    /// Borrow the underlying transport.
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    /// Whether outgoing frames are sent as CAN-FD.
+    pub fn is_fd(&self) -> bool {
+        self.fd
+    }
+
+    /// What is actually open, e.g. `PCAN_USBBUS1 (CAN-FD, ...)`.
+    pub fn description(&self) -> String {
+        self.inner.description()
+    }
+}
+
+impl<T: misa_can::CanBus> DamiaoBus for CanBus<T> {
     fn send(&mut self, can_id: u16, data: &[u8]) -> Result<()> {
-        let frame = socketcan::CanFrame::new(Id::Standard(std_id(can_id)?), data)
-            .ok_or(Error::InvalidFrame("payload too long for classic CAN frame"))?;
-        self.socket.write_frame(&frame)?;
-        Ok(())
+        let id = StandardId::new(can_id).ok_or(Error::InvalidFrame("CAN ID exceeds 11 bits"))?;
+        let frame = if self.fd {
+            // Bit-rate switching: run the data phase at the fast data bitrate.
+            misa_can::Frame::new_fd(id, data, true)
+        } else {
+            misa_can::Frame::new(id, data)
+        }
+        .map_err(map_err)?;
+        self.inner.send(&frame).map_err(map_err)
     }
 
     fn recv(&mut self) -> Result<CanFrame> {
         loop {
-            match self.socket.read_frame() {
-                Ok(frame) => {
-                    if let Some(f) = decode_std(frame.id(), frame.data()) {
-                        return Ok(f);
-                    }
-                    // extended frame — not DAMIAO, keep waiting
-                }
-                Err(ref e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut =>
-                {
-                    return Err(Error::Timeout { motor_id: 0 });
-                }
-                Err(e) => return Err(Error::CanSocket(e)),
-            }
+            let frame = self.inner.recv().map_err(map_err)?;
+            // Extended frames belong to some other family on the wire.
+            let Some(can_id) = frame.standard_id() else {
+                continue;
+            };
+            return Ok(CanFrame {
+                can_id,
+                data: frame.data().to_vec(),
+            });
         }
     }
 
     fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
-        self.socket.set_read_timeout(timeout)?;
-        self.timeout = timeout;
-        Ok(())
+        self.inner.set_timeout(timeout).map_err(map_err)
     }
 }
 
-/// SocketCAN-backed **CAN-FD** implementation (Linux only).
-///
-/// Sends BRS-enabled FD frames so the data phase runs at the bus's configured
-/// data bitrate (e.g. 5 Mbps). The DAMIAO payload is still 8 bytes. A
-/// `CanFdSocket` also receives classic frames, so feedback is handled
-/// uniformly regardless of how the motor framed its reply.
-///
-/// The interface must be brought up in FD mode, e.g.:
-/// ```text
-/// sudo ip link set can0 type can bitrate 1000000 dbitrate 5000000 fd on up
-/// ```
-pub struct SocketCanFdBus {
-    socket: CanFdSocket,
-    timeout: Duration,
-}
-
-impl SocketCanFdBus {
-    /// Open a CAN-FD SocketCAN interface (e.g. `"can0"`). The interface must
-    /// already be configured with `fd on`.
-    pub fn open(interface: &str) -> Result<Self> {
-        let socket = CanFdSocket::open(interface)?;
-        let timeout = Duration::from_millis(100);
-        socket.set_read_timeout(timeout)?;
-        Ok(Self { socket, timeout })
-    }
-
-    /// Borrow the underlying CAN-FD socket handle.
-    pub fn socket(&self) -> &CanFdSocket {
-        &self.socket
-    }
-}
-
-impl DamiaoBus for SocketCanFdBus {
-    fn send(&mut self, can_id: u16, data: &[u8]) -> Result<()> {
-        let mut frame = CanFdFrame::new(Id::Standard(std_id(can_id)?), data)
-            .ok_or(Error::InvalidFrame("payload too long for CAN-FD frame"))?;
-        // Bit-rate switching: run the data phase at the fast data bitrate.
-        frame.set_brs(true);
-        self.socket.write_frame(&frame)?;
-        Ok(())
-    }
-
-    fn recv(&mut self) -> Result<CanFrame> {
-        loop {
-            match self.socket.read_frame() {
-                Ok(any) => {
-                    let decoded = match any {
-                        CanAnyFrame::Normal(f) => decode_std(f.id(), f.data()),
-                        CanAnyFrame::Fd(f) => decode_std(f.id(), f.data()),
-                        // Remote / error frames are not DAMIAO data.
-                        CanAnyFrame::Remote(_) | CanAnyFrame::Error(_) => None,
-                    };
-                    if let Some(f) = decoded {
-                        return Ok(f);
-                    }
-                }
-                Err(ref e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut =>
-                {
-                    return Err(Error::Timeout { motor_id: 0 });
-                }
-                Err(e) => return Err(Error::CanSocket(e)),
-            }
-        }
-    }
-
-    fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
-        self.socket.set_read_timeout(timeout)?;
-        self.timeout = timeout;
-        Ok(())
+/// Map a transport error onto the driver's own error type, keeping the
+/// timeout case distinguishable — the driver's retry loops match on it.
+fn map_err(e: misa_can::Error) -> Error {
+    match e {
+        misa_can::Error::Timeout => Error::Timeout { motor_id: 0 },
+        other => Error::Bus(other),
     }
 }

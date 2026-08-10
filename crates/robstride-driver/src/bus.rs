@@ -2,16 +2,18 @@
 //!
 //! All Robstride traffic is carried as 29-bit extended CAN frames with an
 //! 8-byte payload. The [`RobstrideBus`] trait abstracts over the underlying
-//! CAN transport so that the same `Motor` driver works on Linux SocketCAN
-//! today and on USB-CAN serial adapters / EtherCAT-based gateways
-//! tomorrow.
+//! CAN transport so that the same `Motor` driver works on Linux SocketCAN, on
+//! a PEAK adapter under Windows, and on a USB-CAN (SLCAN) dongle on either.
+//!
+//! The concrete transports live in [`misa_can`]; [`CanBus`] is the thin
+//! adapter that presents one of them as a `RobstrideBus`. [`AnyCanBus`] is
+//! what [`crate::Motor::open`] builds — the backend is chosen by the
+//! interface string (`can0`, `pcan:usb1`, `slcan:COM5`, ...).
 
-use std::io;
 use std::time::Duration;
 
-use socketcan::{CanSocket, EmbeddedFrame, ExtendedId, Id, Socket, StandardId};
-
 use misa_actuator::Shared;
+use misa_can::{ExtendedId, OpenOptions};
 
 use crate::error::{Error, Result};
 
@@ -61,66 +63,87 @@ impl<B: RobstrideBus> RobstrideBus for Shared<B> {
     }
 }
 
-/// SocketCAN-backed implementation of [`RobstrideBus`] (Linux only).
-pub struct SocketCanBus {
-    socket: CanSocket,
-    timeout: Duration,
+/// Adapter presenting any [`misa_can::CanBus`] as a [`RobstrideBus`].
+pub struct CanBus<T: misa_can::CanBus> {
+    inner: T,
 }
 
-impl SocketCanBus {
-    /// Open a SocketCAN interface (e.g. `"can0"`).
+/// The bus [`crate::Motor::open`] produces: a transport picked at run time
+/// from the interface string.
+pub type AnyCanBus = CanBus<Box<dyn misa_can::CanBus>>;
+
+impl AnyCanBus {
+    /// Open whichever CAN transport `interface` names.
+    ///
+    /// | interface | transport |
+    /// |-----------|-----------|
+    /// | `can0` | Linux SocketCAN |
+    /// | `pcan:usb1` | PEAK PCAN-Basic (Windows) |
+    /// | `slcan:COM5` / `slcan:/dev/ttyACM0` | USB-CAN adapter |
+    ///
+    /// Robstride motors ship at 1 Mbit/s, which is the default; append
+    /// `@500K` to the interface to override it.
     pub fn open(interface: &str) -> Result<Self> {
-        let socket = CanSocket::open(interface)?;
-        let timeout = Duration::from_millis(100);
-        socket.set_read_timeout(timeout)?;
-        Ok(Self { socket, timeout })
+        Self::open_with(interface, &OpenOptions::classic())
     }
 
-    /// Borrow the underlying SocketCAN handle.
-    pub fn socket(&self) -> &CanSocket {
-        &self.socket
+    /// Open with explicit transport options (timeout, CAN-FD).
+    pub fn open_with(interface: &str, opts: &OpenOptions) -> Result<Self> {
+        Ok(Self {
+            inner: misa_can::open(interface, opts).map_err(map_err)?,
+        })
     }
 }
 
-impl RobstrideBus for SocketCanBus {
+impl<T: misa_can::CanBus> CanBus<T> {
+    /// Wrap an already-open transport.
+    pub fn new(inner: T) -> Self {
+        Self { inner }
+    }
+
+    /// Borrow the underlying transport.
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    /// What is actually open, e.g. `PCAN_USBBUS1 (CAN, 1000000 bit/s)`.
+    pub fn description(&self) -> String {
+        self.inner.description()
+    }
+}
+
+impl<T: misa_can::CanBus> RobstrideBus for CanBus<T> {
     fn send(&mut self, can_id: u32, data: &[u8]) -> Result<()> {
-        let ext_id = ExtendedId::new(can_id)
-            .ok_or(Error::InvalidFrame("CAN ID exceeds 29 bits"))?;
-        let frame = socketcan::CanFrame::new(Id::Extended(ext_id), data)
-            .ok_or(Error::InvalidFrame("payload too long for CAN frame"))?;
-        self.socket.write_frame(&frame)?;
-        Ok(())
+        let id = ExtendedId::new(can_id).ok_or(Error::InvalidFrame("CAN ID exceeds 29 bits"))?;
+        let frame = misa_can::Frame::new(id, data).map_err(map_err)?;
+        self.inner.send(&frame).map_err(map_err)
     }
 
     fn recv(&mut self) -> Result<CanFrame> {
         loop {
-            match self.socket.read_frame() {
-                Ok(frame) => {
-                    if !frame.is_extended() {
-                        continue;
-                    }
-                    let raw_id = match frame.id() {
-                        Id::Standard(s) => StandardId::as_raw(&s) as u32,
-                        Id::Extended(e) => ExtendedId::as_raw(&e),
-                    };
-                    return Ok(CanFrame {
-                        can_id: raw_id,
-                        data: frame.data().to_vec(),
-                    });
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut =>
-                {
-                    return Err(Error::Timeout { motor_id: 0 });
-                }
-                Err(e) => return Err(Error::CanSocket(e)),
-            }
+            let frame = self.inner.recv().map_err(map_err)?;
+            // Robstride only ever uses 29-bit ids; a standard-id frame belongs
+            // to some other family sharing the wire.
+            let Some(can_id) = frame.extended_id() else {
+                continue;
+            };
+            return Ok(CanFrame {
+                can_id,
+                data: frame.data().to_vec(),
+            });
         }
     }
 
     fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
-        self.socket.set_read_timeout(timeout)?;
-        self.timeout = timeout;
-        Ok(())
+        self.inner.set_timeout(timeout).map_err(map_err)
+    }
+}
+
+/// Map a transport error onto the driver's own error type, keeping the
+/// timeout case distinguishable — the driver's retry loops match on it.
+fn map_err(e: misa_can::Error) -> Error {
+    match e {
+        misa_can::Error::Timeout => Error::Timeout { motor_id: 0 },
+        other => Error::Bus(other),
     }
 }

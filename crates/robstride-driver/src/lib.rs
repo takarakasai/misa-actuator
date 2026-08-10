@@ -2,12 +2,13 @@
 //!
 //! Layered architecture:
 //!
-//! - [`bus::RobstrideBus`] — CAN-frame send/recv abstraction. Concrete
-//!   implementations: [`SocketCanBus`] (Linux SocketCAN); future
-//!   USB-CAN serial adapters plug in here.
+//! - [`bus::RobstrideBus`] — CAN-frame send/recv abstraction. [`CanBus`]
+//!   adapts any [`misa_can`] transport to it: Linux SocketCAN, a PEAK
+//!   adapter on Windows, or an SLCAN USB-CAN dongle on either.
 //! - [`Motor<B>`] — high-level driver, generic over the bus. Defaults to
-//!   `Motor<SocketCanBus>` so the original `Motor::open("can0", ...)`
-//!   ergonomics still work.
+//!   `Motor<AnyCanBus>`, which picks the transport from the interface string,
+//!   so the original `Motor::open("can0", ...)` ergonomics still work and
+//!   `Motor::open("pcan:usb1", ...)` works on Windows.
 //! - `impl Actuator for Motor<B>` — the unified [`misa_actuator::Actuator`]
 //!   surface for use through the trait-object TUI.
 //!
@@ -31,16 +32,16 @@ pub mod error;
 pub mod param_table;
 pub mod scan;
 
-pub use bus::{CanFrame, RobstrideBus, SocketCanBus};
+pub use bus::{AnyCanBus, CanBus, CanFrame, RobstrideBus};
 pub use driver::Motor;
 pub use error::{Error, Result};
-pub use param_table::{ParamTableEntry, TypedValue};
-pub use scan::{ScanProgress, ScanResult, dump_bus, scan_bus, scan_bus_on};
+pub use param_table::{IdentityString, ParamTableEntry, TypedValue};
+pub use scan::{ScanProgress, ScanResult, dump_bus, dump_bus_streaming, scan_bus, scan_bus_on};
 
 /// Re-export of the protocol crate so consumers can drop down to raw frames.
 pub use robstride_protocol as protocol;
 
 pub use robstride_protocol::{
-    lookup_param_type, DEFAULT_HOST_ID, MitScales, MotorFeedback, MotorModel, MotorStatusBits,
-    ParamIndex, ParamType, RunMode,
+    lookup_param_type, BuildName, CatalogueName, DEFAULT_HOST_ID, MitScales, MotorFeedback,
+    MotorModel, MotorStatusBits, ParamIndex, ParamType, ProductLine, ReportedLimits, RunMode,
 };

@@ -25,7 +25,7 @@ use lkmotor_driver::LkCommands;
 #[derive(Parser, Debug)]
 #[command(about = "MIT-mode emulation hold demo (case B: 0x9C + 0xA1)")]
 struct Args {
-    #[arg(short, long, default_value = "/dev/ttyUSB0")]
+    #[arg(short, long, default_value = lkmotor_driver::default_serial_port())]
     device: String,
     #[arg(short, long, default_value_t = 1_000_000)]
     baud: u32,

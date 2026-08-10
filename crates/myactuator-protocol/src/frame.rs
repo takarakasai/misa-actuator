@@ -172,9 +172,65 @@ pub const fn build_read_version_date() -> [u8; DATA_LEN] {
     plain(Cmd::ReadVersionDate)
 }
 
-/// `0xB5` — read the motor model name (ASCII, up to 7 characters).
+/// `0xB5` — read the motor model name, single-shot form (ASCII, up to 7
+/// characters in `data[1..8]`).
+///
+/// This is the form the older manuals document, and it is **not** what a
+/// V4.4-era firmware answers: a real RMD-X4-P36-36 returns nothing usable
+/// here. Prefer [`build_read_motor_model_chunk`].
 pub const fn build_read_motor_model() -> [u8; DATA_LEN] {
     plain(Cmd::ReadMotorModel)
+}
+
+/// How many 5-character chunks make up a model name. Three covers
+/// `"RMD-X4-P36-36"` (13 characters) with room to spare.
+pub const MOTOR_MODEL_CHUNKS: u8 = 3;
+
+/// Byte 1 of a chunked `0xB5` request. Captured as `0x01`, and it is not
+/// obvious why — `0x00` would have been the natural guess, and guessing wrong
+/// here fails silently rather than erroring.
+const MOTOR_MODEL_FLAG: u8 = 0x01;
+
+/// `0xB5` — read one 5-character chunk of the motor model name.
+///
+/// The name does not fit in one frame, so the firmware splits it: `index`
+/// selects the chunk and the reply carries five ASCII characters after a
+/// three-byte header.
+///
+/// Captured from Setup Software V4.0 against a real RMD-X4-P36-36:
+///
+/// ```text
+/// TX  B5 01 01 00 00 00 00 00   RX  B5 01 01 52 4D 44 2D 58   "RMD-X"
+/// TX  B5 01 02 00 00 00 00 00   RX  B5 01 02 34 2D 50 33 36   "4-P36"
+/// TX  B5 01 03 00 00 00 00 00   RX  B5 01 03 2D 33 36 00 00   "-36"
+/// ```
+///
+/// — exactly the `RMD-X4-P36-36` its Motor Name field displays.
+pub const fn build_read_motor_model_chunk(index: u8) -> [u8; DATA_LEN] {
+    [
+        Cmd::ReadMotorModel as u8,
+        MOTOR_MODEL_FLAG,
+        index,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]
+}
+
+/// Parse one chunk of a chunked `0xB5` reply into `(index, five characters)`.
+///
+/// The index is echoed back, and callers must check it: chunks are requested
+/// in sequence, so a stale reply that is accepted for the wrong position
+/// silently scrambles the name rather than failing.
+pub fn parse_motor_model_chunk(data: &[u8]) -> Option<(u8, [u8; 5])> {
+    if data.len() < DATA_LEN || data[0] != Cmd::ReadMotorModel as u8 {
+        return None;
+    }
+    let mut chunk = [0u8; 5];
+    chunk.copy_from_slice(&data[3..8]);
+    Some((data[2], chunk))
 }
 
 /// `0x80` — motor shutdown (output off, running state cleared).
@@ -456,6 +512,74 @@ pub fn parse_motor_model(data: &[u8]) -> Option<[u8; 7]> {
     let mut model = [0u8; 7];
     model.copy_from_slice(&data[1..8]);
     Some(model)
+}
+
+#[cfg(test)]
+mod motor_model_tests {
+    use super::*;
+
+    /// Values captured from Setup Software V4.0 against a real
+    /// RMD-X4-P36-36, whose Motor Name field reads `RMD-X4-P36-36`.
+    const CHUNKS: [(u8, &[u8; 5]); 3] = [
+        (1, b"RMD-X"),
+        (2, b"4-P36"),
+        (3, b"-36\0\0"),
+    ];
+
+    /// Byte-for-byte against the captured requests. The flag byte is the point
+    /// of this test: `0x01` was measured, `0x00` is the obvious guess, and a
+    /// wrong flag produces no reply rather than an error.
+    #[test]
+    fn a_chunk_request_matches_the_captured_bytes() {
+        assert_eq!(
+            build_read_motor_model_chunk(1),
+            [0xB5, 0x01, 0x01, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            build_read_motor_model_chunk(2),
+            [0xB5, 0x01, 0x02, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            build_read_motor_model_chunk(3),
+            [0xB5, 0x01, 0x03, 0, 0, 0, 0, 0]
+        );
+        // The single-shot form carries neither flag nor index — which is
+        // exactly why a firmware that only answers the indexed form returns
+        // nothing usable for it.
+        assert_eq!(build_read_motor_model(), [0xB5, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn the_chunks_reassemble_into_the_name_the_vendor_tool_shows() {
+        // The exact reply frames from the capture.
+        let replies: [[u8; 8]; 3] = [
+            [0xB5, 0x01, 0x01, 0x52, 0x4D, 0x44, 0x2D, 0x58],
+            [0xB5, 0x01, 0x02, 0x34, 0x2D, 0x50, 0x33, 0x36],
+            [0xB5, 0x01, 0x03, 0x2D, 0x33, 0x36, 0x00, 0x00],
+        ];
+        let mut name = [0u8; 16];
+        let mut len = 0;
+        for (i, (index, _)) in CHUNKS.iter().enumerate() {
+            let reply = replies[i];
+            let (echoed, chunk) = parse_motor_model_chunk(&reply).expect("a chunk");
+            let index = *index;
+            assert_eq!(echoed, index);
+            for &b in &chunk {
+                if b == 0 {
+                    break;
+                }
+                name[len] = b;
+                len += 1;
+            }
+        }
+        assert_eq!(&name[..len], b"RMD-X4-P36-36");
+    }
+
+    #[test]
+    fn a_reply_to_another_command_is_not_read_as_a_chunk() {
+        assert!(parse_motor_model_chunk(&[Cmd::ReadStatus1 as u8, 0, 1, 0, 0, 0, 0, 0]).is_none());
+        assert!(parse_motor_model_chunk(&[Cmd::ReadMotorModel as u8, 0, 1]).is_none());
+    }
 }
 
 #[cfg(test)]

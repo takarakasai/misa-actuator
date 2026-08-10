@@ -4,8 +4,11 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("CAN socket error: {0}")]
-    CanSocket(#[from] std::io::Error),
+    /// Transparent so the transport's own message ("invalid CAN interface
+    /// ...", "CAN_Initialize failed: ...") is not repeated once here and again
+    /// as the `Caused by:` line — those messages already name the transport.
+    #[error(transparent)]
+    Bus(#[from] misa_can::Error),
 
     #[error("timeout waiting for response from motor {motor_id}")]
     Timeout { motor_id: u8 },
@@ -29,7 +32,7 @@ impl From<Error> for misa_actuator::Error {
     fn from(e: Error) -> Self {
         use misa_actuator::Error as M;
         match e {
-            Error::CanSocket(e) => M::Bus(e.to_string()),
+            Error::Bus(e) => M::Bus(e.to_string()),
             Error::Timeout { motor_id } => M::Timeout { motor_id },
             Error::InvalidResponse(msg) => M::Protocol(msg),
             Error::MotorFault {

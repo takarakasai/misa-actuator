@@ -2,13 +2,14 @@
 //!
 //! Layered architecture:
 //!
-//! - [`bus::DamiaoBus`] — standard-CAN frame send/recv abstraction. Concrete
-//!   implementations: [`SocketCanBus`] (classic CAN, 1 Mbps) and
-//!   [`SocketCanFdBus`] (CAN-FD, 1–5 Mbps). The DAMIAO protocol is identical on
-//!   both, so the choice is purely the physical layer.
+//! - [`bus::DamiaoBus`] — standard-CAN frame send/recv abstraction. [`CanBus`]
+//!   adapts any [`misa_can`] transport to it, in classic-CAN (1 Mbps) or
+//!   CAN-FD (1–5 Mbps) framing. The DAMIAO protocol is identical on both, so
+//!   the choice is purely the physical layer.
 //! - [`DamiaoMotor<B>`] — high-level driver, generic over the bus. Defaults to
-//!   `DamiaoMotor<SocketCanBus>` so `DamiaoMotor::open("can0", 1, model)` works
-//!   out of the box; use `open_fd` for a CAN-FD bus.
+//!   `DamiaoMotor<AnyCanBus>` so `DamiaoMotor::open("can0", 1, model)` works
+//!   out of the box on Linux and `DamiaoMotor::open("pcan:usb1", 1, model)`
+//!   on Windows; use `open_fd` for a CAN-FD bus.
 //! - `impl Actuator for DamiaoMotor<B>` — the unified
 //!   [`misa_actuator::Actuator`] surface for the trait-object TUI.
 //!
@@ -51,10 +52,10 @@
 //! (`can0`, `can1`) use independent `Shared` instances and run in parallel.
 //!
 //! ```no_run
-//! use damiao_driver::{DamiaoMotor, MotorModel, Shared, SocketCanBus};
+//! use damiao_driver::{AnyCanBus, DamiaoMotor, MotorModel, Shared};
 //! use misa_actuator::{Actuator, RunMode};
 //!
-//! let bus0 = Shared::new(SocketCanBus::open("can0")?);
+//! let bus0 = Shared::new(AnyCanBus::open("can0")?);
 //! // CAN_ID 1 / 2, MST_ID 0x11 / 0x12 (the 0x10 + CAN_ID convention):
 //! let mut m1 = DamiaoMotor::with_bus_and_master(bus0.clone(), 1, 0x11, MotorModel::Dm4310);
 //! let mut m2 = DamiaoMotor::with_bus_and_master(bus0.clone(), 2, 0x12, MotorModel::Dm4310);
@@ -81,7 +82,7 @@ pub mod driver;
 pub mod error;
 pub mod scan;
 
-pub use bus::{CanFrame, DamiaoBus, SocketCanBus, SocketCanFdBus};
+pub use bus::{AnyCanBus, CanBus, CanFrame, DamiaoBus};
 /// Re-exported for sharing one bus across motors — see the multi-motor docs.
 pub use misa_actuator::Shared;
 pub use driver::DamiaoMotor;

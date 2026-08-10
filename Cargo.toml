@@ -1,8 +1,39 @@
 [workspace]
 resolver = "2"
+
+# The GUI is excluded from the default set because building it needs the
+# front end built first (`cd ui && npm ci && npm run build`) — Tauri embeds
+# `ui/dist` at compile time. Keeping it out means a plain `cargo build` /
+# `cargo test` still works with nothing but a Rust toolchain, which is how
+# everything else in here is used. Build it explicitly with
+# `cargo build -p misa-actuator-gui`.
+default-members = [
+    "crates/misa-actuator",
+    "crates/misa-actuator-tui",
+    "crates/misa-can",
+    "crates/misa-actuator-sim",
+    "crates/misa-actuator-core",
+    "crates/lkmotor-protocol",
+    "crates/lkmotor-driver",
+    "crates/lkmotor-cli",
+    "crates/robstride-protocol",
+    "crates/robstride-driver",
+    "crates/robstride-cli",
+    "crates/damiao-protocol",
+    "crates/damiao-driver",
+    "crates/damiao-cli",
+    "crates/myactuator-protocol",
+    "crates/myactuator-driver",
+    "crates/myactuator-cli",
+    "crates/misa-sysid",
+]
+
 members = [
     "crates/misa-actuator",
     "crates/misa-actuator-tui",
+    "crates/misa-can",
+    "crates/misa-actuator-sim",
+    "crates/misa-actuator-core",
     "crates/lkmotor-protocol",
     "crates/lkmotor-driver",
     "crates/lkmotor-cli",
@@ -28,6 +59,9 @@ repository = "https://github.com/kasai-takara/misa-actuator"
 [workspace.dependencies]
 # Workspace-internal crates
 misa-actuator = { path = "crates/misa-actuator", version = "0.1.0" }
+misa-can = { path = "crates/misa-can", version = "0.1.0" }
+misa-actuator-sim = { path = "crates/misa-actuator-sim", version = "0.1.0" }
+misa-actuator-core = { path = "crates/misa-actuator-core", version = "0.1.0" }
 lkmotor-protocol = { path = "crates/lkmotor-protocol", version = "0.1.0" }
 lkmotor-driver = { path = "crates/lkmotor-driver", version = "0.1.0" }
 robstride-protocol = { path = "crates/robstride-protocol", version = "0.1.0" }

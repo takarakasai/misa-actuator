@@ -1,6 +1,6 @@
 //! Drive several DAMIAO motors split across two buses from a single loop.
 //!
-//! Wiring assumed: `can0` and `can1` each carry two DM-J4310 motors with
+//! Wiring assumed: two CAN interfaces each carry two DM-J4310 motors with
 //! `CAN_ID` 1 and 2 and the `MST_ID = 0x10 + CAN_ID` convention (so MST_IDs
 //! `0x11` / `0x12`). Assign IDs first with `damiao-cli set-id` (one motor at a
 //! time), then:
@@ -16,13 +16,22 @@ use std::error::Error;
 use std::thread;
 use std::time::Duration;
 
-use damiao_driver::{DamiaoMotor, MotorModel, Shared, SocketCanBus};
+use damiao_driver::{AnyCanBus, DamiaoMotor, MotorModel, Shared};
 use misa_actuator::{Actuator, RunMode};
+
+/// The two interfaces to drive. `can0`/`can1` on Linux; on Windows use a
+/// two-channel PEAK adapter (`pcan:usb1`, `pcan:usb2`) or two SLCAN dongles
+/// (`slcan:COM5`, `slcan:COM6`).
+const INTERFACES: [&str; 2] = if cfg!(target_os = "linux") {
+    ["can0", "can1"]
+} else {
+    ["pcan:usb1", "pcan:usb2"]
+};
 
 fn main() -> Result<(), Box<dyn Error>> {
     // One shared bus per physical interface.
-    let bus0 = Shared::new(SocketCanBus::open("can0")?);
-    let bus1 = Shared::new(SocketCanBus::open("can1")?);
+    let bus0 = Shared::new(AnyCanBus::open(INTERFACES[0])?);
+    let bus1 = Shared::new(AnyCanBus::open(INTERFACES[1])?);
 
     // Several motors per bus; each gets a clone of its bus and a unique MST_ID.
     let mut motors: Vec<Box<dyn Actuator + Send>> = vec![

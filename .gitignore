@@ -15,3 +15,22 @@
 # tracked; .gitignore does not untrack existing files.
 crates/*/ref/*.pdf
 crates/*/ref/sdk/
+
+# GUI front end: npm-managed and generated. `ui/dist` is embedded into the
+# Tauri binary at compile time, so building `misa-actuator-gui` needs
+# `cd ui && npm ci && npm run build` first — see the README. Every other crate
+# builds with nothing but a Rust toolchain (the workspace's `default-members`
+# keeps it that way).
+/ui/node_modules/
+/ui/dist/
+
+# Tauri regenerates these from tauri.conf.json on every build (build.rs calls
+# tauri_build::build()), so committing them only produces diff noise whenever
+# the config or the Tauri version changes.
+/crates/misa-actuator-gui/gen/schemas/
+
+# Stray build transcripts, e.g. `cargo build | Tee-Object -FilePath build.log`,
+# and the Vite dev server's redirected output.
+/build.log
+/ui/vite.log
+/ui/vite.err

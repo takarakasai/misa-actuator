@@ -33,6 +33,7 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use misa_actuator::realtime::sleep_precise;
 use misa_actuator::{Actuator, MotorFeedback, Result, RunMode};
 
 use crate::limits::{AbortReason, Guard, SafetyLimits};
@@ -422,7 +423,7 @@ pub fn run_load_map(
                 stop = Some(r);
                 break;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            sleep_precise(Duration::from_millis(5));
         }
         if stop.is_some() {
             points.push(Point::from(t0.elapsed().as_secs_f32(), target, &fb));
@@ -450,7 +451,7 @@ pub fn run_load_map(
                 stop = Some(r);
                 break;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            sleep_precise(Duration::from_millis(5));
         }
         spreads.push(acc.torque_spread());
         points.push(acc.into_point(t0.elapsed().as_secs_f32(), target));
@@ -655,7 +656,7 @@ pub fn run_breakaway(
         if Instant::now() >= rest_deadline || abort.load(Ordering::Relaxed) {
             break false;
         }
-        std::thread::sleep(period);
+        sleep_precise(period);
         fb = act.set_torque(0.0)?;
     };
 
@@ -707,7 +708,7 @@ pub fn run_breakaway(
             break;
         }
         if let Some(rem) = period.checked_sub(iter_start.elapsed()) {
-            std::thread::sleep(rem);
+            sleep_precise(rem);
         }
     }
 
@@ -876,7 +877,7 @@ pub fn run_thermal(
             break;
         }
         if let Some(rem) = period.checked_sub(iter_start.elapsed()) {
-            std::thread::sleep(rem);
+            sleep_precise(rem);
         }
     }
 
@@ -1052,7 +1053,7 @@ pub fn run_kt(
                 stop = Some(r);
                 break;
             }
-            std::thread::sleep(period);
+            sleep_precise(period);
         }
         points.push(Point::from(t0.elapsed().as_secs_f32(), level, &fb));
         if stop.is_some() {
@@ -1260,7 +1261,7 @@ pub fn run_breakaway_map(
                 break;
             }
             fb = act.set_position(target, spec.travel_speed_rad_s)?;
-            std::thread::sleep(Duration::from_millis(5));
+            sleep_precise(Duration::from_millis(5));
         }
 
         let dirs: Vec<Direction> = if spec.both_directions {
@@ -1500,7 +1501,7 @@ pub fn run_velocity_sweep(
                 return Ok(None);
             }
             if let Some(rem) = period.checked_sub(iter_start.elapsed()) {
-                std::thread::sleep(rem);
+                sleep_precise(rem);
             }
         }
     };

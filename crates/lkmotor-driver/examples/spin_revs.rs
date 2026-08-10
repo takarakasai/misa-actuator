@@ -25,7 +25,7 @@ const ENC_HALF: i32 = ENC_FULL / 2;
 #[derive(Parser, Debug)]
 #[command(about = "Spin until the output shaft rotates N revolutions (encoder-judged)")]
 struct Args {
-    #[arg(short, long, default_value = "/dev/ttyUSB0")]
+    #[arg(short, long, default_value = lkmotor_driver::default_serial_port())]
     device: String,
     #[arg(short, long, default_value_t = 1_000_000)]
     baud: u32,

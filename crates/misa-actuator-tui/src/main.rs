@@ -6,6 +6,9 @@
 //! # Robstride RS-05 on SocketCAN can0, motor id 1
 //! misa-actuator-tui --driver robstride --interface can0 --motor-id 1 --model Edulite05
 //!
+//! # ...the same motor on Windows, through a PEAK adapter
+//! misa-actuator-tui --driver robstride --interface pcan:usb1 --motor-id 1 --model Edulite05
+//!
 //! # LK Motor V3 on /dev/ttyUSB0 @ 1 Mbps, motor id 1, 1:10 gearbox
 //! misa-actuator-tui --driver lkmotor --interface /dev/ttyUSB0 --motor-id 1 --baud 1000000 --gear-ratio 10.0
 //!
@@ -40,8 +43,9 @@ struct Cli {
     #[arg(long, value_enum)]
     driver: DriverKind,
 
-    /// Bus interface — SocketCAN name (`can0`) for robstride, or serial
-    /// device path (`/dev/ttyUSB0`) for lkmotor.
+    /// Bus interface. For the CAN drivers: `can0` (Linux SocketCAN),
+    /// `pcan:usb1` (PEAK adapter on Windows) or `slcan:COM5` (USB-CAN
+    /// adapter). For lkmotor: a serial port (`/dev/ttyUSB0`, `COM5`).
     #[arg(long)]
     interface: String,
 
@@ -50,8 +54,10 @@ struct Cli {
     motor_id: u8,
 
     // -- robstride-only --
-    /// Robstride: motor model name (`RS-05`, `Edulite05`, ...).
-    #[arg(long, default_value = "Edulite05")]
+    /// Robstride: motor model name (`RS-04`, `EduLite05`, ...) — required,
+    /// since it sets the MIT quantisation range and the family spans ±5.5 to
+    /// ±120 N·m. Damiao: optional model override. Sim: preset name.
+    #[arg(long, default_value = misa_actuator_tui::factory::MODEL_UNSPECIFIED)]
     model: String,
     /// Robstride: host CAN ID.
     #[arg(long, default_value_t = robstride_driver::DEFAULT_HOST_ID)]
@@ -81,6 +87,9 @@ struct Cli {
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // Windows sleeps round up to the ~15.6 ms scheduler tick by default,
+    // which would throttle every timed loop below. No-op on Linux.
+    let _timer = misa_actuator::realtime::TimerResolutionGuard::acquire();
 
     let cli = Cli::parse();
     let cfg = DriverConfig {

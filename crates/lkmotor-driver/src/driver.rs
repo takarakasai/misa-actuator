@@ -31,7 +31,10 @@ pub struct Rs485Driver {
 impl Rs485Driver {
     /// Open the serial port and prepare the bus.
     pub fn open(device: &str, baud: u32, response_timeout: Duration) -> Result<Self> {
-        let port = serialport::new(device, baud)
+        // Windows needs `\\.\COM12` for two-digit ports; a bare name would
+        // fail to open with a bare "not found".
+        let device = crate::serial::normalize_port_name(device);
+        let port = serialport::new(&device, baud)
             .timeout(READ_POLL_TIMEOUT)
             .data_bits(serialport::DataBits::Eight)
             .parity(serialport::Parity::None)

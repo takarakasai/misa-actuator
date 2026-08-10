@@ -3,15 +3,14 @@
 //! V3 traffic is carried as **standard 11-bit** CAN frames with an 8-byte
 //! payload at 1 Mbps. The [`MyActuatorBus`] trait captures the wire I/O so the
 //! driver can also run over mocks (tests) or future transports (the protocol
-//! also exists on RS485); [`SocketCanBus`] is the Linux SocketCAN
-//! implementation.
+//! also exists on RS485). [`CanBus`] adapts any [`misa_can`] transport —
+//! Linux SocketCAN, a PEAK adapter on Windows, or an SLCAN dongle — to that
+//! trait.
 
-use std::io;
 use std::time::Duration;
 
-use socketcan::{CanSocket, EmbeddedFrame, Id, Socket, StandardId};
-
 use misa_actuator::Shared;
+use misa_can::{OpenOptions, StandardId};
 
 use crate::error::{Error, Result};
 
@@ -42,8 +41,8 @@ pub trait MyActuatorBus {
 /// clone. Access is serialized by the mutex — drive the motors from a single
 /// control loop per bus.
 ///
-/// Note: [`MyActuatorBus::set_timeout`] here affects the *shared* socket, so
-/// the last value set wins across all motors on the bus.
+/// Note: [`MyActuatorBus::set_timeout`] here affects the *shared* transport,
+/// so the last value set wins across all motors on the bus.
 impl<B: MyActuatorBus> MyActuatorBus for Shared<B> {
     fn send(&mut self, can_id: u16, data: &[u8]) -> Result<()> {
         self.lock().send(can_id, data)
@@ -58,67 +57,85 @@ impl<B: MyActuatorBus> MyActuatorBus for Shared<B> {
     }
 }
 
-/// Build a standard-id from a `u16`, rejecting ids above 0x7FF.
-fn std_id(can_id: u16) -> Result<StandardId> {
-    StandardId::new(can_id).ok_or(Error::InvalidFrame("CAN ID exceeds 11 bits"))
+/// Adapter presenting any [`misa_can::CanBus`] as a [`MyActuatorBus`].
+pub struct CanBus<T: misa_can::CanBus> {
+    inner: T,
 }
 
-/// SocketCAN-backed classic-CAN implementation (Linux only).
-pub struct SocketCanBus {
-    socket: CanSocket,
-    timeout: Duration,
-}
+/// The bus [`crate::MyActuatorMotor::open`] produces.
+pub type AnyCanBus = CanBus<Box<dyn misa_can::CanBus>>;
 
-impl SocketCanBus {
-    /// Open a classic-CAN SocketCAN interface (e.g. `"can0"`).
+impl AnyCanBus {
+    /// Open whichever CAN transport `interface` names.
+    ///
+    /// | interface | transport |
+    /// |-----------|-----------|
+    /// | `can0` | Linux SocketCAN |
+    /// | `pcan:usb1` | PEAK PCAN-Basic (Windows) |
+    /// | `slcan:COM5` / `slcan:/dev/ttyACM0` | USB-CAN adapter |
+    ///
+    /// RMD V3 motors ship at 1 Mbit/s, which is the default.
     pub fn open(interface: &str) -> Result<Self> {
-        let socket = CanSocket::open(interface)?;
-        let timeout = Duration::from_millis(100);
-        socket.set_read_timeout(timeout)?;
-        Ok(Self { socket, timeout })
+        Self::open_with(interface, &OpenOptions::classic())
     }
 
-    /// Borrow the underlying SocketCAN handle.
-    pub fn socket(&self) -> &CanSocket {
-        &self.socket
+    /// Open with explicit transport options (timeout, CAN-FD).
+    pub fn open_with(interface: &str, opts: &OpenOptions) -> Result<Self> {
+        Ok(Self {
+            inner: misa_can::open(interface, opts).map_err(map_err)?,
+        })
     }
 }
 
-impl MyActuatorBus for SocketCanBus {
+impl<T: misa_can::CanBus> CanBus<T> {
+    /// Wrap an already-open transport.
+    pub fn new(inner: T) -> Self {
+        Self { inner }
+    }
+
+    /// Borrow the underlying transport.
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    /// What is actually open, e.g. `PCAN_USBBUS1 (CAN, 1000000 bit/s)`.
+    pub fn description(&self) -> String {
+        self.inner.description()
+    }
+}
+
+impl<T: misa_can::CanBus> MyActuatorBus for CanBus<T> {
     fn send(&mut self, can_id: u16, data: &[u8]) -> Result<()> {
-        let frame = socketcan::CanFrame::new(Id::Standard(std_id(can_id)?), data)
-            .ok_or(Error::InvalidFrame("payload too long for classic CAN frame"))?;
-        self.socket.write_frame(&frame)?;
-        Ok(())
+        let id = StandardId::new(can_id).ok_or(Error::InvalidFrame("CAN ID exceeds 11 bits"))?;
+        let frame = misa_can::Frame::new(id, data).map_err(map_err)?;
+        self.inner.send(&frame).map_err(map_err)
     }
 
     fn recv(&mut self) -> Result<CanFrame> {
         loop {
-            match self.socket.read_frame() {
-                Ok(frame) => match frame.id() {
-                    Id::Standard(s) => {
-                        return Ok(CanFrame {
-                            can_id: s.as_raw(),
-                            data: frame.data().to_vec(),
-                        });
-                    }
-                    // Extended frame — not MyActuator, keep waiting.
-                    Id::Extended(_) => {}
-                },
-                Err(ref e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut =>
-                {
-                    return Err(Error::Timeout { motor_id: 0 });
-                }
-                Err(e) => return Err(Error::CanSocket(e)),
-            }
+            let frame = self.inner.recv().map_err(map_err)?;
+            // MyActuator only uses 11-bit ids; an extended frame belongs to
+            // another family sharing the wire (e.g. RobStride).
+            let Some(can_id) = frame.standard_id() else {
+                continue;
+            };
+            return Ok(CanFrame {
+                can_id,
+                data: frame.data().to_vec(),
+            });
         }
     }
 
     fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
-        self.socket.set_read_timeout(timeout)?;
-        self.timeout = timeout;
-        Ok(())
+        self.inner.set_timeout(timeout).map_err(map_err)
+    }
+}
+
+/// Map a transport error onto the driver's own error type, keeping the
+/// timeout case distinguishable — the driver's retry loops match on it.
+fn map_err(e: misa_can::Error) -> Error {
+    match e {
+        misa_can::Error::Timeout => Error::Timeout { motor_id: 0 },
+        other => Error::Bus(other),
     }
 }

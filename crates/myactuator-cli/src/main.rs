@@ -1,7 +1,10 @@
 //! Test CLI for the `myactuator-driver` crate (MyActuator RMD, CAN V3).
 //!
+//! `-i` names the CAN interface: `can0` on Linux, `pcan:usb1` for a PEAK
+//! adapter on Windows, `slcan:COM5` for a USB-CAN dongle on either.
+//!
 //! ```text
-//! sudo ip link set can0 type can bitrate 1000000 up
+//! sudo ip link set can0 type can bitrate 1000000 up      # Linux only
 //! myactuator-cli -i can0 scan
 //! myactuator-cli -i can0 -m 1 status
 //! myactuator-cli -i can0 -m 1 move-to 1.57 --speed 2 --duration 3
@@ -23,7 +26,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use myactuator_driver::{scan_bus_on, MotorConfig, MotorFeedback, MyActuatorMotor};
+use myactuator_driver::{dump_bus_on, scan_bus_on, MotorConfig, MotorFeedback, MyActuatorMotor};
 use myactuator_protocol::{AccelIndex, ParamIndex};
 
 /// clap-friendly mirror of [`AccelIndex`] (kept in `myactuator-protocol`,
@@ -50,8 +53,10 @@ impl From<AccelArg> for AccelIndex {
 #[derive(Parser, Debug)]
 #[command(version, about = "Test CLI for MyActuator RMD servo motors (CAN V3)")]
 struct Cli {
-    /// SocketCAN interface name (e.g. can0).
-    #[arg(short, long, default_value = "can0")]
+    /// CAN interface: `can0` (Linux SocketCAN), `pcan:usb1` (PEAK adapter on
+    /// Windows) or `slcan:COM5` (USB-CAN adapter). Append `@500K` to override
+    /// the 1 Mbit/s default bitrate.
+    #[arg(short, long, default_value = misa_can::default_interface())]
     interface: String,
 
     /// Motor id on the bus (1..=32).
@@ -60,8 +65,21 @@ struct Cli {
 
     /// Output-frame torque constant Kt (N·m/A). 0 = current-units mode: the
     /// torque API carries amps instead of N·m.
-    #[arg(long, default_value_t = 0.0)]
+    ///
+    /// Prefer `--refresh-kt`: the motor knows this value and you do not have
+    /// to be right about it.
+    #[arg(long, default_value_t = 0.0, conflicts_with = "refresh_kt")]
     kt: f32,
+
+    /// Read the torque constant from the motor (`KT_OUT`, 0xC0) instead of
+    /// taking it from `--kt`.
+    ///
+    /// Kt scales torque in both directions, so a wrong one is silently wrong
+    /// rather than an error — and there is no model name to look a datasheet
+    /// value up by, because the documented `0xB5` "motor model" command comes
+    /// back empty on this firmware. A real RMD reports 1.1 N·m/A.
+    #[arg(long)]
+    refresh_kt: bool,
 
     /// Per-request timeout, in ms.
     #[arg(long, default_value_t = 100)]
@@ -81,6 +99,24 @@ enum Command {
         /// Last id to probe.
         #[arg(long, default_value_t = 32)]
         to: u8,
+    },
+    /// Passively listen on the bus and print every frame as it arrives,
+    /// decoded into MyActuator ids and command codes.
+    ///
+    /// Sends nothing. Use it to watch what another tool (MYACTUATOR Setup
+    /// Software, a vendor SDK) puts on the wire while you drive its UI — put
+    /// this adapter and the other one on the same CANH/CANL/GND at the same
+    /// bitrate, start the capture, then press the button you want to
+    /// understand.
+    ///
+    /// Ctrl-C ends the capture early and keeps what was printed.
+    Dump {
+        /// Listen duration (s).
+        #[arg(long, default_value_t = 30.0)]
+        duration: f32,
+        /// Print raw ids only, without the command decode.
+        #[arg(long)]
+        raw: bool,
     },
     /// One-shot measurement (0x92 position + 0x9C state) and Status1 health.
     Status,
@@ -226,8 +262,60 @@ enum Command {
     },
 }
 
+/// One captured frame, decoded into the MyActuator id layout and command byte.
+///
+/// The ASCII column earns its place here: the model name comes back as
+/// five-character chunks of a `0xB5` reply, and spotting `RMD-X` in a hex dump
+/// by eye is needless work.
+fn print_dump_frame(t: Duration, id: u16, data: &[u8], raw: bool) {
+    use myactuator_protocol::can_id::{
+        COMMAND_BASE, MOTION_BASE, MOTION_REPLY_BASE, MULTI_MOTOR_ID, REPLY_BASE,
+    };
+
+    let hex = data
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if raw {
+        println!("{:9.3}  0x{id:03X}  {hex}", t.as_secs_f64() * 1000.0);
+        return;
+    }
+
+    let channel = match id {
+        MULTI_MOTOR_ID => "broadcast".to_string(),
+        i if (COMMAND_BASE + 1..=COMMAND_BASE + 32).contains(&i) => {
+            format!("cmd -> motor {}", i - COMMAND_BASE)
+        }
+        i if (REPLY_BASE + 1..=REPLY_BASE + 32).contains(&i) => {
+            format!("reply <- motor {}", i - REPLY_BASE)
+        }
+        i if (MOTION_BASE + 1..=MOTION_BASE + 32).contains(&i) => {
+            format!("motion -> motor {}", i - MOTION_BASE)
+        }
+        i if (MOTION_REPLY_BASE + 1..=MOTION_REPLY_BASE + 32).contains(&i) => {
+            format!("motion <- motor {}", i - MOTION_REPLY_BASE)
+        }
+        _ => "?".to_string(),
+    };
+    // Byte 0 is the command code on every single-motor frame, in both
+    // directions — the motor echoes it back.
+    let cmd = data.first().map_or_else(String::new, |c| format!("0x{c:02X}"));
+    let ascii: String = data
+        .iter()
+        .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
+        .collect();
+    println!(
+        "{:9.3}  0x{id:03X}  {channel:<22}  {cmd:<9}  {hex:<23}  |{ascii}|",
+        t.as_secs_f64() * 1000.0
+    );
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // Windows sleeps round up to the ~15.6 ms scheduler tick by default,
+    // which would throttle every timed loop below. No-op on Linux.
+    let _timer = misa_actuator::realtime::TimerResolutionGuard::acquire();
     let cli = Cli::parse();
 
     let config = if cli.kt > 0.0 {
@@ -239,7 +327,39 @@ fn main() -> Result<()> {
         .with_context(|| format!("failed to open CAN interface {}", cli.interface))?;
     motor.set_timeout(Duration::from_millis(cli.timeout_ms))?;
 
+    if cli.refresh_kt {
+        let kt = motor
+            .refresh_torque_constant()
+            .context("failed to read KT_OUT from the motor")?;
+        eprintln!("Kt from the motor: {kt} N·m/A");
+    }
+
     match &cli.command {
+        Command::Dump { duration, raw } => {
+            let stop = Arc::new(AtomicBool::new(false));
+            {
+                let s = stop.clone();
+                let _ = ctrlc::set_handler(move || s.store(true, Ordering::SeqCst));
+            }
+            eprintln!(
+                "listening on {} for {duration:.0}s (Ctrl-C to stop early) — \
+                 nothing is transmitted",
+                cli.interface
+            );
+            if !raw {
+                println!(
+                    "{:>9}  {:>5}  {:<22}  {:<9}  {:<23}  ascii",
+                    "t [ms]", "id", "channel", "cmd", "data"
+                );
+            }
+            let n = dump_bus_on(
+                motor.bus(),
+                Duration::from_secs_f32(*duration),
+                &|| stop.load(Ordering::SeqCst),
+                &mut |t, id, data| print_dump_frame(t, id, data, *raw),
+            )?;
+            eprintln!("captured {n} frame(s)");
+        }
         Command::Scan { from, to } => {
             if to < from {
                 bail!("--to must be >= --from");
@@ -295,7 +415,14 @@ fn main() -> Result<()> {
             } else {
                 None
             };
-            print!("model={} (empty if unsupported by this firmware)  ", if model.is_empty() { "<none>" } else { &model });
+            // Only caveat an answer that is actually missing. Tagging a real
+            // model name with "empty if unsupported" reads as doubt about a
+            // value the motor stated plainly.
+            if model.is_empty() {
+                print!("model=<none> (neither 0xB5 form answered)  ");
+            } else {
+                print!("model={model}  ");
+            }
             match guess {
                 Some((ymd, rev)) => println!(
                     "raw version={date}  guessed date={:04}-{:02}-{:02} rev={rev:02}",
@@ -418,6 +545,7 @@ fn main() -> Result<()> {
             let r = control_loop(Some(*duration), || motor.set_velocity(*velocity));
             motor.stop()?;
             r?;
+            print_settled(&mut motor);
         }
         Command::MoveTo {
             position,
@@ -428,11 +556,13 @@ fn main() -> Result<()> {
             let r = control_loop(Some(*duration), || motor.set_position(*position, *speed));
             motor.stop()?;
             r?;
+            print_settled(&mut motor);
         }
         Command::Torque { value, duration } => {
             let r = control_loop(Some(*duration), || motor.set_torque(*value));
             motor.stop()?;
             r?;
+            print_settled(&mut motor);
         }
         Command::Characterize {
             what,
@@ -1228,7 +1358,7 @@ where
         match tick() {
             Ok(fb) => {
                 if last_print.elapsed() >= Duration::from_millis(200) {
-                    println!("{}", fmt_fb(fb));
+                    println!("{}", fmt_fb_coarse(fb));
                     last_print = Instant::now();
                 }
             }
@@ -1238,15 +1368,45 @@ where
             }
         }
         if let Some(rem) = period.checked_sub(loop_start.elapsed()) {
-            std::thread::sleep(rem);
+            misa_actuator::realtime::sleep_precise(rem);
         }
     }
     Ok(())
 }
 
+/// Where the shaft actually ended up, read at full resolution.
+///
+/// The loop above prints the coarse 1°/LSB position that control replies
+/// carry; this asks `0x92` (0.01°/LSB) once the motion is over, so the number
+/// you judge the move by is the accurate one. Reported, not fatal — a failed
+/// read here says nothing about whether the move succeeded.
+fn print_settled<B: myactuator_driver::MyActuatorBus>(
+    motor: &mut myactuator_driver::MyActuatorMotor<B>,
+) {
+    match motor.measure() {
+        Ok(fb) => println!("settled: {}", fmt_fb(fb)),
+        Err(e) => eprintln!("settled position unavailable: {e}"),
+    }
+}
+
 fn fmt_fb(fb: MotorFeedback) -> String {
     format!(
         "pos={:+.3} rad  vel={:+.3} rad/s  tau={:+.3} Nm  iq={:+.2} A  T={} °C",
+        fb.position_rad, fb.velocity_rad_per_s, fb.torque_nm, fb.current_a, fb.temperature_c
+    )
+}
+
+/// Position out of a control reply, printed at the precision it actually has.
+///
+/// Control replies (`0x9C`) carry the angle at **1°/LSB**, so the position in
+/// them is good to about 0.017 rad — three decimals is false precision. On a
+/// small move that reads as a large error: a `move-to 0.1` that lands exactly
+/// on target displays as `+0.116`, which looks like a 16% overshoot and is
+/// really one count of quantisation. Two decimals, plus an explicit final
+/// reading from `0x92` (0.01°/LSB) once the move is done.
+fn fmt_fb_coarse(fb: MotorFeedback) -> String {
+    format!(
+        "pos={:+.2} rad (±0.02, 1°/LSB)  vel={:+.3} rad/s  tau={:+.3} Nm  iq={:+.2} A  T={} °C",
         fb.position_rad, fb.velocity_rad_per_s, fb.torque_nm, fb.current_a, fb.temperature_c
     )
 }

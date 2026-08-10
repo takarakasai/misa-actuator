@@ -11,8 +11,9 @@
 //!
 //! - **Bus / transport (per family)**: each motor family defines its own
 //!   bus trait (e.g. `LkBus`, `RobstrideBus`) because the wire formats
-//!   differ. Concrete implementations exist for RS485, SocketCAN, and in
-//!   the future EtherCAT / USB-CAN.
+//!   differ. The CAN families sit on `misa-can`, which carries their frames
+//!   over SocketCAN (Linux), PCAN-Basic (Windows) or SLCAN (either); LK Motor
+//!   uses RS485 directly.
 //! - **Driver (per family)**: `LkMotor<B: LkBus>`, `RobstrideMotor<B: RobstrideBus>`
 //!   etc. — generic over the bus, hold the per-motor state (id, gear ratio,
 //!   torque constant, MIT scales, position anchor, ...).
@@ -29,10 +30,12 @@
 
 pub mod error;
 pub mod feedback;
+pub mod realtime;
 pub mod shared;
 pub mod traits;
 
 pub use error::{Error, Result};
 pub use feedback::{ErrorFlags, MotorFeedback, MotorStatus, RunMode};
+pub use realtime::{sleep_precise, sleep_until, TimerResolutionGuard};
 pub use shared::Shared;
 pub use traits::Actuator;

@@ -9,3 +9,4 @@ description = "Common actuator-control trait, SI-unit feedback types, and unifie
 
 [dependencies]
 thiserror = { workspace = true }
+log = { workspace = true }

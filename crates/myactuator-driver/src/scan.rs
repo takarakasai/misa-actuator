@@ -17,6 +17,37 @@ pub type ScanProgress<'a> = &'a mut dyn FnMut(usize, usize, u8);
 
 /// Probe each id in `id_range` and return those that answered. Ids outside
 /// 1..=32 are skipped (never probed, never reported).
+/// Listen passively on `bus` and hand each frame to `on_frame` as it arrives,
+/// with the time since the capture started.
+///
+/// Sends nothing. Streaming rather than collect-then-return because the reason
+/// to run this is usually to watch what another tool puts on the bus while you
+/// drive its UI, and output that only appears after the window closes cannot
+/// be correlated with the button you pressed.
+pub fn dump_bus_on<B: MyActuatorBus>(
+    bus: &mut B,
+    duration: Duration,
+    should_stop: &dyn Fn() -> bool,
+    on_frame: &mut dyn FnMut(Duration, u16, &[u8]),
+) -> Result<usize> {
+    // Short poll so the deadline and `should_stop` are both honoured promptly
+    // on a quiet bus.
+    bus.set_timeout(Duration::from_millis(50))?;
+    let mut count = 0usize;
+    let start = Instant::now();
+    while start.elapsed() < duration && !should_stop() {
+        match bus.recv() {
+            Ok(frame) => {
+                on_frame(start.elapsed(), frame.can_id, &frame.data);
+                count += 1;
+            }
+            Err(Error::Timeout { .. }) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(count)
+}
+
 pub fn scan_bus_on<B: MyActuatorBus>(
     bus: &mut B,
     id_range: RangeInclusive<u8>,

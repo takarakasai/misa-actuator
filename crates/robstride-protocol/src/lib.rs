@@ -3,7 +3,7 @@
 //! This crate is `no_std` and performs no I/O. It encodes request frames into
 //! the fixed 8-byte payload of an extended (29-bit) CAN frame, and decodes
 //! response frames from a borrowed slice. Wire I/O is the responsibility of
-//! the consumer (see the `robstride` crate for a `socketcan`-backed driver).
+//! the consumer (see the `robstride-driver` crate for a `misa-can`-backed driver).
 //!
 //! # Wire format
 //!
@@ -53,12 +53,14 @@ pub use can_id::{build_can_id, build_can_id_raw, parse_can_id};
 pub use comm_type::{CommType, RunMode};
 pub use feedback::{MotorFeedback, MotorStatusBits, parse_param_response, parse_status_frame};
 pub use frame::{
-    DATA_LEN, build_disable_frame, build_enable_frame, build_mit_frame, build_ping_frame,
-    build_read_param_frame, build_run_mode_frame, build_set_device_id_frame, build_set_zero_frame,
-    build_write_param_f32_frame, build_write_param_i8_frame,
+    DATA_LEN, VERSION_REPLY_PREFIX, VERSION_REQUEST_PREFIX, VersionReply, build_disable_frame,
+    build_enable_frame, build_mit_frame, build_ping_frame, build_read_param_frame,
+    build_run_mode_frame, build_set_device_id_frame, build_set_zero_frame,
+    build_version_read_frame, build_write_param_f32_frame, build_write_param_i8_frame,
+    is_version_request, parse_version_reply,
 };
 pub use mit::{decode_mit_signed, decode_mit_unsigned, encode_mit_signed, encode_mit_unsigned};
-pub use model::{MitScales, MotorModel};
+pub use model::{BuildName, CatalogueName, MitScales, MotorModel, ProductLine, ReportedLimits};
 pub use param::ParamIndex;
 pub use param_table::{
     build_read_param_frame_ext, build_read_param_table_frame, parse_param_table_frame,

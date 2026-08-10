@@ -36,7 +36,7 @@ use lkmotor_driver::LkCommands;
 #[derive(Parser, Debug)]
 #[command(about = "Position-mode (0xA4) chirp stability test — exercises the motor's internal position PID")]
 struct Args {
-    #[arg(short, long, default_value = "/dev/ttyUSB0")]
+    #[arg(short, long, default_value = lkmotor_driver::default_serial_port())]
     device: String,
     #[arg(short, long, default_value_t = 1_000_000)]
     baud: u32,

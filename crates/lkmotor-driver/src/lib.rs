@@ -4,7 +4,8 @@
 //!
 //! - [`bus::LkBus`] — application-level request/response trait. Concrete
 //!   implementations exist for RS485 ([`Rs485Driver`]); future CAN
-//!   transports plug in here.
+//!   transports plug in here. RS485 runs on Linux and Windows alike — only
+//!   the port name differs (`/dev/ttyUSB0` vs. `COM5`), see [`serial`].
 //! - [`bus::LkCommands`] — typed command helpers (`read_state2`,
 //!   `torque_control`, ...) automatically available on any `LkBus`.
 //! - [`Motor`] — owns per-motor state (encoder turn tracker, gear ratio,
@@ -30,10 +31,12 @@ pub mod error;
 pub mod lk_motor;
 pub mod motor;
 pub mod motor_id;
+pub mod serial;
 
 pub use bus::{LkBus, LkCommands, Response, parse_state2_from_response};
 pub use lkmotor_protocol::SettingParamId;
 pub use driver::Rs485Driver;
+pub use serial::{default_serial_port, list_ports, normalize_port_name};
 pub use error::{Error, Result};
 pub use lk_motor::{LkMotor, PositionAnchor};
 pub use motor::{ErrorFlags, Motor, MotorConfig, MotorFeedback, MotorStatus};

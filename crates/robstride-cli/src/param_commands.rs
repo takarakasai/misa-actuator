@@ -11,12 +11,178 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use robstride_driver::{lookup_param_type, Motor, ParamIndex, ParamType, TypedValue};
+use robstride_driver::{
+    lookup_param_type, BuildName, Motor, MotorModel, ParamIndex, ParamType, TypedValue,
+};
 use serde::Serialize;
 
 pub fn run_version(motor: &mut Motor, motor_id: u8, timeout_ms: u64) -> Result<()> {
     let version = motor.read_firmware_version(Duration::from_millis(timeout_ms))?;
     println!("motor={motor_id}  AppCodeVersion={version}");
+    Ok(())
+}
+
+/// Print everything the motor can be made to say about which model it is.
+///
+/// Deliberately shows the evidence rather than just a verdict. The strong
+/// route (a self-reported name) is unwritten on at least one real unit, and
+/// the fallback can only rule models out — an operator deciding whether to
+/// trust the answer needs to see which of those they got, and the raw bytes of
+/// any row that came back illegible.
+pub fn run_identify(
+    motor: &mut Motor,
+    selected: Option<MotorModel>,
+    deep: bool,
+    timeout_ms: u64,
+) -> Result<()> {
+    match selected {
+        Some(m) => println!("opened as {m}"),
+        None => println!("no --model given — reporting evidence only"),
+    }
+
+    // The version read is what the vendor tool actually sends when it decides
+    // a motor's type, so it goes first and its raw bytes are shown — byte 7 is
+    // undocumented and is the only unexplained field left in that exchange.
+    let mut from_version = None;
+    match motor.read_version() {
+        Ok(v) => {
+            print!(
+                "\nversion read (comm type 26): {v}  [trailing byte 0x{:02X}]",
+                v.trailing
+            );
+            match MotorModel::from_firmware_version(v.version) {
+                Some((model, line)) => {
+                    println!("  → {}", line.catalogue_name(model));
+                    from_version = Some(model);
+                }
+                None => println!("  (no model in this version)"),
+            }
+        }
+        Err(e) => println!("\nversion read (comm type 26): no answer ({e})"),
+    }
+
+    let strings = if deep {
+        motor.read_identity_strings(Duration::from_millis(timeout_ms))
+    } else {
+        println!(
+            "\nself-reported names: skipped (pass --deep). \
+             The parameter-table path truncates and has left a real RS-04 \
+             unresponsive until power-cycled."
+        );
+        Vec::new()
+    };
+    if deep && strings.is_empty() {
+        println!("\nself-reported names: no row answered");
+    } else if deep {
+        println!("\nself-reported names:");
+        for s in &strings {
+            print!("  0x{:04X} {:<13} ", s.function_code, s.label);
+            if s.is_printable() {
+                print!("{:?}", s.text);
+            } else {
+                print!("unwritten or unreadable — raw [{}]", s.raw_hex());
+            }
+            match s.model {
+                Some(m) => println!("  → {m}"),
+                None => println!(),
+            }
+        }
+    }
+
+    // The firmware version wins: it names the motor outright, where the
+    // parameter-table strings at best narrow to a product line.
+    let named = from_version.or_else(|| strings.iter().find_map(|s| s.model));
+
+    // `AppCodeName` names the product line, not the size within it — a real
+    // EduLite05 says `"EL_motor"`, with no `05` anywhere. So it narrows the
+    // field rather than answering, and saying so is the whole point.
+    let build = strings
+        .iter()
+        .find(|s| s.function_code == 0x1007 && s.is_printable());
+    let mut family = None;
+    if let Some(b) = build {
+        print!("\nfirmware build {:?} — ", b.text);
+        match MotorModel::classify_build_name(&b.text) {
+            Some(BuildName::Narrows(models)) => {
+                let names: Vec<&str> = models.iter().map(|m| m.name()).collect();
+                println!(
+                    "the {} line (the build name does not carry the size)",
+                    names.join(" / ")
+                );
+                family = Some(models);
+            }
+            Some(BuildName::Uninformative) => println!(
+                "carries no model information. The RS line reports this \
+                 verbatim on every size."
+            ),
+            None => println!("not a build name we have seen; nothing inferred from it."),
+        }
+    }
+
+    let limits = motor.read_reported_limits();
+    println!("\nreported limits:");
+    match limits.limit_torque {
+        Some(v) => println!("  limit_torque  {v} N·m"),
+        None => println!("  limit_torque  (no answer)"),
+    }
+    match limits.limit_spd {
+        Some(v) => println!("  limit_spd     {v} rad/s"),
+        None => println!("  limit_spd     (no answer)"),
+    }
+
+    println!();
+    // Intersect the two independent narrowings when both are available.
+    let candidates: Vec<&str> = limits
+        .candidates()
+        .filter(|m| family.is_none_or(|f| f.contains(m)))
+        .map(|m| m.name())
+        .collect();
+    match (named, selected) {
+        (Some(m), Some(s)) if m == s => println!("VERDICT: the motor identifies as {m} — matches."),
+        (Some(m), Some(s)) => println!(
+            "VERDICT: the motor identifies as {m}, but this session opened as {s}. \
+             Use --model {m} — MIT scaling is wrong until you do."
+        ),
+        (Some(m), None) => println!("VERDICT: the motor identifies as {m}. Use --model {m}."),
+        (None, _) if limits.is_empty() => {
+            println!("VERDICT: the motor said nothing usable. The model cannot be checked.")
+        }
+        (None, Some(s)) if !limits.consistent_with(s) => println!(
+            "VERDICT: the limits RULE OUT {s}. Consistent with: {}.",
+            if candidates.is_empty() {
+                "nothing known".to_string()
+            } else {
+                candidates.join(", ")
+            }
+        ),
+        // One survivor is an identification, not a narrowing. Saying "this
+        // rules models out; it does not confirm one" when exactly one model
+        // fits would understate real evidence.
+        (None, _) if candidates.len() == 1 => println!(
+            "VERDICT: the limits fit exactly one model in the family — {}. \
+             Nothing else quantises that far.",
+            candidates[0]
+        ),
+        (None, Some(s)) => println!(
+            "VERDICT: the limits are consistent with {s}, and with {}. \
+             That rules models out; it does not pick one.",
+            candidates
+                .iter()
+                .filter(|c| **c != s.name())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        (None, None) => println!(
+            "VERDICT: the limits are consistent with: {}. \
+             That narrows the field but does not pick one — check the label on the motor.",
+            if candidates.is_empty() {
+                "nothing known".to_string()
+            } else {
+                candidates.join(", ")
+            }
+        ),
+    }
     Ok(())
 }
 

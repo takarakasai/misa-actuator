@@ -1,15 +1,14 @@
 //! Bus scanning and passive monitoring helpers.
 //!
-//! These convenience helpers build a [`SocketCanBus`] internally. To scan
-//! over a different transport (USB-CAN, etc.), open the bus yourself and
-//! call [`scan_bus_on`].
+//! These convenience helpers build an [`AnyCanBus`] internally. To scan
+//! over a bus you already hold open, call [`scan_bus_on`].
 
 use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
 use robstride_protocol::{build_ping_frame, parse_can_id};
 
-use crate::bus::{RobstrideBus, SocketCanBus};
+use crate::bus::{AnyCanBus, RobstrideBus};
 use crate::error::{Error, Result};
 
 /// Result of probing a single motor id.
@@ -31,7 +30,7 @@ pub fn scan_bus(
     timeout_per_id: Duration,
     on_progress: Option<ScanProgress<'_>>,
 ) -> Result<Vec<ScanResult>> {
-    let mut bus = SocketCanBus::open(interface)?;
+    let mut bus = AnyCanBus::open(interface)?;
     scan_bus_on(&mut bus, host_id, id_range, timeout_per_id, on_progress)
 }
 
@@ -90,16 +89,44 @@ pub fn scan_bus_on<B: RobstrideBus>(
 
 /// Passively listen on the bus and return every frame seen during `duration`.
 pub fn dump_bus(interface: &str, duration: Duration) -> Result<Vec<(u32, Vec<u8>)>> {
-    let mut bus = SocketCanBus::open(interface)?;
-    bus.set_timeout(Duration::from_millis(100))?;
     let mut frames = Vec::new();
+    dump_bus_streaming(interface, duration, &|| false, &mut |_, id, data| {
+        frames.push((id, data.to_vec()))
+    })?;
+    Ok(frames)
+}
+
+/// Listen passively and hand each frame to `on_frame` as it arrives, with the
+/// time since capture started.
+///
+/// Streaming rather than collect-then-return because the reason to run this is
+/// usually to watch what another tool puts on the bus while you drive its UI —
+/// output that appears only after the capture window closes is useless for
+/// correlating "I pressed the button" with "these frames appeared".
+///
+/// `should_stop` is polled between frames so a Ctrl-C can end the capture
+/// early without losing what was already printed.
+pub fn dump_bus_streaming(
+    interface: &str,
+    duration: Duration,
+    should_stop: &dyn Fn() -> bool,
+    on_frame: &mut dyn FnMut(Duration, u32, &[u8]),
+) -> Result<usize> {
+    let mut bus = AnyCanBus::open(interface)?;
+    // Short poll so `should_stop` and the deadline are both honoured promptly
+    // on a quiet bus.
+    bus.set_timeout(Duration::from_millis(50))?;
+    let mut count = 0usize;
     let start = Instant::now();
-    while start.elapsed() < duration {
+    while start.elapsed() < duration && !should_stop() {
         match bus.recv() {
-            Ok(frame) => frames.push((frame.can_id, frame.data)),
+            Ok(frame) => {
+                on_frame(start.elapsed(), frame.can_id, &frame.data);
+                count += 1;
+            }
             Err(Error::Timeout { .. }) => continue,
             Err(e) => return Err(e),
         }
     }
-    Ok(frames)
+    Ok(count)
 }

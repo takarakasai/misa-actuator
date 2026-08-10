@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use myactuator_protocol::{
     build_brake_lock, build_brake_release, build_commit_params, build_function_control,
     build_motion_control, build_position_control, build_read_acceleration, build_read_motor_model,
+    build_read_motor_model_chunk, parse_motor_model_chunk, MOTOR_MODEL_CHUNKS,
     build_read_motor_power, build_read_multi_turn_angle, build_read_multi_turn_encoder,
     build_read_multi_turn_encoder_raw, build_read_multi_turn_zero_offset, build_read_param,
     build_read_pid, build_read_run_mode, build_read_single_turn_angle,
@@ -38,7 +39,7 @@ use myactuator_protocol::{
     DATA_LEN,
 };
 
-use crate::bus::{MyActuatorBus, SocketCanBus};
+use crate::bus::{AnyCanBus, MyActuatorBus};
 use crate::error::{Error, Result};
 
 const DEG_PER_RAD: f32 = 180.0 / PI;
@@ -106,7 +107,7 @@ pub struct MotorStatus {
 }
 
 /// High-level MyActuator RMD motor handle.
-pub struct MyActuatorMotor<B: MyActuatorBus = SocketCanBus> {
+pub struct MyActuatorMotor<B: MyActuatorBus = AnyCanBus> {
     bus: B,
     motor_id: u8,
     config: MotorConfig,
@@ -118,10 +119,11 @@ pub struct MyActuatorMotor<B: MyActuatorBus = SocketCanBus> {
     pub(crate) enabled: bool,
 }
 
-impl MyActuatorMotor<SocketCanBus> {
-    /// Open a SocketCAN interface (e.g. `"can0"`) and bind to one motor.
+impl MyActuatorMotor<AnyCanBus> {
+    /// Open a CAN interface (`"can0"`, `"pcan:usb1"`, `"slcan:COM5"`, ...) and
+    /// bind to one motor. See [`AnyCanBus::open`] for the accepted forms.
     pub fn open(interface: &str, motor_id: u8, config: MotorConfig) -> Result<Self> {
-        let bus = SocketCanBus::open(interface)?;
+        let bus = AnyCanBus::open(interface)?;
         Self::with_bus(bus, motor_id, config)
     }
 }
@@ -251,13 +253,45 @@ impl<B: MyActuatorBus> MyActuatorMotor<B> {
     /// padding. Returns an owned `String` since the underlying bytes are
     /// ASCII but not guaranteed valid UTF-8 on malformed replies.
     pub fn read_motor_model(&mut self) -> Result<String> {
+        // Chunked first: the name does not fit in one frame, and a V4.4-era
+        // firmware answers only the indexed form. A real RMD-X4-P36-36 returns
+        // nothing usable from the single-shot request the older manuals
+        // document, which is why this used to report an empty model on a motor
+        // whose vendor tool displays the name perfectly well.
+        let mut name = String::new();
+        let mut chunked_ok = false;
+        for index in 1..=MOTOR_MODEL_CHUNKS {
+            let reply = match self.transact(build_read_motor_model_chunk(index)) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            let Some((echoed, chunk)) = parse_motor_model_chunk(&reply) else {
+                break;
+            };
+            log::debug!("0xB5 chunk {index}: echoed={echoed} raw={chunk:02X?}");
+            // The index is echoed; a mismatch means a stale reply, and
+            // appending it would scramble the name rather than fail.
+            if echoed != index {
+                break;
+            }
+            chunked_ok = true;
+            for &b in &chunk {
+                if b == 0 {
+                    break;
+                }
+                name.push(b as char);
+            }
+        }
+        let trimmed = name.trim().to_string();
+        if chunked_ok && !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+
+        // Fall back to the single-shot form for firmwares that use it.
         let reply = self.transact(build_read_motor_model())?;
         let raw = parse_motor_model(&reply)
             .ok_or_else(|| Error::InvalidResponse("bad 0xB5 reply".into()))?;
-        let end = raw
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(raw.len());
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
         Ok(String::from_utf8_lossy(&raw[..end]).trim().to_string())
     }
 
@@ -284,6 +318,37 @@ impl<B: MyActuatorBus> MyActuatorMotor<B> {
 
     /// Read one parameter from the undocumented `0xC0` indexed space,
     /// selected by [`ParamIndex`] — Protect/Plan/Motor Parameters and a
+    /// Adopt the torque constant the motor reports about itself
+    /// (`KT_OUT`, `0xC0`), and return it.
+    ///
+    /// Kt is the only electrical constant this driver needs: V3 speaks
+    /// output-shaft units on the wire, so torque is just `current × Kt` in
+    /// both directions. Getting it wrong scales every torque command and every
+    /// reported torque by the ratio, silently — a wrong `1.0` against a real
+    /// `1.1` is a 10% error that looks like nothing, and a wrong `0.1` is a
+    /// factor of eleven that looks like a broken motor.
+    ///
+    /// The motor knows the value. A real RMD reports `KT_OUT = 1.1 N·m/A`,
+    /// while `--kt` defaults to "current units" and otherwise expects a human
+    /// to type the number — which is a worse source than the register.
+    ///
+    /// Reading it also rules out the failure the default hides: `0xB5`, the
+    /// documented "motor model" command, comes back **empty** on this
+    /// firmware, so there is no model name to look a datasheet value up by.
+    pub fn refresh_torque_constant(&mut self) -> Result<f32> {
+        let kt = self.read_param(ParamIndex::KtOut)?;
+        if !(kt.is_finite() && kt > 0.0) {
+            return Err(Error::InvalidResponse(format!(
+                "motor {} reported KT_OUT = {kt}, which cannot scale torque; \
+                 keeping the previous value",
+                self.motor_id()
+            )));
+        }
+        self.config.torque_constant_nm_per_a = kt;
+        log::info!("myactuator motor {}: KT_OUT = {kt} N·m/A", self.motor_id());
+        Ok(kt)
+    }
+
     /// second PID-gain set (Kd/R(Slope)/T(Filter) per loop), reverse
     /// engineered from Setup Software V4.0 traffic. See
     /// `myactuator-protocol/doc/setup-software-c0-param-protocol.md`.

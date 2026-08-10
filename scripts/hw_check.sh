@@ -3,6 +3,8 @@
 #   - RobStride 04        (extended-ID CAN, robstride-cli)
 #   - MyActuator RMD X4   (standard-ID CAN V3, myactuator-cli)
 #
+# Linux/SocketCAN. The Windows equivalent is scripts/hw_check.ps1.
+#
 # The two families can share one 1 Mbps bus (RobStride uses extended 29-bit
 # IDs, MyActuator standard 11-bit IDs, and each driver filters out the other
 # kind) or live on separate physical buses/channels — use --rs-interface /

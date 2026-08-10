@@ -728,7 +728,7 @@ Response frame: Response motor feedback frame (see communication type 0).
 | Size | Bit28~bit24 | bit23~8 | bit7~0 | Byte0~Byte7 |
 | Description | 0x4 ² | bit15~8: used to identify the main CAN_ID | target motor CAN_ID | Byte[0]=0x00, Byte[1]=0xC4 |
 
-² *The source table literally shows `0x4` in the Bit28~bit24 column for the "communication type 26" request frame; the expected value for type 26 is `0x1A`. This looks like a copy/paste artifact in the original vendor document (the surrounding cell text is boilerplate reused from other command sections). Treat with suspicion and verify against real device traffic.*
+² *The source table shows `0x4` in the Bit28~bit24 column for the "communication type 26" request frame, where `0x1A` would be expected. **This was verified against real traffic on 2026-08-02 and the manual is correct**: motorstudio's "Detection Devices" sends `ID=0x0400FD01` (comm-type field `4`, host `0xFD`, target `1`) with data `00 C4 00 00 00 00 00 00`, and the motor answers. The comm-type field genuinely carries `4` here, not `26` — so this command is indistinguishable from a Disable by ID alone and must be told apart by the `00 C4` payload prefix. The earlier "copy/paste artifact" reading was wrong.*
 
 **Response frame:**
 
@@ -737,7 +737,7 @@ Response frame: Response motor feedback frame (see communication type 0).
 | Size | Bit28~bit24 | bit23~8 | bit7~0 | Byte0~Byte7 |
 | Description | *(see note ³)* | *(see note ³)* | target motor CAN_ID | Byte0=0x00; Byte1=0xC4; Byte2=0x56; Byte3~6: motor version number, ordered from high to low |
 
-³ *The source table's ID-field description cells for this response frame are identical to the communication-type-2 (motor feedback) cells (CAN ID / fault bits / mode status), which does not semantically match a version-read response. This appears to be another copy-paste artifact in the original document — the meaningful content is the Byte0~6 version payload; the ID-field text should likely be disregarded or re-verified against real device behavior.*
+³ *The source table's ID-field cells for this response are identical to the communication-type-2 (motor feedback) cells. **Also verified correct on 2026-08-02**: a real RS-04 answers with `ID=0x020001FD` — comm type `2`, exactly like a feedback frame — carrying `00 C4 56 00 04 01 20 07`, where `00 04 01 20` decodes to AppCodeVersion `0.4.1.32` as displayed by motorstudio. So a version reply is **on the wire indistinguishable from motor feedback except by its `00 C4 56` prefix**, and any feedback parser that sees one will decode it as nonsense position/velocity/torque. Byte7 (`0x07` on this RS-04) is not described by the manual and its meaning is unknown.*
 
 ---
 

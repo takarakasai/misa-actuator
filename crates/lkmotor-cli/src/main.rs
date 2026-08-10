@@ -2,7 +2,8 @@
 //! over an RS485 serial port.
 //!
 //! ```text
-//! lkmotor-cli -i /dev/ttyUSB0 -m 1 scan
+//! lkmotor-cli ports                          # list serial ports (Windows: COM*)
+//! lkmotor-cli -i /dev/ttyUSB0 -m 1 scan       # -i COM5 on Windows
 //! lkmotor-cli -i /dev/ttyUSB0 -m 1 status
 //! lkmotor-cli -i /dev/ttyUSB0 -m 1 zero
 //! lkmotor-cli -i /dev/ttyUSB0 -m 1 move-to 1.57 --speed 5 --duration 3
@@ -123,8 +124,9 @@ impl HybridCmdArg {
 #[derive(Parser, Debug)]
 #[command(version, about = "Test CLI for LKMTech V3 servo motors (MG4005 / MG / MS / RMD-X)")]
 struct Cli {
-    /// RS485 serial device (e.g. /dev/ttyUSB0).
-    #[arg(short, long, default_value = "/dev/ttyUSB0")]
+    /// RS485 serial device — `/dev/ttyUSB0` on Linux, `COM5` on Windows.
+    /// Run `lkmotor-cli ports` to list what is attached.
+    #[arg(short, long, default_value = lkmotor_driver::default_serial_port())]
     interface: String,
 
     /// Motor id on the bus (1..=32).
@@ -397,14 +399,30 @@ enum Command {
         #[arg(long, default_value = "chirp_bode.csv")]
         bode: String,
     },
+    /// List the serial ports this machine reports, with USB ids.
+    ///
+    /// Mostly for Windows, where the RS485 adapter's COM number is handed out
+    /// by the OS and differs from machine to machine.
+    Ports,
 }
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // Windows sleeps round up to the ~15.6 ms scheduler tick by default,
+    // which would throttle every timed loop below. No-op on Linux.
+    let _timer = misa_actuator::realtime::TimerResolutionGuard::acquire();
     let cli = Cli::parse();
+
+    // `ports` exists precisely because you don't know which port to open yet,
+    // so it has to run before `open_motor`.
+    if matches!(cli.command, Command::Ports) {
+        return list_serial_ports();
+    }
+
     let mut motor = open_motor(&cli)?;
 
     match &cli.command {
+        Command::Ports => unreachable!("handled before the port is opened"),
         Command::Scan { from, to } => {
             println!("scanning ids {from}..={to} on {} ...", cli.interface);
             let timeout = Duration::from_millis(cli.timeout_ms);
@@ -804,6 +822,25 @@ fn print_broadcast_replies(replies: &[lkmotor_driver::Response]) {
     }
 }
 
+/// Print every serial port the OS knows about, so the right `--interface`
+/// can be picked without guessing.
+fn list_serial_ports() -> Result<()> {
+    let ports = lkmotor_driver::list_ports();
+    if ports.is_empty() {
+        println!("no serial ports found");
+        if cfg!(windows) {
+            println!("check Device Manager → Ports (COM & LPT); a USB-RS485 adapter");
+            println!("usually needs its CH340 / FTDI / CP210x driver installed first");
+        }
+        return Ok(());
+    }
+    println!("{:<12}  {}", "PORT", "DETAIL");
+    for (name, detail) in ports {
+        println!("{name:<12}  {detail}");
+    }
+    Ok(())
+}
+
 fn open_motor(cli: &Cli) -> Result<LkMotor<Rs485Driver>> {
     let id = MotorId::new(cli.motor_id)
         .with_context(|| format!("invalid motor id {} (must be 1..=32)", cli.motor_id))?;
@@ -1061,7 +1098,7 @@ where
             }
         }
         if let Some(rem) = period.checked_sub(loop_start.elapsed()) {
-            std::thread::sleep(rem);
+            misa_actuator::realtime::sleep_precise(rem);
         }
     }
     Ok(())

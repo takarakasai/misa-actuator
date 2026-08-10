@@ -31,7 +31,7 @@ use lkmotor_driver::LkCommands;
 #[derive(Parser, Debug)]
 #[command(about = "Linear-chirp stability sweep for the case-B MIT-mode emulation")]
 struct Args {
-    #[arg(short, long, default_value = "/dev/ttyUSB0")]
+    #[arg(short, long, default_value = lkmotor_driver::default_serial_port())]
     device: String,
     #[arg(short, long, default_value_t = 1_000_000)]
     baud: u32,

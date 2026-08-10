@@ -7,6 +7,7 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use misa_actuator::realtime::{sleep_until, TimerResolutionGuard};
 use misa_actuator::{Actuator, MotorFeedback, Result, RunMode};
 
 use crate::chirp::Chirp;
@@ -114,6 +115,27 @@ pub fn run_chirp(
     target_rate_hz: f32,
     abort: &AtomicBool,
 ) -> Result<ChirpLog> {
+    run_chirp_with(act, chirp, exc, target_rate_hz, abort, &mut |_| {})
+}
+
+/// [`run_chirp`], reporting each sample as it is taken.
+///
+/// A sweep runs for tens of seconds. Handing back only the finished log is
+/// fine for a CLI that is going to write a CSV, but a UI wants to draw the
+/// response as it happens — and an operator watching a motor be excited wants
+/// to see it going wrong before the run ends, not after.
+///
+/// `on_sample` is called from inside the control loop, so it must be cheap:
+/// push to a buffer, do not block on I/O. Time spent here comes straight out
+/// of the loop's timing budget.
+pub fn run_chirp_with(
+    act: &mut dyn Actuator,
+    chirp: &Chirp,
+    exc: Excitation,
+    target_rate_hz: f32,
+    abort: &AtomicBool,
+    on_sample: &mut dyn FnMut(&Sample),
+) -> Result<ChirpLog> {
     act.set_run_mode(exc.run_mode())?;
     let enable_fb = act.enable()?;
 
@@ -127,21 +149,29 @@ pub fn run_chirp(
     let period = Duration::from_secs_f32(1.0 / target_rate_hz.max(1.0));
     let mut samples = Vec::with_capacity((chirp.duration_s * target_rate_hz) as usize + 1);
 
+    // Ask the OS for a fine timer tick for the duration of the sweep. Without
+    // this, Windows rounds every sleep up to ~15.6 ms and the chirp runs at
+    // ~64 Hz no matter what `target_rate_hz` says. No-op on Linux.
+    let _timer = TimerResolutionGuard::acquire();
+
     let start = Instant::now();
+    // Absolute deadlines rather than "sleep the remainder": a slow iteration
+    // then costs one late sample instead of shifting every sample after it.
+    let mut next_tick = start;
     loop {
         let t = start.elapsed().as_secs_f32();
         if t >= chirp.duration_s || abort.load(Ordering::Relaxed) {
             break;
         }
-        let iter_start = Instant::now();
 
         let u = chirp.value(t);
         let (cmd, fb) = command(act, exc, center, u)?;
-        samples.push(sample(t, cmd, &fb));
+        let s = sample(t, cmd, &fb);
+        on_sample(&s);
+        samples.push(s);
 
-        if let Some(rem) = period.checked_sub(iter_start.elapsed()) {
-            std::thread::sleep(rem);
-        }
+        next_tick += period;
+        sleep_until(next_tick);
     }
     let total = start.elapsed().as_secs_f32().max(1e-6);
 

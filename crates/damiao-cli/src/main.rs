@@ -1,8 +1,13 @@
 //! Test CLI for the `damiao-driver` crate (DM-J4310-2EC and friends).
 //!
+//! `-i` names the CAN interface: `can0` on Linux, `pcan:usb1` for a PEAK
+//! adapter on Windows, `slcan:COM5` for a USB-CAN dongle. `--fd` needs a
+//! CAN-FD-capable transport — SocketCAN with `fd on`, or a PEAK FD adapter;
+//! SLCAN cannot do FD.
+//!
 //! Classic CAN (1 Mbps):
 //! ```text
-//! sudo ip link set can0 type can bitrate 1000000 up
+//! sudo ip link set can0 type can bitrate 1000000 up      # Linux only
 //! damiao-cli -i can0 scan
 //! damiao-cli -i can0 -m 1 enable
 //! damiao-cli -i can0 -m 1 move-to 1.57 --speed 5 --duration 3
@@ -36,8 +41,10 @@ use damiao_driver::{
 #[derive(Parser, Debug)]
 #[command(version, about = "Test CLI for DAMIAO CAN/CAN-FD servo motors")]
 struct Cli {
-    /// SocketCAN interface name (e.g. can0).
-    #[arg(short, long, default_value = "can0")]
+    /// CAN interface: `can0` (Linux SocketCAN), `pcan:usb1` (PEAK adapter on
+    /// Windows) or `slcan:COM5` (USB-CAN adapter, classic CAN only). Append
+    /// `@1M,5M` to set the arbitration and CAN-FD data bitrates.
+    #[arg(short, long, default_value = misa_can::default_interface())]
     interface: String,
 
     /// Motor CAN_ID (slave id).
@@ -79,6 +86,15 @@ struct Cli {
     /// Use a CAN-FD bus (interface must be `fd on`). Default is classic CAN.
     #[arg(long)]
     fd: bool,
+
+    /// Diagnostic: initialise the link as CAN-FD but send classic frames.
+    ///
+    /// Use when a motor answers on `--fd`-less runs and goes silent with
+    /// `--fd`. If it answers here, the FD initialisation and bit timing are
+    /// good and the motor itself is not an FD node; if it does not, the
+    /// problem is on our side of the link.
+    #[arg(long, conflicts_with = "fd")]
+    fd_link_classic_frames: bool,
 
     /// Per-request timeout, in ms.
     #[arg(long, default_value_t = 100)]
@@ -307,6 +323,9 @@ enum Command {
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // Windows sleeps round up to the ~15.6 ms scheduler tick by default,
+    // which would throttle every timed loop below. No-op on Linux.
+    let _timer = misa_actuator::realtime::TimerResolutionGuard::acquire();
     let cli = Cli::parse();
 
     let model = MotorModel::from_name(&cli.model)
@@ -315,7 +334,18 @@ fn main() -> Result<()> {
 
     // The bus type is chosen at runtime; dispatch into a generic runner so the
     // command logic is written once for both transports.
-    if cli.fd {
+    if cli.fd_link_classic_frames {
+        let mut motor =
+            DamiaoMotor::open_fd_link_classic_frames(&cli.interface, cli.motor_id, model)
+                .with_context(|| format!("failed to open CAN-FD interface {}", cli.interface))?;
+        eprintln!(
+            "diagnostic: link initialised as CAN-FD, frames sent as classic CAN.\n\
+             If the motor answers here but not with --fd, the FD bit timing is \
+             fine and the motor is not configured for CAN-FD."
+        );
+        configure(&mut motor, &cli, timeout)?;
+        run(&mut motor, &cli)
+    } else if cli.fd {
         let mut motor = DamiaoMotor::open_fd(&cli.interface, cli.motor_id, model)
             .with_context(|| format!("failed to open CAN-FD interface {}", cli.interface))?;
         configure(&mut motor, &cli, timeout)?;
@@ -469,6 +499,7 @@ fn run<B: DamiaoBus>(motor: &mut DamiaoMotor<B>, cli: &Cli) -> Result<()> {
                 ("CAN_ID (ESC_ID)", Rid::ESC_ID, true),
                 ("MST_ID", Rid::MST_ID, true),
                 ("CTRL_MODE", Rid::CTRL_MODE, true),
+                ("GR (gear ratio)", Rid::GR, false),
                 ("PMAX", Rid::PMAX, false),
                 ("VMAX", Rid::VMAX, false),
                 ("TMAX", Rid::TMAX, false),
@@ -476,11 +507,29 @@ fn run<B: DamiaoBus>(motor: &mut DamiaoMotor<B>, cli: &Cli) -> Result<()> {
             let model = motor.model();
             println!("motor config (addressed at CAN_ID {}):", cli.motor_id);
             println!(
-                "  {:<16}          = {} (register layout {:?})",
+                "  {:<16}          = {} (register layout {:?})  [selected]",
                 "model",
                 model.name(),
                 model.register_layout()
             );
+            // What the motor says it is, which need not be what --model says.
+            match motor.identify_model() {
+                Ok(m) if m.register_layout() == model.register_layout() => println!(
+                    "  {:<16}          = {} (gear ratio {}:1)  [from the motor]",
+                    "identified",
+                    m.name(),
+                    m.gear_ratio()
+                ),
+                Ok(m) => println!(
+                    "  {:<16}          = {} (gear ratio {}:1)  [from the motor] \
+                     — MISMATCH, use --model {}",
+                    "identified",
+                    m.name(),
+                    m.gear_ratio(),
+                    m.name()
+                ),
+                Err(e) => println!("  {:<16}          = <{e}>", "identified"),
+            }
             for &(label, rid, is_int) in regs {
                 match motor.read_register(rid) {
                     Ok(r) if is_int => println!("  {label:<16} (RID {rid:>2}) = {}", r.as_i32()),
@@ -745,6 +794,13 @@ fn chirp_cmd(
 /// Send a control command repeatedly at ~100 Hz (to satisfy the comm-loss
 /// watchdog) for `duration` seconds, or until Ctrl-C if `duration` is `None`.
 /// Prints the latest feedback periodically.
+///
+/// How many feedback frames may be missed in a row before the loop stops
+/// commanding. Five at a 10 ms period is 50 ms of driving blind — long enough
+/// to ride out the isolated drops seen on CAN-FD, short enough that a motor
+/// which has genuinely stopped answering is not commanded onward.
+const MAX_CONSECUTIVE_MISSES: u32 = 5;
+
 fn control_loop<F>(duration: Option<f32>, mut tick: F) -> Result<()>
 where
     F: FnMut() -> damiao_driver::Result<Feedback>,
@@ -758,6 +814,9 @@ where
     let start = Instant::now();
     let mut last_print = Instant::now();
     let period = Duration::from_millis(10);
+    let mut missed = 0u32;
+    let mut missed_total = 0u32;
+    let mut ticks = 0u32;
     while running.load(Ordering::SeqCst) {
         if let Some(d) = duration {
             if start.elapsed().as_secs_f32() >= d {
@@ -765,12 +824,30 @@ where
             }
         }
         let loop_start = Instant::now();
+        ticks += 1;
         match tick() {
             Ok(fb) => {
+                missed = 0;
                 if last_print.elapsed() >= Duration::from_millis(200) {
                     println!("{}", fmt_fb(fb));
                     last_print = Instant::now();
                 }
+            }
+            // A dropped feedback frame is not a reason to stop driving.
+            //
+            // Over CAN-FD this motor leaves roughly one reply in seven
+            // unanswered (see `DamiaoMotor::read_register`), so aborting on
+            // the first miss ends a one-second hold almost immediately — and
+            // the command itself had already taken effect, which made it look
+            // like the motor was unreachable when it was in fact moving.
+            //
+            // Consecutive misses are different: that is a motor that has
+            // stopped talking, and continuing to command one you cannot
+            // observe is how a runaway goes unnoticed. So tolerate isolated
+            // drops, give up on a run of them.
+            Err(damiao_driver::Error::Timeout { .. }) if missed + 1 < MAX_CONSECUTIVE_MISSES => {
+                missed += 1;
+                missed_total += 1;
             }
             Err(e) => {
                 eprintln!("control error: {e}");
@@ -778,8 +855,14 @@ where
             }
         }
         if let Some(rem) = period.checked_sub(loop_start.elapsed()) {
-            std::thread::sleep(rem);
+            misa_actuator::realtime::sleep_precise(rem);
         }
+    }
+    if missed_total > 0 {
+        eprintln!(
+            "note: {missed_total} of {ticks} feedback reads went unanswered \
+             (tolerated; the motor was still commanded)"
+        );
     }
     Ok(())
 }

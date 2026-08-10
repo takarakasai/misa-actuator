@@ -1,0 +1,31 @@
+[package]
+name = "misa-actuator-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Motor session plumbing shared by the GUI and the TUI: driver factory, I/O worker thread, setpoint/command/event protocol, watchdog"
+
+[dependencies]
+misa-actuator = { workspace = true }
+misa-can = { workspace = true }
+misa-actuator-sim = { workspace = true }
+misa-sysid = { workspace = true }
+lkmotor-driver = { workspace = true }
+robstride-driver = { workspace = true }
+damiao-driver = { workspace = true }
+myactuator-driver = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+# Only needed by the CLIs that derive `ValueEnum` on `DriverKind`; a GUI has no
+# use for an argument parser.
+clap = { workspace = true, optional = true }
+
+[features]
+default = []
+clap = ["dep:clap"]
+
+[dev-dependencies]
+serde_json = "1"

@@ -1,5 +1,8 @@
 //! Test CLI for the `robstride-driver` crate.
 //!
+//! `-i` names the CAN interface: `can0` on Linux, `pcan:usb1` for a PEAK
+//! adapter on Windows, `slcan:COM5` for a USB-CAN dongle on either.
+//!
 //! Examples:
 //! ```text
 //! robstride-cli -i can0 scan
@@ -18,15 +21,19 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use robstride_driver::{dump_bus, scan_bus, Motor, MotorModel, ParamIndex, RunMode, DEFAULT_HOST_ID};
+use robstride_driver::{
+    dump_bus_streaming, scan_bus, Motor, MotorModel, ParamIndex, RunMode, DEFAULT_HOST_ID,
+};
 
 mod param_commands;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Test CLI for the Robstride CAN servo motor driver")]
 struct Cli {
-    /// SocketCAN interface name (e.g. can0).
-    #[arg(short, long, default_value = "can0")]
+    /// CAN interface: `can0` (Linux SocketCAN), `pcan:usb1` (PEAK adapter on
+    /// Windows) or `slcan:COM5` (USB-CAN adapter). Append `@500K` to override
+    /// the 1 Mbit/s default bitrate.
+    #[arg(short, long, default_value = misa_can::default_interface())]
     interface: String,
 
     /// Motor CAN ID (1..=127). Required for per-motor commands.
@@ -37,9 +44,16 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_HOST_ID)]
     host_id: u8,
 
-    /// Motor model — accepts `RS-05`, `rs05`, `Edulite05`, etc.
-    #[arg(long, default_value = "Edulite05")]
-    model: String,
+    /// Motor model — accepts `RS-04`, `rs04`, `EduLite05`, `RobStride-05`, etc.
+    ///
+    /// Required for anything that commands or decodes motion: the model sets
+    /// the MIT quantisation range, which spans ±5.5 N·m (RS-05) to ±120 N·m
+    /// (RS-04) across the family. There is deliberately no default — a wrong
+    /// one mis-scales commands *and* feedback by up to 21x, silently.
+    /// Commands that never touch that scaling (`scan`, `identify`, `version`,
+    /// `param-table`, `read-param`, `params`, `set-id`) run without it.
+    #[arg(long)]
+    model: Option<String>,
 
     /// Also report current in feedback, at one extra bus round-trip per sample.
     ///
@@ -184,6 +198,28 @@ enum Command {
         #[arg(long, default_value_t = 500)]
         timeout_ms: u64,
     },
+    /// Ask the motor what model it is.
+    ///
+    /// Reads the free-text rows a model could be written into (Name,
+    /// AppCodeName, BarCode) and the limits it reports (limit_torque,
+    /// limit_spd), then says what they support. RobStride has no model
+    /// register, so a name is the only direct answer and the limits can only
+    /// rule models out — the output distinguishes the two.
+    Identify {
+        /// Also read the parameter-table name rows (Name / AppCodeName /
+        /// BarCode).
+        ///
+        /// Off by default. That path is reverse-engineered, it truncates
+        /// (`"moto"` for `"motor"` on a real RS-04), and on that unit every
+        /// read after it timed out until the motor was power-cycled. The
+        /// rows are also empty or uninformative on both motors measured, so
+        /// the default is the documented traffic only.
+        #[arg(long)]
+        deep: bool,
+        /// Per-row read timeout for the free-text rows (ms). Only with --deep.
+        #[arg(long, default_value_t = 500)]
+        timeout_ms: u64,
+    },
     /// Read one row's raw value by FunctionCode via the cheap single-row
     /// read (5 frames total — see robstride_protocol::param_table). Accepts
     /// hex (`0x1003`) or decimal. Use `param-table` first to look up a
@@ -226,11 +262,22 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Passively listen on the bus and print every frame.
+    /// Passively listen on the bus and print every frame as it arrives,
+    /// decoded into the RobStride ID fields.
+    ///
+    /// Sends nothing. Use it to watch what another tool (motorstudio, a
+    /// vendor SDK) puts on the wire while you drive its UI — put this adapter
+    /// and the other one on the same CANH/CANL/GND at the same bitrate, start
+    /// the capture, then press the button you want to understand.
+    ///
+    /// Ctrl-C ends the capture early and keeps what was printed.
     Dump {
         /// Listen duration (s).
-        #[arg(long, default_value_t = 5.0)]
+        #[arg(long, default_value_t = 30.0)]
         duration: f32,
+        /// Print raw IDs only, without the comm-type decode.
+        #[arg(long)]
+        raw: bool,
     },
     /// Periodically print position / velocity / torque.
     Monitor {
@@ -340,8 +387,32 @@ enum Command {
     },
 }
 
+fn known_model_names() -> String {
+    MotorModel::CATALOGUE
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn parse_model(s: &str) -> Result<MotorModel> {
-    MotorModel::from_name(s).with_context(|| format!("unknown motor model: {s}"))
+    MotorModel::from_name(s)
+        .with_context(|| format!("unknown motor model: {s} (known: {})", known_model_names()))
+}
+
+/// The model for a command that will command or decode motion.
+fn require_model(cli: &Cli) -> Result<MotorModel> {
+    match cli.model.as_deref() {
+        Some(s) => parse_model(s),
+        None => bail!(
+            "--model is required for this command: it sets the MIT quantisation range, \
+             and the range differs 21-fold across the family (RS-05 is ±5.5 N·m, RS-04 \
+             ±120), so the wrong one mis-scales both commands and feedback.\n\
+             Known: {}\n\
+             Run `identify` first if you are unsure which motor is on the bus.",
+            known_model_names()
+        ),
+    }
 }
 
 /// Parse a FunctionCode as hex (`0x1003`, `1003h`) or decimal (`4099`).
@@ -359,7 +430,25 @@ fn parse_function_code(s: &str) -> std::result::Result<u16, String> {
 }
 
 fn open_motor(cli: &Cli) -> Result<Motor> {
-    let model = parse_model(&cli.model)?;
+    open_motor_with(cli, require_model(cli)?)
+}
+
+/// Open for a command that neither commands motion nor decodes feedback —
+/// `scan`, `version`, the parameter-table reads, `set-id`, `identify`.
+///
+/// Those need a `Motor` only because that is what owns the bus, and the MIT
+/// scales never come into play. Requiring `--model` for them would be worse
+/// than pointless: `scan` and `identify` are precisely what you run *before*
+/// you know which motor is out there.
+fn open_motor_unscaled(cli: &Cli) -> Result<Motor> {
+    let model = match cli.model.as_deref() {
+        Some(s) => parse_model(s)?,
+        None => MotorModel::Rs04,
+    };
+    open_motor_with(cli, model)
+}
+
+fn open_motor_with(cli: &Cli, model: MotorModel) -> Result<Motor> {
     let mut motor = Motor::open_with_host(&cli.interface, cli.motor_id, cli.host_id, model)
         .with_context(|| format!("failed to open {} for motor {}", cli.interface, cli.motor_id))?;
     // Deriving torque needs a current reading, so --kt implies --report-current
@@ -372,6 +461,53 @@ fn open_motor(cli: &Cli) -> Result<Motor> {
         }
     }
     Ok(motor)
+}
+
+/// One captured frame, decoded into the RobStride 29-bit ID layout.
+///
+/// The ASCII column is there because the rows worth staring at during a
+/// capture are the parameter reads, and their payloads are names and version
+/// strings — spotting `EL_motor` in a hex dump by eye is needless work.
+fn print_dump_frame(t: Duration, id: u32, data: &[u8], raw: bool) {
+    let hex = data
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if raw {
+        println!("{:9.3}  0x{id:08X}  {hex}", t.as_secs_f64() * 1000.0);
+        return;
+    }
+
+    use robstride_driver::protocol as proto;
+    let (comm_type, extra, target) = proto::parse_can_id(id);
+
+    // The version query and its reply both borrow another command's comm type
+    // and are told apart only by a payload prefix. Labelling them by ID alone
+    // would print "Disable" for a read and "OperationStatus" for a version —
+    // which is how a capture gets misread.
+    let name = if proto::is_version_request(id, data) {
+        "26 VersionRead(req)".to_string()
+    } else if proto::parse_version_reply(id, data).is_some() {
+        "26 VersionRead(rsp)".to_string()
+    } else {
+        match proto::CommType::from_u8(comm_type) {
+            Some(ct) => format!("{comm_type:2} {ct:?}"),
+            // Type 19 is the bulk parameter table — real, and absent from
+            // `CommType`, so label it rather than leaving a bare number in the
+            // middle of a capture.
+            None if comm_type == 19 => format!("{comm_type:2} ParamTable"),
+            None => format!("{comm_type:2} ?"),
+        }
+    };
+    let ascii: String = data
+        .iter()
+        .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
+        .collect();
+    println!(
+        "{:9.3}  0x{id:08X}  {name:<22}  {target:>3} <-{extra:#06X}  {hex:<23}  |{ascii}|",
+        t.as_secs_f64() * 1000.0
+    );
 }
 
 fn print_feedback(label: &str, fb: &robstride_driver::MotorFeedback) {
@@ -603,7 +739,7 @@ fn run(cli: Cli) -> Result<()> {
                     Ok(fb) => print_feedback("  ", &fb),
                     Err(e) => eprintln!("mit error: {e}"),
                 }
-                std::thread::sleep(dt);
+                misa_actuator::realtime::sleep_precise(dt);
             }
             motor.disable()?;
         }
@@ -611,7 +747,7 @@ fn run(cli: Cli) -> Result<()> {
             if *new_id == 0 {
                 bail!("new id must be >= 1");
             }
-            let mut motor = open_motor(&cli)?;
+            let mut motor = open_motor_unscaled(&cli)?;
             println!(
                 "reassigning motor {} -> {} on {} ...",
                 cli.motor_id, new_id, cli.interface
@@ -661,18 +797,27 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Version { timeout_ms } => {
-            let mut motor = open_motor(&cli)?;
+            let mut motor = open_motor_unscaled(&cli)?;
             param_commands::run_version(&mut motor, cli.motor_id, *timeout_ms)?;
+        }
+        Command::Identify { deep, timeout_ms } => {
+            let mut motor = open_motor_unscaled(&cli)?;
+            // Pass the *selection*, not the model the bus was opened with —
+            // with no `--model` those differ, and reporting the placeholder as
+            // if the operator had chosen it is exactly the confusion this
+            // command exists to clear up.
+            let selected = cli.model.as_deref().map(parse_model).transpose()?;
+            param_commands::run_identify(&mut motor, selected, *deep, *timeout_ms)?;
         }
         Command::ReadParam {
             function_code,
             timeout_ms,
         } => {
-            let mut motor = open_motor(&cli)?;
+            let mut motor = open_motor_unscaled(&cli)?;
             param_commands::run_read_param(&mut motor, *function_code, *timeout_ms)?;
         }
         Command::ParamTable { timeout_ms } => {
-            let mut motor = open_motor(&cli)?;
+            let mut motor = open_motor_unscaled(&cli)?;
             param_commands::run_param_table(&mut motor, *timeout_ms)?;
         }
         Command::Params {
@@ -680,7 +825,7 @@ fn run(cli: Cli) -> Result<()> {
             toml,
             out,
         } => {
-            let mut motor = open_motor(&cli)?;
+            let mut motor = open_motor_unscaled(&cli)?;
             param_commands::run_params(
                 &mut motor,
                 cli.motor_id,
@@ -689,16 +834,24 @@ fn run(cli: Cli) -> Result<()> {
                 out.as_deref(),
             )?;
         }
-        Command::Dump { duration } => {
-            let frames = dump_bus(&cli.interface, Duration::from_secs_f32(*duration))?;
-            println!("captured {} frame(s)", frames.len());
-            for (id, data) in frames {
-                print!("  0x{:08X} ", id);
-                for b in &data {
-                    print!("{:02X} ", b);
-                }
-                println!();
+        Command::Dump { duration, raw } => {
+            let stop = Arc::new(AtomicBool::new(false));
+            install_ctrl_c(stop.clone());
+            eprintln!(
+                "listening on {} for {duration:.0}s (Ctrl-C to stop early) — \
+                 nothing is transmitted",
+                cli.interface
+            );
+            if !raw {
+                println!("{:>9}  {:>10}  {:<22}  {:<8}  {}", "t [ms]", "id", "comm type", "target", "data");
             }
+            let n = dump_bus_streaming(
+                &cli.interface,
+                Duration::from_secs_f32(*duration),
+                &|| stop.load(Ordering::Relaxed),
+                &mut |t, id, data| print_dump_frame(t, id, data, *raw),
+            )?;
+            eprintln!("captured {n} frame(s)");
         }
         Command::Monitor { interval } => {
             let mut motor = open_motor(&cli)?;
@@ -710,7 +863,7 @@ fn run(cli: Cli) -> Result<()> {
                     Ok(fb) => print_feedback("  ", &fb),
                     Err(e) => eprintln!("read error: {e}"),
                 }
-                std::thread::sleep(dt);
+                misa_actuator::realtime::sleep_precise(dt);
             }
         }
         Command::SmokeTest {
@@ -879,7 +1032,7 @@ fn observe(motor: &mut Motor, label: &str, duration: f32, stop: &Arc<AtomicBool>
             Ok(v) => v,
             Err(e) => {
                 eprintln!("  {label} pos read error: {e}");
-                std::thread::sleep(dt);
+                misa_actuator::realtime::sleep_precise(dt);
                 continue;
             }
         };
@@ -887,13 +1040,13 @@ fn observe(motor: &mut Motor, label: &str, duration: f32, stop: &Arc<AtomicBool>
             Ok(v) => v,
             Err(e) => {
                 eprintln!("  {label} vel read error: {e}");
-                std::thread::sleep(dt);
+                misa_actuator::realtime::sleep_precise(dt);
                 continue;
             }
         };
         println!("{label}: pos={:+.3} rad  vel={:+.3} rad/s", pos, vel);
         last = Some((pos, vel));
-        std::thread::sleep(dt);
+        misa_actuator::realtime::sleep_precise(dt);
     }
     last
 }
@@ -906,7 +1059,8 @@ fn run_smoke_test(cli: &Cli, p: SmokeParams) -> Result<()> {
     let initial = motor.read_status().context("initial status read failed")?;
     println!(
         "=== Smoke test: motor id={} model={} ===",
-        cli.motor_id, cli.model
+        cli.motor_id,
+        motor.model()
     );
     print_feedback("initial", &initial);
 
@@ -1075,5 +1229,8 @@ fn run_smoke_test(cli: &Cli, p: SmokeParams) -> Result<()> {
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Windows sleeps round up to the ~15.6 ms scheduler tick by default,
+    // which would throttle every timed loop below. No-op on Linux.
+    let _timer = misa_actuator::realtime::TimerResolutionGuard::acquire();
     run(Cli::parse())
 }

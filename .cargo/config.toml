@@ -1,0 +1,23 @@
+# Give Windows binaries a Linux-sized main stack.
+#
+# Windows reserves 1 MB for the main thread where Linux gives 8 MB. That gap is
+# invisible until something builds a large structure in a single stack frame —
+# and `clap`'s derive does exactly that, expanding every subcommand's builder
+# chain inline into one function. On `robstride-cli` (30+ subcommands) an
+# unoptimized build of that one frame exceeds 1 MB, and the binary overflows
+# the stack before `main` runs a single line: `--help` alone was enough, with
+# no bus and no motor involved.
+#
+# Raising the reservation rather than trimming the CLI, because the limit is
+# arbitrary and the alternative is a workspace where adding a subcommand can
+# crash unrelated commands. Reserved address space is not committed memory, so
+# 8 MB costs nothing until it is touched.
+#
+# Worker threads are unaffected — `std::thread` sets its own stack size and
+# already defaults to 2 MB. This is only about the main thread.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]

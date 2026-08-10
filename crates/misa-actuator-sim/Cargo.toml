@@ -1,0 +1,18 @@
+[package]
+name = "misa-actuator-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Simulated Actuator — a calibrated motor + load + thermal model for developing and testing against, with no hardware attached"
+
+[dependencies]
+misa-actuator = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+# Only for the integration test that checks a characterization run recovers the
+# values the simulator was built with. No cycle: misa-sysid depends on
+# misa-actuator, not on this crate.
+misa-sysid = { workspace = true }

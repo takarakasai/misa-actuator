@@ -93,7 +93,9 @@ struct MotorEntry {
 }
 
 fn default_model() -> String {
-    "Edulite05".to_string()
+    // Not a real model: a config that omits `model` for a RobStride motor must
+    // fail loudly, not silently pick one whose MIT range is 21x off.
+    misa_actuator_tui::factory::MODEL_UNSPECIFIED.to_string()
 }
 fn default_host_id() -> u8 {
     robstride_driver::DEFAULT_HOST_ID
@@ -427,6 +429,9 @@ impl App {
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // Windows sleeps round up to the ~15.6 ms scheduler tick by default,
+    // which would throttle every timed loop below. No-op on Linux.
+    let _timer = misa_actuator::realtime::TimerResolutionGuard::acquire();
     let cli = Cli::parse();
 
     let config = load_config(&cli.config)?;

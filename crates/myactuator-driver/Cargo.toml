@@ -5,12 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Rust SocketCAN driver for MyActuator RMD servo motors (CAN protocol V3), impl misa_actuator::Actuator"
+description = "Rust CAN driver for MyActuator RMD servo motors (CAN protocol V3), impl misa_actuator::Actuator"
 
 [dependencies]
 misa-actuator = { workspace = true }
+misa-can = { workspace = true }
 myactuator-protocol = { workspace = true }
-socketcan = { workspace = true }
-embedded-can = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }

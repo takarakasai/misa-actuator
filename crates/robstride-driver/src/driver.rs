@@ -1,12 +1,12 @@
 //! High-level [`Motor`] driver — generic over any [`RobstrideBus`].
 //!
 //! `Motor` was historically tied to Linux SocketCAN. It is now generic over
-//! the bus, with [`SocketCanBus`] as the default. Concrete usage:
+//! the bus, with [`AnyCanBus`] as the default. Concrete usage:
 //!
 //! - `Motor::open("can0", 1, MotorModel::Rs05)` — convenience constructor
-//!   that opens a SocketCAN interface (defaults to `Motor<SocketCanBus>`).
-//! - `Motor::with_bus(my_usb_can_bus, 1, MotorModel::Rs05)` — bring your
-//!   own bus (e.g. a future USB-CAN serial adapter).
+//!   that opens whatever transport the interface string names (SocketCAN on
+//!   Linux, `pcan:usb1` or `slcan:COM5` on Windows).
+//! - `Motor::with_bus(my_bus, 1, MotorModel::Rs05)` — bring your own bus.
 
 use std::time::{Duration, Instant};
 
@@ -14,17 +14,17 @@ use robstride_protocol::{
     CommType, MitScales, MotorFeedback, MotorModel, ParamIndex, RunMode, build_can_id_raw,
     build_disable_frame, build_enable_frame, build_mit_frame, build_ping_frame,
     build_read_param_frame, build_run_mode_frame, build_set_device_id_frame, build_set_zero_frame,
-    build_write_param_f32_frame, parse_can_id, parse_param_response, parse_status_frame,
-    DEFAULT_HOST_ID,
+    build_version_read_frame, build_write_param_f32_frame, parse_can_id, parse_param_response,
+    parse_status_frame, parse_version_reply, ReportedLimits, VersionReply, DEFAULT_HOST_ID,
 };
 
-use crate::bus::{RobstrideBus, SocketCanBus};
+use crate::bus::{AnyCanBus, RobstrideBus};
 use crate::error::{Error, Result};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// High-level controller for a single Robstride motor on any [`RobstrideBus`].
-pub struct Motor<B: RobstrideBus = SocketCanBus> {
+pub struct Motor<B: RobstrideBus = AnyCanBus> {
     bus: B,
     motor_id: u8,
     host_id: u8,
@@ -45,8 +45,9 @@ pub struct Motor<B: RobstrideBus = SocketCanBus> {
     torque_constant: Option<f32>,
 }
 
-impl Motor<SocketCanBus> {
-    /// Open the given SocketCAN interface and bind to a single motor id.
+impl Motor<AnyCanBus> {
+    /// Open the CAN interface named by `interface` and bind to a single motor
+    /// id. See [`AnyCanBus::open`] for the accepted interface forms.
     pub fn open(interface: &str, motor_id: u8, model: MotorModel) -> Result<Self> {
         Self::open_with_host(interface, motor_id, DEFAULT_HOST_ID, model)
     }
@@ -59,7 +60,7 @@ impl Motor<SocketCanBus> {
         host_id: u8,
         model: MotorModel,
     ) -> Result<Self> {
-        let bus = SocketCanBus::open(interface)?;
+        let bus = AnyCanBus::open(interface)?;
         Ok(Self::with_bus_and_host(bus, motor_id, host_id, model))
     }
 }
@@ -383,6 +384,65 @@ impl<B: RobstrideBus> Motor<B> {
         Ok(())
     }
 
+    /// Read the firmware version (manual: communication type 26).
+    ///
+    /// This is what the vendor tool sends as part of "Detection Devices", and
+    /// unlike the parameter-table reads it is a documented single frame in and
+    /// a single frame out.
+    ///
+    /// Two traps, both confirmed by capture:
+    /// - the request goes out under the **`DISABLE`** comm type, separated
+    ///   from a real disable only by its `00 C4` payload prefix;
+    /// - the reply comes back under the **feedback** comm type, separated only
+    ///   by its `00 C4 56` prefix. Any status read racing this call could pick
+    ///   the reply up and decode it as position/velocity/torque, so this
+    ///   discards frames that are not version replies rather than trusting
+    ///   whatever arrives first.
+    pub fn read_version(&mut self) -> Result<VersionReply> {
+        let (id, data) = build_version_read_frame(self.host_id, self.motor_id);
+        self.send(id, &data)?;
+        let start = Instant::now();
+        loop {
+            if start.elapsed() > self.timeout {
+                return Err(Error::Timeout {
+                    motor_id: self.motor_id,
+                });
+            }
+            let frame = self.bus.recv()?;
+            if let Some(reply) = parse_version_reply(frame.can_id, &frame.data) {
+                if reply.motor_id == self.motor_id {
+                    return Ok(reply);
+                }
+            }
+        }
+    }
+
+    /// Read the limits the motor reports about itself, for cross-checking the
+    /// model this driver was opened with.
+    ///
+    /// Read-only and safe to call on a disabled motor. Individual reads that
+    /// fail are left as `None` rather than failing the call: a firmware build
+    /// that omits one parameter should still let the other be checked, and
+    /// [`ReportedLimits::consistent_with`] already treats a missing reading as
+    /// evidence of nothing.
+    pub fn read_reported_limits(&mut self) -> ReportedLimits {
+        let mut read = |param: ParamIndex| match self.read_param(param) {
+            Ok(v) if v.is_finite() && v > 0.0 => Some(v),
+            Ok(v) => {
+                log::debug!("motor {}: {param:?} read back {v}, ignoring", self.motor_id);
+                None
+            }
+            Err(e) => {
+                log::debug!("motor {}: could not read {param:?}: {e}", self.motor_id);
+                None
+            }
+        };
+        ReportedLimits {
+            limit_torque: read(ParamIndex::LimitTorque),
+            limit_spd: read(ParamIndex::LimitSpd),
+        }
+    }
+
     // ---------------------------------------------------------------------
     // Status
     // ---------------------------------------------------------------------
@@ -511,5 +571,20 @@ impl<B: RobstrideBus> Motor<B> {
             temperature: f32::NAN,
             status: robstride_protocol::MotorStatusBits::default(),
         })
+    }
+}
+
+/// Leave the motor de-energised when the handle goes away.
+///
+/// Best-effort: the bus may already be gone, and there is nothing useful to do
+/// about it if it is. What matters is that dropping a `Motor` — because a GUI
+/// window closed, a job ended, or a thread unwound — cannot leave a motor
+/// holding torque with nobody driving it. `LkMotor` and `MyActuatorMotor` have
+/// always done this; this driver and `DamiaoMotor` used to be the exceptions.
+impl<B: RobstrideBus> Drop for Motor<B> {
+    fn drop(&mut self) {
+        if let Err(e) = self.disable() {
+            log::warn!("robstride: disable on drop failed for motor {}: {e}", self.motor_id);
+        }
     }
 }

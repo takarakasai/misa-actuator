@@ -1,14 +1,19 @@
 # misa-actuator
 
 Common actuator-control interface for multiple servo-motor families on
-multiple bus transports, plus a debug TUI.
+multiple bus transports, plus a debug TUI. Runs on Linux and Windows — see
+[`doc/windows.md`](doc/windows.md) for the Windows setup.
 
 ## Workspace layout
 
 ```
 crates/
 ├── misa-actuator/          # common Actuator trait, types, unified Error
+├── misa-actuator-core/     # session: I/O worker thread, setpoints, watchdog
+├── misa-actuator-gui/      # Tauri desktop GUI (front end in ../ui)
+├── misa-actuator-sim/      # simulated Actuator, calibrated from bench data
 ├── misa-actuator-tui/      # ratatui-based debug TUI (driver-agnostic)
+├── misa-can/               # CAN transport: SocketCAN / PCAN-Basic / SLCAN
 ├── misa-sysid/             # chirp system-identification + FRF tooling
 ├── lkmotor-protocol/       # LK Motor V3 frame codec (no_std)
 ├── lkmotor-driver/         # LK Motor driver (RS485), impl Actuator
@@ -28,10 +33,22 @@ crates/
 
 | family | models | transport | notes |
 |--------|--------|-----------|-------|
-| Robstride | RS-00…RS-06 (`--model rs04`, `robstride04`, `Edulite05`, …) | SocketCAN | per-model MIT scales |
+| Robstride | RS-00…RS-06 (`--model rs04`, `robstride04`, `Edulite05`, …) | CAN | per-model MIT scales |
 | LK Motor (上海凌控) V3 | MG4005 etc. | RS485 | current-based torque (`--kt`), soft zero |
-| DAMIAO | DM-J4310, DM-J3507 | SocketCAN classic / CAN-FD | register-based run modes |
-| MyActuator RMD (CAN V3) | RMD-X / RMD-L V3 firmware | SocketCAN | output-shaft wire units, native motion (MIT) mode |
+| DAMIAO | DM-J4310, DM-J3507 | CAN classic / CAN-FD | register-based run modes |
+| MyActuator RMD (CAN V3) | RMD-X / RMD-L V3 firmware | CAN | output-shaft wire units, native motion (MIT) mode |
+
+"CAN" above means any transport `misa-can` supports, selected by the
+`--interface` string:
+
+| backend | platform | CAN-FD | interface |
+|---------|----------|--------|-----------|
+| SocketCAN | Linux | yes | `can0` |
+| PCAN-Basic (PEAK) | Windows | yes | `pcan:usb1`, `pcan:usb2@1M,5M` |
+| SLCAN (CANable, …) | Linux + Windows | no | `slcan:COM5`, `slcan:/dev/ttyACM0` |
+
+RS485 needs no backend selection — pass the port name (`/dev/ttyUSB0`,
+`COM5`); `lkmotor-cli ports` lists what is attached.
 
 See [`crates/robstride-protocol/doc/communication-protocols.md`](crates/robstride-protocol/doc/communication-protocols.md)
 for a full rundown of RobStride's wire protocols (classic private protocol vs. the undocumented
@@ -42,9 +59,12 @@ bulk/single parameter-table reads used to fetch firmware version etc.).
 `misa_actuator::Actuator` is the SI-unit motor-control trait that
 applications speak. Each motor family has its own internal **bus** trait
 (e.g. `LkBus`, `RobstrideBus`, `DamiaoBus`, `MyActuatorBus`) so that the
-same motor protocol can run on RS485 / SocketCAN / EtherCAT / etc. Driver
+same motor protocol can run on RS485 / CAN / EtherCAT / etc. Driver
 structs are generic over the bus, and the `Actuator` impl is
 bus-independent.
+
+The three CAN families share one transport layer, `misa-can`, so a new
+adapter is implemented once rather than per family.
 
 ```
         application / TUI  ─►  dyn Actuator
@@ -54,8 +74,13 @@ bus-independent.
    LkMotor<B>       RobstrideMotor<B>  DamiaoMotor<B>   MyActuatorMotor<B>
         │                  │               │                   │
     LkBus trait      RobstrideBus     DamiaoBus trait   MyActuatorBus trait
-        │                  │               │                   │
-  (RS485 / CAN / ...) (SocketCAN)   (CAN / CAN-FD)       (SocketCAN)
+        │                  └───────────────┼───────────────────┘
+        │                                  ▼
+        │                        misa_can::CanBus trait
+        │                                  │
+        │                ┌─────────────────┼─────────────────┐
+   (RS485 serial)   SocketCAN          PCAN-Basic          SLCAN
+                     (Linux)            (Windows)      (serial, any OS)
 ```
 
 ## Quick start (TUI)
@@ -64,12 +89,99 @@ bus-independent.
 # Robstride RS-04 on can0
 misa-actuator-tui --driver robstride --interface can0 --motor-id 1 --model rs04
 
+# ...the same motor on Windows, through a PEAK adapter
+misa-actuator-tui --driver robstride --interface pcan:usb1 --motor-id 1 --model rs04
+
 # MyActuator RMD (CAN V3) on can0, Kt 0.83 N·m/A (0 → current-units mode)
 misa-actuator-tui --driver myactuator --interface can0 --motor-id 1 --kt 0.83
 
 # DAMIAO DM-J4310 on CAN-FD
 misa-actuator-tui --driver damiao --interface can0 --bus can-fd --motor-id 1 --model DM4310
 
-# LK Motor MG4005 on RS485
+# LK Motor MG4005 on RS485 (--interface COM5 on Windows)
 misa-actuator-tui --driver lkmotor --interface /dev/ttyUSB0 --motor-id 1 --baud 1000000 --gear-ratio 10.0
 ```
+
+## GUI
+
+A Tauri desktop app: Rust backend (the same drivers everything else uses) with
+a TypeScript front end.
+
+```powershell
+cd ui
+npm ci
+npm run app            # starts Vite + the app, with hot reload
+```
+
+That is the command to use day to day. `npm run app` runs `tauri dev`, which
+starts the Vite dev server and then `cargo run` — both halves, in the right
+order.
+
+**`cargo run -p misa-actuator-gui` on its own is not enough in a debug build.**
+Tauri points a debug build at the dev server (`http://localhost:5173`), so
+without Vite running the window opens on `ERR_CONNECTION_REFUSED`. Either use
+`npm run app`, or build a release binary, which embeds the front end and needs
+nothing else at run time:
+
+```powershell
+cd ui; npm run build; cd ..
+cargo run -p misa-actuator-gui --release
+```
+
+To produce a distributable installer:
+
+```powershell
+cd ui
+npm run app:build      # → target/release/bundle/nsis/
+```
+
+Every other crate needs nothing but a Rust toolchain — the workspace's
+`default-members` excludes the GUI, so a plain `cargo build` / `cargo test`
+still works without Node installed.
+
+The GUI opens a motor exactly the way the CLIs do, including `--driver sim`, so
+it is fully usable with no hardware attached.
+
+**Safety.** Three independent mechanisms, because a UI is one more thing that
+can stop working while a motor is energised:
+
+- **STOP** (button, or `Esc` from anywhere) sets a flag the worker checks
+  before every bus transaction. It is not a queued command, so it cannot end
+  up behind a backlog.
+- A **watchdog** disables the motor if the window stops polling while
+  streaming. That covers a hung renderer, where by definition nobody can press
+  stop. Minimising the window while streaming will trip it — deliberately.
+- **Closing the window** stops the motor and waits for the worker to confirm
+  before the process exits.
+
+## Developing without hardware
+
+`misa-actuator-sim` is a simulated `Actuator` — motor, load, friction and
+thermal model — that every tool in the workspace accepts:
+
+```powershell
+misa-actuator-tui --driver sim --model rs04 --motor-id 1
+misa-actuator-identify --interface sim --vendors sim --from 1 --to 12
+```
+
+The `dm4310` and `rs04` presets are calibrated from
+[`doc/bench-measurements-2026-07-30.md`](doc/bench-measurements-2026-07-30.md)
+— torque constants, inertia, static and kinetic friction, heating rate. That
+makes it more than a stub: a characterization run against the simulator has a
+*known right answer*, which no real motor can offer. `misa-actuator-sim`'s
+integration tests assert that `misa-sysid` recovers the planted values.
+
+## Platform notes
+
+Linux is the reference platform. Windows is fully supported with two
+differences worth knowing up front:
+
+- **No kernel CAN stack.** Pick a PEAK adapter (`pcan:usb1`, CAN-FD capable)
+  or an SLCAN dongle (`slcan:COM5`, classic CAN only, lower throughput).
+- **Coarse default timer.** Windows rounds sleeps up to ~15.6 ms, so the
+  binaries request a 1 ms tick and busy-wait the last fraction of a
+  millisecond in periodic loops. Rates up to ~1 kHz hold; the highest-rate
+  identification runs are still better done on Linux.
+
+Full setup, interface-string reference and troubleshooting:
+[`doc/windows.md`](doc/windows.md).

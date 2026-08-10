@@ -15,7 +15,7 @@ use lkmotor_driver::{MotorId, Rs485Driver};
 #[derive(Parser, Debug)]
 #[command(about = "Hex-dump raw payloads from common LK Motor read commands")]
 struct Args {
-    #[arg(short, long, default_value = "/dev/ttyUSB0")]
+    #[arg(short, long, default_value = lkmotor_driver::default_serial_port())]
     device: String,
     #[arg(short, long, default_value_t = 1_000_000)]
     baud: u32,

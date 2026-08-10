@@ -19,7 +19,7 @@ use lkmotor_driver::LkCommands;
 #[command(about = "Scan the RS485 bus for any responding LK Motor V3 servo")]
 struct Args {
     /// Serial device path (e.g., /dev/ttyUSB0).
-    #[arg(short, long, default_value = "/dev/ttyUSB0")]
+    #[arg(short, long, default_value = lkmotor_driver::default_serial_port())]
     device: String,
 
     /// Serial baud rate.

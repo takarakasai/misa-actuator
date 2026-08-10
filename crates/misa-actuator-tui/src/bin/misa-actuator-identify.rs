@@ -53,9 +53,9 @@ use misa_actuator_tui::factory::{build_actuator, BusKind, DriverConfig, DriverKi
     about = "Identify which vendor's actuator answers on each bus address, by trying every driver's scan in turn"
 )]
 struct Cli {
-    /// SocketCAN interface (e.g. can0) or serial port (e.g. /dev/ttyUSB0) —
-    /// tried against every vendor; ones that don't match this transport
-    /// simply fail to open and are skipped.
+    /// CAN interface (`can0`, `pcan:usb1`, `slcan:COM5`) or serial port
+    /// (`/dev/ttyUSB0`, `COM5`) — tried against every vendor; ones that don't
+    /// match this transport simply fail to open and are skipped.
     #[arg(long)]
     interface: String,
 
@@ -84,7 +84,7 @@ struct Cli {
 
     /// Robstride/Damiao: motor model name (only matters if a vendor's
     /// `open()` validates it before scanning).
-    #[arg(long, default_value = "Edulite05")]
+    #[arg(long, default_value = misa_actuator_tui::factory::MODEL_UNSPECIFIED)]
     model: String,
 
     /// Damiao: physical CAN layer.
@@ -190,6 +190,10 @@ fn read_details(
         // Neither the CAN nor RS485 manual for this vendor documents a
         // model-name or firmware-version command (see module docs).
         DriverKind::Lkmotor => Details::NONE,
+        // The simulator answers every probe it is configured to answer, so it
+        // is deliberately absent from `--vendors` by default — including it
+        // would drown out whatever real hardware is on the wire.
+        DriverKind::Sim => Details::NONE,
     }
 }
 
@@ -199,11 +203,15 @@ fn vendor_label(kind: DriverKind) -> &'static str {
         DriverKind::Damiao => "damiao",
         DriverKind::Myactuator => "myactuator",
         DriverKind::Lkmotor => "lkmotor",
+        DriverKind::Sim => "sim",
     }
 }
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // Windows sleeps round up to the ~15.6 ms scheduler tick by default,
+    // which would throttle every timed loop below. No-op on Linux.
+    let _timer = misa_actuator::realtime::TimerResolutionGuard::acquire();
     let cli = Cli::parse();
 
     if cli.to < cli.from {

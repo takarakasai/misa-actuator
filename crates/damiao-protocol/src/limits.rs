@@ -160,6 +160,64 @@ impl MotorModel {
         }
     }
 
+    /// The reduction ratio, which is also the last digits of the part number.
+    ///
+    /// From the manuals' specification tables (see
+    /// `doc/dm-j-series-cross-model-reference.md`). `P` variants match their
+    /// siblings exactly.
+    pub const fn gear_ratio(&self) -> u16 {
+        match self {
+            MotorModel::Dm3507 => 7,
+            MotorModel::Dm4310 | MotorModel::Dm4310P => 10,
+            MotorModel::Dm4340 | MotorModel::Dm4340P => 40,
+            MotorModel::Dm6248P => 48,
+            MotorModel::Dm8009 | MotorModel::Dm8009P => 9,
+            MotorModel::Dm10422P => 22,
+        }
+    }
+
+    /// Identify the model from the reduction ratio the motor reports in `GR`
+    /// (RID 20).
+    ///
+    /// **This is model identification over the bus, and it is exact.** Every
+    /// distinct DM-J motor has a distinct reduction ratio, and the ratio is a
+    /// read-only constant the firmware reports about itself — not a setting
+    /// that can drift.
+    ///
+    /// The one ambiguity is the `P` suffix, which shares a ratio with its
+    /// sibling. That is not a real ambiguity for anything the driver does: the
+    /// manuals list identical torque, speed and ratio for each pair, and both
+    /// members share a register layout, so this returns the non-`P` variant
+    /// and every derived value is correct either way.
+    ///
+    /// Rounds, because `GR` comes back as an `f32` — a real DM4310 reports
+    /// exactly `10`, but a ratio is an integer and float equality is the wrong
+    /// test for one.
+    pub fn from_gear_ratio(gr: f32) -> Option<Self> {
+        if !gr.is_finite() || gr <= 0.0 {
+            return None;
+        }
+        let want = (gr + 0.5) as u16;
+        // Prefer the non-`P` sibling when there is one, but fall back to a `P`
+        // variant — `DM6248P` and `DM10422P` have no non-`P` counterpart, and
+        // skipping them outright would leave two real motors unidentifiable.
+        let mut fallback = None;
+        let mut i = 0;
+        while i < Self::ALL.len() {
+            let m = Self::ALL[i];
+            if m.gear_ratio() == want {
+                if !m.name().ends_with('P') {
+                    return Some(m);
+                }
+                if fallback.is_none() {
+                    fallback = Some(m);
+                }
+            }
+            i += 1;
+        }
+        fallback
+    }
+
     /// Which register-map layout this model uses above RID `0x25`.
     pub const fn register_layout(&self) -> RegisterLayout {
         match self {
@@ -330,6 +388,63 @@ impl LowerBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reduction ratio is what makes over-the-bus identification work, so
+    /// it has to stay unique across distinct motors. If a future model
+    /// duplicates one, `from_gear_ratio` silently starts answering with the
+    /// wrong motor.
+    #[test]
+    fn every_distinct_model_has_its_own_gear_ratio() {
+        for &a in MotorModel::ALL {
+            for &b in MotorModel::ALL {
+                if a == b || a.gear_ratio() != b.gear_ratio() {
+                    continue;
+                }
+                // The only permitted collision is a P/non-P pair, which the
+                // manuals give identical specs and a shared register layout.
+                assert_eq!(
+                    a.name().trim_end_matches('P'),
+                    b.name().trim_end_matches('P'),
+                    "{} and {} share a ratio but are different motors",
+                    a.name(),
+                    b.name()
+                );
+                assert_eq!(a.limits(), b.limits());
+                assert_eq!(a.register_layout(), b.register_layout());
+            }
+        }
+    }
+
+    #[test]
+    fn a_reported_gear_ratio_identifies_the_model() {
+        // Measured on a real DM-J4310-2EC over CAN-FD: GR (RID 20) = 10.
+        assert_eq!(MotorModel::from_gear_ratio(10.0), Some(MotorModel::Dm4310));
+
+        // Every model must be reachable, including the two that exist only as
+        // `P` variants (DM6248P, DM10422P) and so have no sibling to fall back
+        // to.
+        for &m in MotorModel::ALL {
+            let found = MotorModel::from_gear_ratio(m.gear_ratio() as f32)
+                .unwrap_or_else(|| panic!("{} has no match", m.name()));
+            // A `P` motor may resolve to its sibling, which is the same machine.
+            assert_eq!(found.limits(), m.limits(), "{}", m.name());
+            assert_eq!(found.register_layout(), m.register_layout(), "{}", m.name());
+        }
+        assert_eq!(
+            MotorModel::from_gear_ratio(48.0),
+            Some(MotorModel::Dm6248P),
+            "a P-only model must still be identifiable"
+        );
+        assert_eq!(MotorModel::from_gear_ratio(22.0), Some(MotorModel::Dm10422P));
+    }
+
+    #[test]
+    fn an_implausible_gear_ratio_is_not_forced_onto_a_model() {
+        assert_eq!(MotorModel::from_gear_ratio(0.0), None);
+        assert_eq!(MotorModel::from_gear_ratio(-1.0), None);
+        assert_eq!(MotorModel::from_gear_ratio(f32::NAN), None);
+        assert_eq!(MotorModel::from_gear_ratio(100.0), None);
+    }
 
     #[test]
     fn parse_names() {

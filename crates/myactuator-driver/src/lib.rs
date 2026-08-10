@@ -1,5 +1,8 @@
-//! SocketCAN driver for MyActuator RMD servo motors (CAN protocol V3),
+//! CAN driver for MyActuator RMD servo motors (CAN protocol V3),
 //! implementing [`misa_actuator::Actuator`].
+//!
+//! The transport comes from the interface string: `can0` (Linux SocketCAN),
+//! `pcan:usb1` (PEAK adapter on Windows) or `slcan:COM5` (USB-CAN dongle).
 //!
 //! ```no_run
 //! use myactuator_driver::{MotorConfig, MyActuatorMotor};
@@ -16,7 +19,7 @@
 //!
 //! ## Multi-motor buses
 //!
-//! Wrap one opened [`SocketCanBus`] in [`misa_actuator::Shared`] and hand each
+//! Wrap one opened [`AnyCanBus`] in [`misa_actuator::Shared`] and hand each
 //! [`MyActuatorMotor`] a clone; replies are disambiguated by the per-motor
 //! reply id (`0x240 + ID`).
 
@@ -26,11 +29,11 @@ pub mod driver;
 pub mod error;
 pub mod scan;
 
-pub use bus::{CanFrame, MyActuatorBus, SocketCanBus};
+pub use bus::{AnyCanBus, CanBus, CanFrame, MyActuatorBus};
 pub use driver::{MotorConfig, MotorFeedback, MotorStatus, MyActuatorMotor};
 pub use error::{Error, Result};
 pub use myactuator_protocol::{ErrorState, MotionFeedback, ParamIndex, Status1, Status2};
-pub use scan::{probe_one, scan_bus_on};
+pub use scan::{dump_bus_on, probe_one, scan_bus_on};
 
 #[cfg(test)]
 mod tests {

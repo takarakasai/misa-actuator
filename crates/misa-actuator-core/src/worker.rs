@@ -1019,8 +1019,14 @@ impl Worker {
                 let _ = self.events.send(Event::CharacterizeFinished {
                     run,
                     // An empty series is not a measurement, and plotting one
-                    // looks exactly like a measurement of zero.
-                    data: (!data.x.is_empty()).then_some(data),
+                    // looks exactly like a measurement of zero — but findings
+                    // without a curve still are one. A breakaway map where
+                    // nothing broke loose plots nothing and yet knows five
+                    // positions were tried and none moved, which is a result;
+                    // dropping it reported "no measurement" for a run that had
+                    // measured something definite (2026-08-08, an RMD-X4 whose
+                    // ramp ceiling was too low).
+                    data: (!data.x.is_empty() || !data.summary.is_empty()).then_some(data),
                     aborted,
                     fitted_kt,
                     suggested_torque_limit_nm,

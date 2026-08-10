@@ -190,9 +190,20 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         timeout: u64,
     },
-    /// Read firmware version (AppCodeVersion) via RobStride's undocumented
-    /// bulk parameter table (reverse-engineered from motorstudio — see
-    /// robstride_protocol::param_table).
+    /// Read the version via the undocumented BULK parameter table. Prefer
+    /// `identify`, which is safe.
+    ///
+    /// This path has silenced three motors until power-cycled, and truncates the
+    /// answer: `0.4.` where the motor holds `0.4.1.32`. The first symptom is
+    /// `disable on drop failed: timeout` as the command exits.
+    ///
+    /// `identify` reads the same version over comm type 26 — the exchange the
+    /// vendor's own tool sends — with neither problem, and prints the evidence
+    /// it rests on. There is no reason to run this instead.
+    ///
+    /// Kept because it is the only user of the bulk path, so removing it would
+    /// remove the ability to reproduce the fault (reverse-engineered from
+    /// motorstudio — see robstride_protocol::param_table).
     Version {
         /// Overall read timeout (ms).
         #[arg(long, default_value_t = 500)]
@@ -797,6 +808,24 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Version { timeout_ms } => {
+            // Warn and proceed, as `damiao-cli reg-write` does: this is a
+            // diagnostic tool and the operator may mean it. What was missing was
+            // any statement of the cost before the frames go out.
+            //
+            // Three motors have been silenced by this path (doc/handover.md
+            // section 6), two of them on 2026-08-05 by someone who had read the
+            // `--deep` warning on `identify` and assumed it covered this too.
+            // The subcommand names suggest these are the same exchange. They are
+            // not, and the safe one also returns a better answer.
+            eprintln!(
+                "WARNING: `version` reads the undocumented BULK parameter table, which has \
+                 left three RobStride motors unresponsive until power-cycled — the first \
+                 symptom is `disable on drop failed: timeout` as this command exits. It also \
+                 truncates: expect `0.4.` where the motor holds `0.4.1.32`.\n\
+                 \n\
+                 Use `identify` instead. It reads the version over comm type 26, which is \
+                 what the vendor's own tool sends, and returns all four components.\n"
+            );
             let mut motor = open_motor_unscaled(&cli)?;
             param_commands::run_version(&mut motor, cli.motor_id, *timeout_ms)?;
         }

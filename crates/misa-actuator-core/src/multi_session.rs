@@ -102,6 +102,14 @@ pub struct MotorReading {
     pub misses: u32,
     /// The most recent failure, if the last transaction failed.
     pub error: Option<String>,
+    /// What the worker would command this motor right now, in the units of its
+    /// current mode ([`Setpoint::primary`]).
+    ///
+    /// Reported so a table can show commanded next to measured, and so a UI can
+    /// fill its target box from the value the worker actually holds. A box that
+    /// shows zero while the worker holds a seeded position would be a display
+    /// that disagrees with the machine — and the operator would trust the box.
+    pub target: f32,
 }
 
 /// Every motor's latest reading, taken in one pass.
@@ -199,6 +207,12 @@ struct Shared {
     /// Overwritten rather than queued, for the reason the single-motor session
     /// gives: dragging a slider must not pile up commands.
     setpoints: Mutex<Vec<Setpoint>>,
+    /// Whether a caller has chosen a target for this motor yet.
+    ///
+    /// One flag per motor, because seeding is per motor: a four-motor wire has
+    /// four shafts resting in four different places. Same purpose as the
+    /// single-motor session's single flag — see [`Worker::seed_position`].
+    setpoints_touched: Vec<AtomicBool>,
     streaming: AtomicBool,
     stop: AtomicBool,
     stop_reason: AtomicU8,
@@ -243,6 +257,27 @@ impl Shared {
         }
         let last = self.last_heartbeat_ms.load(Ordering::Acquire);
         self.now_ms().saturating_sub(last) > limit
+    }
+
+    /// Point one motor's position setpoint at where its shaft actually is, but
+    /// only while nobody has chosen a target for it.
+    ///
+    /// The same hazard as the single-motor session's seeding
+    /// ([`crate::worker`]), multiplied: a motor remembers its position across
+    /// power cycles and a freshly-opened table does not, so without this the
+    /// first streaming pass sends **every** motor to zero at whatever the speed
+    /// cap allows. On a shared wire that is four shafts setting off at once.
+    ///
+    /// The simulator cannot catch its absence: every preset starts at zero,
+    /// where a command of zero and a correct seed are indistinguishable. It took
+    /// looking at two real motors resting at non-zero angles.
+    fn seed_position(&self, i: usize, position_rad: f32) {
+        if !position_rad.is_finite() || self.setpoints_touched[i].load(Ordering::Acquire) {
+            return;
+        }
+        if let Ok(mut guard) = self.setpoints.lock() {
+            guard[i].position_rad = position_rad;
+        }
     }
 
     fn period(&self) -> Duration {
@@ -298,6 +333,7 @@ impl MultiSession {
         let shared = Arc::new(Shared {
             started: Instant::now(),
             setpoints: Mutex::new(vec![Setpoint::default(); motors.len()]),
+            setpoints_touched: (0..motors.len()).map(|_| AtomicBool::new(false)).collect(),
             streaming: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             stop_reason: AtomicU8::new(STOP_NONE),
@@ -366,6 +402,10 @@ impl MultiSession {
         if let Ok(mut guard) = self.shared.setpoints.lock() {
             guard[index] = sp;
         }
+        // After this the worker must stop seeding this motor, or "set a target,
+        // then enable" would have the next reading quietly replace the target
+        // with wherever the shaft happens to be.
+        self.shared.setpoints_touched[index].store(true, Ordering::Release);
         Ok(())
     }
 
@@ -732,12 +772,14 @@ impl Worker {
                 m.last_error = None;
                 m.last = fb;
                 m.last_ok = Some(Instant::now());
+                self.shared.seed_position(i, fb.position_rad);
             }
             Err(e) => note_fault(m, "transaction", e, &self.events),
         }
 
         self.status_if_due(i);
     }
+
 
     /// Voltage, temperature and fault bits, on their own slower cadence.
     ///
@@ -894,12 +936,22 @@ impl Worker {
             return;
         }
         let elapsed = self.last_flush.elapsed().as_secs_f32().max(1e-6);
+        // Read once for the whole snapshot, so every row's target comes from the
+        // same instant as its neighbours.
+        let targets: Vec<f32> = self
+            .shared
+            .setpoints
+            .lock()
+            .map(|g| g.iter().map(|sp| sp.primary()).collect())
+            .unwrap_or_default();
         let snapshot = MultiSnapshot {
             t_s: self.shared.started.elapsed().as_secs_f64(),
             motors: self
                 .motors
                 .iter()
-                .map(|m| MotorReading {
+                .enumerate()
+                .map(|(i, m)| MotorReading {
+                    target: targets.get(i).copied().unwrap_or(f32::NAN),
                     motor_id: m.spec.motor_id,
                     driver: m.spec.driver,
                     label: m.spec.label(),
@@ -1152,6 +1204,83 @@ mod tests {
         );
     }
 
+    /// A shaft resting away from zero must not be commanded to zero by the act
+    /// of connecting.
+    ///
+    /// Three cases, because each guard removes a different accident:
+    ///
+    ///   - untouched: the setpoint follows the measurement, so the first
+    ///     streaming pass says "stay where you are" instead of "go to zero"
+    ///   - touched: seeding stops, or "set a target, then enable" would have the
+    ///     next reading quietly discard the target
+    ///   - not finite: a driver that reports no position must not be able to
+    ///     write `NaN` into a command
+    ///
+    /// Tested against `Shared` rather than through a session because the
+    /// simulator starts every preset at zero, where a correct seed and a
+    /// forgotten one look identical.
+    #[test]
+    fn a_resting_shaft_is_not_commanded_to_zero() {
+        let shared = Shared {
+            started: Instant::now(),
+            setpoints: Mutex::new(vec![Setpoint::default(); 2]),
+            setpoints_touched: (0..2).map(|_| AtomicBool::new(false)).collect(),
+            streaming: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            stop_reason: AtomicU8::new(STOP_NONE),
+            rate_millihz: AtomicU32::new(rate_to_millihz(DEFAULT_RATE_HZ)),
+            last_heartbeat_ms: AtomicU64::new(0),
+            watchdog_ms: AtomicU64::new(0),
+            alive: AtomicBool::new(true),
+        };
+        let target_of = |i: usize| shared.setpoints.lock().unwrap()[i].position_rad;
+
+        // Default is the dangerous value, which is the whole reason for seeding.
+        assert_eq!(target_of(0), 0.0);
+
+        shared.seed_position(0, 5.9);
+        assert_eq!(target_of(0), 5.9, "an untouched motor should follow its shaft");
+        // Still tracking: a shaft turned by hand keeps the command with it.
+        shared.seed_position(0, 6.1);
+        assert_eq!(target_of(0), 6.1);
+
+        shared.setpoints_touched[0].store(true, Ordering::Release);
+        shared.seed_position(0, 0.2);
+        assert_eq!(target_of(0), 6.1, "a chosen target must survive the next reading");
+
+        shared.seed_position(1, f32::NAN);
+        assert_eq!(target_of(1), 0.0, "NaN must not reach a command");
+        shared.seed_position(1, f32::INFINITY);
+        assert_eq!(target_of(1), 0.0);
+
+        // Per motor: seeding motor 0 must not have moved motor 1's target.
+        shared.seed_position(1, -1.25);
+        assert_eq!(target_of(1), -1.25);
+        assert_eq!(target_of(0), 6.1);
+    }
+
+    /// Marking a target as chosen is what stops the worker from seeding over it,
+    /// so it has to happen on the same call that writes the target — not later,
+    /// and not in the UI.
+    #[test]
+    fn choosing_a_target_marks_it_as_chosen() {
+        let s = MultiSession::connect(&sim_cfg(&[1, 2])).unwrap();
+        let mut sp = Setpoint::default();
+        sp.position_rad = 0.5;
+        s.set_setpoint(2, sp).unwrap();
+        assert!(
+            s.shared.setpoints_touched[1].load(Ordering::Acquire),
+            "the motor that was addressed"
+        );
+        assert!(
+            !s.shared.setpoints_touched[0].load(Ordering::Acquire),
+            "and only that motor"
+        );
+        // The value survives however many readings the worker takes meanwhile.
+        let _ = wait_for_snapshot(&s);
+        assert_eq!(s.setpoint(2).unwrap().position_rad, 0.5);
+    }
+
     /// The TypeScript side depends on these shapes, so a rename here fails a
     /// test rather than a running app.
     ///
@@ -1206,6 +1335,7 @@ mod tests {
                 enabled: true,
                 misses: 0,
                 error: None,
+                target: 0.25,
             }],
             achieved_rate_hz: 50.0,
             dropped: 0,
@@ -1217,6 +1347,10 @@ mod tests {
         assert!(json.contains("\"driver\":\"damiao\""), "{json}");
         assert!(json.contains("\"positionRad\":0.25"), "{json}");
         assert!(json.contains("\"ageMs\":12"), "{json}");
+        // Commanded, next to measured. A UI fills its target box from this, so a
+        // rename would silently give every box a default of zero again — which is
+        // the jump this field exists to prevent.
+        assert!(json.contains("\"target\":0.25"), "{json}");
         assert!(json.contains("\"achievedRateHz\":50"), "{json}");
         assert!(json.contains("\"starvedPasses\":0"), "{json}");
         assert!(json.contains("\"drainedFrames\":0"), "{json}");

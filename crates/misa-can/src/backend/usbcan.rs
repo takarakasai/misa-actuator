@@ -143,6 +143,12 @@ const MAX_DATA_PACKET: usize = 15;
 /// deadline, so this only bounds how precisely a timeout lands.
 const READ_QUANTUM: Duration = Duration::from_millis(5);
 
+/// How long the adapter needs after its settings command before it will transmit.
+///
+/// Paid once, at open. See [`UsbCanBackend::send_settings`] for the measurement
+/// that says this is required rather than cautious.
+const SETTINGS_SETTLE: Duration = Duration::from_millis(100);
+
 /// Cap on unparsed bytes held while looking for a packet, so a wedged adapter
 /// streaming garbage cannot grow the buffer without limit.
 const MAX_PARTIAL: usize = 8 * MAX_DATA_PACKET;
@@ -245,19 +251,29 @@ impl UsbCanBackend {
         Ok(bus)
     }
 
-    /// Send the settings command and clear whatever the adapter echoes.
+    /// Send the settings command, then give the adapter time to apply it.
     ///
-    /// Nothing is waited for: the adapter does not acknowledge, so there is no
-    /// verdict to read. That means **a wrong serial framing cannot be detected
-    /// here** — the write succeeds into a device that never understood it, and
-    /// the symptom arrives later as a receive timeout. Hence the loud logging of
-    /// baud and stop bits at open.
+    /// **The settle wait is not politeness — without it the first frames sent are
+    /// lost.** Measured 2026-08-05 against a live bus with a PEAK adapter
+    /// watching: probing ids 1..4 immediately after opening put only ids 3 and 4
+    /// on the wire, and probing a single id put nothing there at all. The adapter
+    /// re-initialises its CAN controller when the settings arrive and drops
+    /// whatever is handed to it meanwhile.
+    ///
+    /// Easy to miss, because the reference implementation sends its settings and
+    /// then listens — a lost first transmission never comes up.
+    ///
+    /// Nothing is waited *for*: the protocol has no acknowledgement, so there is
+    /// no verdict to read and a wrong serial framing cannot be detected here. The
+    /// write succeeds into a device that never understood it, and the symptom
+    /// arrives later as silence. Hence the loud logging of baud and stop bits.
     fn send_settings(&mut self, speed: u8, mode: u8) -> Result<()> {
         let packet = settings_packet(speed, mode);
         self.port.write_all(&packet)?;
         self.port.flush()?;
-        // Anything already buffered predates the new settings.
-        let deadline = Instant::now() + Duration::from_millis(50);
+        std::thread::sleep(SETTINGS_SETTLE);
+        // Anything buffered now predates the new settings.
+        let deadline = Instant::now() + Duration::from_millis(20);
         while Instant::now() < deadline {
             match self.port.read(&mut self.scratch) {
                 Ok(0) => break,

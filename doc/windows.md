@@ -153,11 +153,19 @@ What it cannot do:
   work this adapter is a step backwards.
 - **Classic CAN only.** No FD framing exists in the protocol.
 
-**If nothing is ever received, suspect the serial framing first.** Two protocol
-sources disagree about it, and the adapter never acknowledges its settings, so a
-wrong choice is silent. The default follows the one that has been run against
-hardware: 2 Mbaud, 8 data bits, **2 stop bits**. The vendor's note says 1,228,800
-and one stop bit:
+Verified against an RS-04 on 2026-08-05: `scan` and `identify` return the same
+answers as the PEAK adapter does, extended ids and all.
+
+**If nothing is received or sent, check the three wires and the 120R jumper
+first** — an hour went into a loose connection whose symptom was silence in both
+directions, and which also made the *PEAK* adapter lose sight of the motor twice.
+The protocol has no acknowledgement, not even for its settings command, so a wiring
+fault, a wrong serial framing and a dead unit all look identical from this side.
+Diagnose with a PEAK adapter alongside: send on one, listen on the other.
+
+**Serial framing: 2 Mbaud, 8 data bits, 2 stop bits** — the reference's values, and
+the ones that work. The vendor's note says 1,228,800 and one stop bit, which does
+not:
 
 ```powershell
 robstride-cli.exe -i "usbcan:COM1?serial-baud=1228800&stop-bits=1" scan
@@ -171,6 +179,13 @@ implementation uses `DLC + 5` for both, which declares an extended frame complet
 two bytes early and desyncs the stream. Our decoder counts per frame type and
 checks the trailing `0x55`, so a length mistake becomes a skipped packet instead
 of a mangled reading.
+
+**The adapter cannot transmit for ~100 ms after its settings command.** It
+re-initialises its CAN controller and drops whatever arrives meanwhile, so the
+backend waits before returning from open. Without that wait the first one or two
+frames vanish — probing four ids put only the last two on the wire, and probing a
+single id put nothing there. The reference implementation listens after
+configuring, so it never notices.
 
 The protocol itself is written out in `crates/misa-can/src/backend/usbcan.rs`.
 **The source material is not in the repository** — the licensing of some of it is

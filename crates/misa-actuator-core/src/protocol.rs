@@ -159,6 +159,74 @@ impl Default for ChirpJob {
     }
 }
 
+/// A quasi-static characterization run.
+///
+/// These share the chirp's lifecycle — the worker owns the loop, `STOP` cuts
+/// them short — but not its result shape, so they report through
+/// [`Event::CharacterizeFinished`] rather than [`Event::JobFinished`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", rename_all_fields = "camelCase", tag = "run")]
+pub enum CharacterizeJob {
+    /// Step through positions and record the holding torque at each: the load
+    /// the motor is working against, as a function of where it is.
+    LoadMap {
+        from_rad: f32,
+        to_rad: f32,
+        steps: u32,
+        settle_s: f32,
+        max_speed_rad_s: f32,
+        /// Sweep back as well, so hysteresis shows up as a gap between the
+        /// two directions instead of hiding inside one curve.
+        return_sweep: bool,
+    },
+    /// Ramp torque until the shaft breaks loose. The torque it goes at is the
+    /// stiction the motor has to overcome before it can move at all.
+    Breakaway {
+        ramp_nm_per_s: f32,
+        max_torque_nm: f32,
+        positive: bool,
+        rate_hz: f32,
+    },
+}
+
+impl CharacterizeJob {
+    /// A label for the run, for logs and the UI.
+    pub fn name(&self) -> &'static str {
+        match self {
+            CharacterizeJob::LoadMap { .. } => "load map",
+            CharacterizeJob::Breakaway { .. } => "breakaway",
+        }
+    }
+}
+
+/// What a characterization run produced.
+///
+/// Deliberately generic: one x/y series plus named findings. The runs measure
+/// different things, but every one of them is "a curve and a few numbers", and
+/// a per-run result type would make the UI carry a branch for each without
+/// showing the operator anything more.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CharacterizeData {
+    pub x_label: String,
+    pub y_label: String,
+    pub x: Vec<f32>,
+    pub y: Vec<f32>,
+    /// What the first series is. Named per run rather than fixed, because
+    /// "outbound / return" and "commanded / measured" are both two series on
+    /// shared axes but mean entirely different things.
+    pub series: String,
+    /// A second series on the same axes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x2: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y2: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series2: Option<String>,
+    /// Named findings, e.g. `("breakaway torque", "0.902 N·m")`.
+    pub summary: Vec<(String, String)>,
+}
+
 /// A long-running measurement the worker owns for its whole duration.
 ///
 /// Unlike a [`Command`], a job blocks the worker's loop — a chirp is a control
@@ -169,6 +237,7 @@ impl Default for ChirpJob {
 #[serde(rename_all = "kebab-case", tag = "job")]
 pub enum JobSpec {
     Chirp(ChirpJob),
+    Characterize(CharacterizeJob),
 }
 
 /// A Bode estimate, as [`misa_sysid::FreqResponse`] but serde-shaped.
@@ -428,6 +497,16 @@ pub enum Event {
     },
     JobStarted {
         spec: JobSpec,
+    },
+    /// The answer to a [`JobSpec::Characterize`] run.
+    ///
+    /// `data` is `None` when the run was cut short before it had measured
+    /// anything — distinct from an empty series, which would plot as a real
+    /// measurement of nothing.
+    CharacterizeFinished {
+        run: CharacterizeJob,
+        data: Option<CharacterizeData>,
+        aborted: bool,
     },
     JobProgress {
         elapsed_s: f32,

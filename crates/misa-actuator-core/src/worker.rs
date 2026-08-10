@@ -537,7 +537,10 @@ impl Worker {
     /// through the loop — the stop flag (which `misa-sysid` reads as its
     /// abort) and the watchdog thread that can set it.
     fn run_job(&mut self, spec: JobSpec) {
-        let JobSpec::Chirp(job) = spec;
+        let job = match spec {
+            JobSpec::Chirp(job) => job,
+            JobSpec::Characterize(run) => return self.run_characterize(run),
+        };
 
         // Starting with a stop already pending would abort instantly and look
         // like a failure.
@@ -695,6 +698,107 @@ impl Worker {
             }
             Err(e) => {
                 self.log(LogLevel::Error, format!("chirp failed: {e}"));
+                let _ = self.events.send(Event::JobFailed {
+                    message: e.to_string(),
+                });
+            }
+        }
+    }
+
+    /// A quasi-static characterization run.
+    ///
+    /// Same lifecycle as a chirp — the worker owns its loop, `STOP` reaches it
+    /// through the shared abort flag — but the primitives return a whole
+    /// result at the end rather than streaming samples, so there is no
+    /// progress to report beyond "running". Both leave the motor disabled on
+    /// every exit path.
+    #[allow(clippy::type_complexity)]
+    fn run_characterize(&mut self, run: CharacterizeJob) {
+        let _ = self.shared.take_stop();
+        self.shared.streaming.store(false, Ordering::Release);
+        self.shared.job_active.store(true, Ordering::Release);
+        self.shared.beat();
+        let _ = self.events.send(Event::JobStarted {
+            spec: JobSpec::Characterize(run),
+        });
+        self.log(LogLevel::Info, format!("{}: starting", run.name()));
+
+        // `gentle` rather than anything tuned: this envelope is survivable on
+        // the smallest motor in the workspace, and the GUI does not know which
+        // one is plugged in. A rig that can take more should say so
+        // deliberately, not inherit it from a default.
+        let limits = misa_sysid::SafetyLimits::gentle();
+        let outcome = match run {
+            CharacterizeJob::LoadMap {
+                from_rad,
+                to_rad,
+                steps,
+                settle_s,
+                max_speed_rad_s,
+                return_sweep,
+            } => {
+                let spec = misa_sysid::LoadMapSpec {
+                    from_rad,
+                    to_rad,
+                    steps: (steps as usize).max(2),
+                    settle_s,
+                    max_speed_rad_s,
+                    return_sweep,
+                    ..misa_sysid::LoadMapSpec::symmetric(0.5, 2)
+                };
+                misa_sysid::run_load_map(self.actuator.as_mut(), &spec, limits, &self.shared.stop)
+                    .map(load_map_data)
+            }
+            CharacterizeJob::Breakaway {
+                ramp_nm_per_s,
+                max_torque_nm,
+                positive,
+                rate_hz,
+            } => {
+                let direction = if positive {
+                    misa_sysid::Direction::Positive
+                } else {
+                    misa_sysid::Direction::Negative
+                };
+                let spec = misa_sysid::BreakawaySpec {
+                    ramp_nm_per_s,
+                    rate_hz,
+                    ..misa_sysid::BreakawaySpec::slow(max_torque_nm, direction)
+                };
+                misa_sysid::run_breakaway(self.actuator.as_mut(), &spec, limits, &self.shared.stop)
+                    .map(breakaway_data)
+            }
+        };
+
+        self.shared.job_active.store(false, Ordering::Release);
+        self.enabled = false;
+        let aborted = self.shared.take_stop().is_some();
+
+        match outcome {
+            Ok((data, note)) => {
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "{}: {note}{}",
+                        run.name(),
+                        if aborted { " (stopped early)" } else { "" }
+                    ),
+                );
+                let _ = self.events.send(Event::CharacterizeFinished {
+                    run,
+                    // An empty series is not a measurement, and plotting one
+                    // looks exactly like a measurement of zero.
+                    data: (!data.x.is_empty()).then_some(data),
+                    aborted,
+                });
+            }
+            Err(e) => {
+                self.log(LogLevel::Error, format!("{} failed: {e}", run.name()));
+                let _ = self.events.send(Event::CharacterizeFinished {
+                    run,
+                    data: None,
+                    aborted,
+                });
                 let _ = self.events.send(Event::JobFailed {
                     message: e.to_string(),
                 });
@@ -881,6 +985,112 @@ impl Worker {
 
 /// Span of a signal. `0.0` for an empty or all-NaN run rather than infinity,
 /// so a caller comparing it against a threshold does not get a surprise.
+/// Torque against position, split into the two sweep directions.
+///
+/// Plotted as two series rather than one: a load map that goes out and back
+/// separates into two curves exactly when there is hysteresis, and averaging
+/// them into a single line would hide the friction that separation measures.
+fn load_map_data(m: misa_sysid::LoadMap) -> (CharacterizeData, String) {
+    let n = m.points.len();
+    // The outbound sweep is the first half when a return sweep ran.
+    let split = if m.spec.return_sweep { n.div_ceil(2) } else { n };
+    let (out, back) = m.points.split_at(split.min(n));
+
+    let xy = |ps: &[misa_sysid::Point]| {
+        (
+            ps.iter().map(|p| p.position_rad).collect::<Vec<_>>(),
+            ps.iter().map(|p| p.torque_nm).collect::<Vec<_>>(),
+        )
+    };
+    let (x, y) = xy(out);
+    let (x2, y2) = xy(back);
+
+    let peak = m
+        .points
+        .iter()
+        .map(|p| p.torque_nm.abs())
+        .fold(0.0f32, f32::max);
+    let summary = vec![
+        ("points".to_string(), n.to_string()),
+        ("peak |torque|".to_string(), format!("{peak:.3} N·m")),
+        // A dwell spread comparable to the torque itself means the shaft was
+        // hunting, so that point averages a limit cycle rather than measuring
+        // a steady load. Worth stating rather than leaving in the curve.
+        (
+            "worst dwell spread".to_string(),
+            match m.worst_dwell_spread_nm() {
+                Some(w) => format!("{w:.3} N·m"),
+                None => "not measured".to_string(),
+            },
+        ),
+    ];
+    let note = format!("{n} points, peak {peak:.3} N·m");
+    (
+        CharacterizeData {
+            x_label: "position [rad]".to_string(),
+            y_label: "torque [N·m]".to_string(),
+            x,
+            y,
+            series: "outbound".to_string(),
+            x2: (!x2.is_empty()).then_some(x2),
+            y2: (!y2.is_empty()).then_some(y2),
+            series2: (!back.is_empty()).then(|| "return".to_string()),
+            summary,
+        },
+        note,
+    )
+}
+
+/// The torque ramp and where the shaft let go.
+///
+/// The **commanded** ramp is the primary series. Plotting the measured torque
+/// alone produced a flat line at zero: what this run varies is the command,
+/// and on a shaft that has not moved yet the feedback has little to report.
+/// Measured torque rides alongside as the second series, so the gap between
+/// what was asked for and what the motor registered stays visible.
+fn breakaway_data(b: misa_sysid::Breakaway) -> (CharacterizeData, String) {
+    let x: Vec<f32> = b.points.iter().map(|p| p.t_s).collect();
+    let y: Vec<f32> = b.points.iter().map(|p| p.cmd).collect();
+    let measured: Vec<f32> = b.points.iter().map(|p| p.torque_nm).collect();
+    let mut summary = Vec::new();
+    let note = match b.breakaway_torque_nm {
+        Some(t) => {
+            summary.push(("breakaway torque".to_string(), format!("{t:.3} N·m")));
+            if let Some(p) = b.breakaway_position_rad {
+                summary.push(("at position".to_string(), format!("{p:+.4} rad")));
+            }
+            format!("broke loose at {t:.3} N·m")
+        }
+        None => {
+            // Saying "0 N·m" here would read as a frictionless joint. It
+            // means the ramp ran out before anything moved.
+            summary.push((
+                "breakaway torque".to_string(),
+                format!("not reached below {:.3} N·m", b.spec.max_torque_nm),
+            ));
+            "did not break loose within the torque ceiling".to_string()
+        }
+    };
+    summary.push((
+        "rested first".to_string(),
+        if b.rested { "yes" } else { "no" }.to_string(),
+    ));
+    (
+        CharacterizeData {
+            x_label: "t [s]".to_string(),
+            y_label: "torque [N·m]".to_string(),
+            x: x.clone(),
+            y,
+            series: "commanded".to_string(),
+            x2: Some(x),
+            y2: Some(measured),
+            series2: Some("measured".to_string()),
+            summary,
+        },
+        note,
+    )
+}
+
 fn peak_to_peak(values: impl Iterator<Item = f32>) -> f32 {
     let mut lo = f32::INFINITY;
     let mut hi = f32::NEG_INFINITY;

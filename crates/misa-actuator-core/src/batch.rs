@@ -77,6 +77,15 @@ pub struct BatchSpec {
     /// Runs performed on each motor, in order.
     pub runs: Vec<CharacterizeJob>,
     pub envelope: RunEnvelope,
+    /// Whether the ramping runs' ceilings are defaults that should follow each
+    /// motor's own, rather than figures the operator chose.
+    ///
+    /// A default carries no intent, and following the wrong thing is how eleven
+    /// RS-03s with 6 N·m ceilings were all ramped to 0.85 — half of the *bar's*
+    /// stale RS-00 — so several never broke loose (2026-08-07). A value the
+    /// operator typed is left alone whatever the motor's ceiling is: clamped
+    /// down where it would not fit, never raised.
+    pub ramp_follows_ceiling: bool,
     /// Measure each motor's own Kt before its runs, and use it for them.
     ///
     /// Worth defaulting on: Kt is a property of the individual motor, not of the
@@ -270,7 +279,7 @@ fn run(spec: BatchSpec, progress: &Mutex<BatchProgress>, cancel: &AtomicBool) {
         let runs: Vec<CharacterizeJob> = spec
             .runs
             .iter()
-            .map(|r| clamp_ramp(*r, effective_ceiling))
+            .map(|r| ramp_for(*r, effective_ceiling, spec.ramp_follows_ceiling))
             .collect();
         if spec.measure_kt_first {
             let kt_run = kt_job(envelope);
@@ -328,7 +337,12 @@ const RAMP_FRACTION: f32 = 0.5;
 /// operator's choice about their rig, and a batch is not the place to overrule
 /// it — this exists to stop one figure chosen for a large motor being applied to
 /// a small one, not to push every run to the maximum.
-fn clamp_ramp(job: CharacterizeJob, ceiling_nm: f32) -> CharacterizeJob {
+/// This motor's ramp ceiling.
+///
+/// With `follow`, the run's own figure is a default and is replaced by half this
+/// motor's ceiling — up or down. Without it, the figure is the operator's and is
+/// only ever lowered to fit.
+fn ramp_for(job: CharacterizeJob, ceiling_nm: f32, follow: bool) -> CharacterizeJob {
     // A zero or absurd ceiling would cap every ramp at zero, which is a run
     // that cannot measure anything and says so only in its result. Callers
     // resolve "use the default" before getting here; this refuses to turn a
@@ -337,6 +351,7 @@ fn clamp_ramp(job: CharacterizeJob, ceiling_nm: f32) -> CharacterizeJob {
         return job;
     }
     let cap = ceiling_nm * RAMP_FRACTION;
+    let resolve = |asked: f32| if follow { cap } else { asked.min(cap) };
     match job {
         CharacterizeJob::Breakaway {
             ramp_nm_per_s,
@@ -345,7 +360,7 @@ fn clamp_ramp(job: CharacterizeJob, ceiling_nm: f32) -> CharacterizeJob {
             rate_hz,
         } => CharacterizeJob::Breakaway {
             ramp_nm_per_s,
-            max_torque_nm: max_torque_nm.min(cap),
+            max_torque_nm: resolve(max_torque_nm),
             positive,
             rate_hz,
         },
@@ -360,7 +375,7 @@ fn clamp_ramp(job: CharacterizeJob, ceiling_nm: f32) -> CharacterizeJob {
             half_span_rad,
             steps,
             ramp_nm_per_s,
-            max_torque_nm: max_torque_nm.min(cap),
+            max_torque_nm: resolve(max_torque_nm),
             rate_hz,
             both_directions,
         },
@@ -543,6 +558,7 @@ mod tests {
             },
             // Off: this is testing the batch's sequencing, and a Kt run per
             // motor would triple the wall clock for nothing.
+            ramp_follows_ceiling: false,
             measure_kt_first: false,
         }
     }
@@ -714,22 +730,31 @@ mod tests {
 
         // A ramp sized for a big motor is cut to half the small motor's ceiling.
         assert_eq!(
-            clamp_ramp(ramp(6.0), 0.55),
+            ramp_for(ramp(6.0), 0.55, false),
             ramp(0.275),
             "a 6 N·m ramp must not be applied inside a 0.55 N·m envelope"
         );
         // And the large motor keeps its own.
-        assert_eq!(clamp_ramp(ramp(6.0), 12.0), ramp(6.0));
+        assert_eq!(ramp_for(ramp(6.0), 12.0, false), ramp(6.0));
 
         // Only ever lowered: a deliberately gentle run is not pushed up to the
         // envelope just because there is room.
-        assert_eq!(clamp_ramp(ramp(0.5), 12.0), ramp(0.5));
+        assert_eq!(ramp_for(ramp(0.5), 12.0, false), ramp(0.5));
+
+        // A default follows the motor *up* as well as down. Clamping only
+        // downwards left eleven RS-03s with 6 N·m ceilings all ramping to 0.85
+        // — half of the bar's stale RS-00 — and several never broke loose.
+        assert_eq!(ramp_for(ramp(0.85), 6.0, true), ramp(3.0));
+        // A figure the operator chose is still only ever lowered.
+        assert_eq!(ramp_for(ramp(0.85), 6.0, false), ramp(0.85));
+        // Following does not escape the ceiling either way.
+        assert_eq!(ramp_for(ramp(20.0), 0.55, true), ramp(0.275));
 
         // A sentinel ceiling is not a limit. Passing the raw "0 means use the
         // default" field through capped every ramp at zero, and the run then
         // reported "not reached below 0.000 N·m" — obeyed exactly, and useless.
-        assert_eq!(clamp_ramp(ramp(6.0), 0.0), ramp(6.0));
-        assert_eq!(clamp_ramp(ramp(6.0), f32::NAN), ramp(6.0));
+        assert_eq!(ramp_for(ramp(6.0), 0.0, false), ramp(6.0));
+        assert_eq!(ramp_for(ramp(6.0), f32::NAN, false), ramp(6.0));
 
         // Runs that do not ramp against a ceiling are untouched.
         let sweep = CharacterizeJob::VelocitySweep {
@@ -739,7 +764,7 @@ mod tests {
             return_sweep: true,
             bins: 12,
         };
-        assert_eq!(clamp_ramp(sweep, 0.55), sweep);
+        assert_eq!(ramp_for(sweep, 0.55, false), sweep);
     }
 
     #[test]

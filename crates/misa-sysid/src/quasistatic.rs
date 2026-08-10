@@ -1350,9 +1350,45 @@ pub struct VelocitySweepSpec {
     pub rate_hz: f32,
     /// Also sweep back, which is what makes the friction separable.
     pub return_sweep: bool,
+    /// Travel to discard at the start of each measured leg (rad).
+    ///
+    /// Each leg begins by commanding full speed *against* the direction the
+    /// shaft is already moving, so it has to decelerate, stop and reverse before
+    /// anything it reports is steady motion. Logging that transient put it in
+    /// the position bins at the ends of the span — and at opposite ends for the
+    /// two legs, since each reverses where the other finished.
+    ///
+    /// The damage was not noise. In the lowest bins the `+` leg is a transient
+    /// while the `−` leg is steady, so the half-difference subtracted one from
+    /// the other and read friction low; the half-sum kept the residue, with
+    /// opposite signs at the two ends. On an RS-04 that showed as friction
+    /// sagging from 0.60 to 0.49 N·m in the end bins and a load curve running
+    /// −0.08 to +0.115 N·m — which reads exactly like a spring term and is not
+    /// one (2026-08-07).
+    ///
+    /// Judged by **position**, not by reported velocity: some RobStride firmware
+    /// reports velocity as an exact zero in most frames, so "has it reached
+    /// speed" is not a question its feedback can answer.
+    ///
+    /// Costs coverage at the ends of the span — those bins genuinely were not
+    /// measured in steady motion, so losing them is the correction.
+    pub lead_in_rad: f32,
 }
 
 impl VelocitySweepSpec {
+    /// Fraction of the half-span discarded at the start of each measured leg.
+    ///
+    /// A fraction rather than a distance because the reversal distance depends
+    /// on an inertia nobody here knows; this at least scales with the sweep and
+    /// stays bounded. Generous enough to cover a reversal at these speeds while
+    /// leaving most of the span measured.
+    pub const LEAD_IN_FRACTION: f32 = 0.15;
+
+    /// The default lead-in for a given half-span (rad).
+    pub fn lead_in_for(half_span_rad: f32) -> f32 {
+        half_span_rad.abs() * Self::LEAD_IN_FRACTION
+    }
+
     /// A slow symmetric traverse: 0.05 rad/s at 200 Hz, both directions.
     pub fn slow(half_span_rad: f32) -> Self {
         Self {
@@ -1360,6 +1396,7 @@ impl VelocitySweepSpec {
             half_span_rad,
             rate_hz: 200.0,
             return_sweep: true,
+            lead_in_rad: Self::lead_in_for(half_span_rad),
         }
     }
 }
@@ -1510,6 +1547,7 @@ pub fn run_velocity_sweep(
 
     // Each leg drives until the bound is crossed. `log` marks whether the leg's
     // samples are part of the measurement or just positioning.
+    let lead_in = spec.lead_in_rad.max(0.0);
     let leg = |act: &mut dyn Actuator,
                    points: &mut Vec<Point>,
                    guard: &mut Guard,
@@ -1517,6 +1555,10 @@ pub fn run_velocity_sweep(
                    done: &dyn Fn(f32) -> bool,
                    log: bool|
      -> Result<Option<AbortReason>> {
+        // Where this leg began, so the lead-in can be measured from it. Taken
+        // from the first feedback rather than from the bound the previous leg
+        // aimed at, which it overshoots by however far one period carries it.
+        let mut origin: Option<f32> = None;
         loop {
             let t = t0.elapsed().as_secs_f32();
             if abort.load(Ordering::Relaxed) {
@@ -1524,7 +1566,17 @@ pub fn run_velocity_sweep(
             }
             let iter_start = Instant::now();
             let fb = act.set_velocity(vel)?;
-            if log {
+            if fb.position_rad.is_finite() {
+                origin.get_or_insert(fb.position_rad);
+            }
+            // Discard the reversal: this leg is fighting the momentum the last
+            // one left, and nothing it reports is steady motion until the shaft
+            // has actually travelled. A rig whose position never becomes finite
+            // logs nothing, which is correct — there is no measurement there.
+            let past_lead_in = origin.is_some_and(|o| {
+                fb.position_rad.is_finite() && (fb.position_rad - o).abs() >= lead_in
+            });
+            if log && past_lead_in {
                 points.push(Point::from(t, vel, &fb));
             }
             if let Some(r) = guard.check(t, &fb) {
@@ -2744,6 +2796,134 @@ mod tests {
         assert!(m.samples.iter().all(|p| p.torque_nm.is_nan()));
     }
 
+    /// A leg that starts by reversing must not log the reversal.
+    ///
+    /// The rig only reaches the commanded speed after a delay, and reports a
+    /// wildly wrong torque until it does. That transient used to land in the
+    /// position bins at the ends of the span — at opposite ends for the two legs,
+    /// since each reverses where the other finished — so the end bins compared a
+    /// transient in one direction against steady motion in the other.
+    #[test]
+    fn a_legs_reversal_is_not_part_of_the_measurement() {
+        /// Takes `lag` samples to pick up the commanded speed, and reports a
+        /// large bogus torque throughout that window.
+        struct Laggy {
+            pos: f32,
+            vel: f32,
+            cmd: f32,
+            since_change: u32,
+            lag: u32,
+            dt: f32,
+        }
+        impl Actuator for Laggy {
+            fn motor_id(&self) -> u8 {
+                1
+            }
+            fn enable(&mut self) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn disable(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_zero(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_run_mode(&mut self, _m: RunMode) -> Result<()> {
+                Ok(())
+            }
+            fn set_position(&mut self, _p: f32, _s: f32) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn set_velocity(&mut self, v: f32) -> Result<MotorFeedback> {
+                if v != self.cmd {
+                    self.cmd = v;
+                    self.since_change = 0;
+                }
+                self.since_change += 1;
+                // Keep the old velocity through the lag window, so the shaft
+                // carries on the way it was going while the new command is
+                // already in force — which is what a real reversal does.
+                if self.since_change > self.lag {
+                    self.vel = v;
+                }
+                self.pos += self.vel * self.dt;
+                Ok(self.fb())
+            }
+            fn set_torque(&mut self, _t: f32) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn mit_control(
+                &mut self,
+                _p: f32,
+                _v: f32,
+                _kp: f32,
+                _kd: f32,
+                _tff: f32,
+            ) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn measure(&mut self) -> Result<MotorFeedback> {
+                Ok(self.fb())
+            }
+            fn read_status(&mut self) -> Result<misa_actuator::MotorStatus> {
+                Ok(misa_actuator::MotorStatus {
+                    voltage_v: 24.0,
+                    temperature_c: 30.0,
+                    error: Default::default(),
+                })
+            }
+        }
+        impl Laggy {
+            fn fb(&self) -> MotorFeedback {
+                // 10 N·m while catching up, 0.5·direction once at speed.
+                let torque = if self.since_change <= self.lag {
+                    10.0
+                } else {
+                    0.5 * self.vel.signum()
+                };
+                MotorFeedback {
+                    position_rad: self.pos,
+                    velocity_rad_per_s: self.vel,
+                    torque_nm: torque,
+                    current_a: f32::NAN,
+                    temperature_c: 30.0,
+                }
+            }
+        }
+
+        let spec = VelocitySweepSpec {
+            speed_rad_s: 1.0,
+            half_span_rad: 0.5,
+            rate_hz: 1000.0,
+            return_sweep: true,
+            lead_in_rad: VelocitySweepSpec::lead_in_for(0.5),
+        };
+        let mut rig = Laggy {
+            pos: 0.0,
+            vel: -1.0,
+            cmd: -1.0,
+            since_change: 999,
+            lag: 20,
+            dt: 0.001,
+        };
+        let sweep = run_velocity_sweep(&mut rig, &spec, roomy(), &no_abort()).unwrap();
+
+        // The bogus 10 N·m must be nowhere in the measurement.
+        assert!(
+            sweep.points.iter().all(|p| p.torque_nm < 5.0),
+            "the reversal transient was logged: {:?}",
+            sweep.points.iter().map(|p| p.torque_nm).fold(0.0, f32::max)
+        );
+        // And what is left is the planted friction, with no load.
+        let friction = sweep.mean_kinetic_friction_nm(8).expect("a curve");
+        assert!(
+            (friction - 0.5).abs() < 0.05,
+            "friction {friction}, expected 0.5"
+        );
+        let load = sweep.peak_static_load_nm(8).expect("a curve");
+        assert!(load < 0.05, "load should vanish, got {load}");
+    }
+
     /// The velocity sweep must split a planted spring load from kinetic friction
     /// by binning the two passes.
     #[test]
@@ -2831,6 +3011,9 @@ mod tests {
             half_span_rad: 0.3,
             rate_hz: 5000.0,
             return_sweep: true,
+            // No lead-in: these rigs have no momentum to reverse, so it would
+            // only drop samples the test is counting.
+            lead_in_rad: 0.0,
         };
         let sweep = run_velocity_sweep(&mut rig, &spec, roomy(), &no_abort()).unwrap();
         assert_eq!(sweep.abort, None);
@@ -2916,6 +3099,9 @@ mod tests {
             half_span_rad: 0.3,
             rate_hz: 2000.0,
             return_sweep: true,
+            // No lead-in: these rigs have no momentum to reverse, so it would
+            // only drop samples the test is counting.
+            lead_in_rad: 0.0,
         };
         let sweep = run_velocity_sweep(&mut Stalled, &spec, limits, &no_abort()).unwrap();
         // The unlogged positioning leg never reaches its bound, so the time
@@ -3089,6 +3275,9 @@ mod tests {
             half_span_rad: 0.2,
             rate_hz: 5000.0,
             return_sweep: true,
+            // No lead-in: these rigs have no momentum to reverse, so it would
+            // only drop samples the test is counting.
+            lead_in_rad: 0.0,
         };
         let start = 0.0;
         for rep in 0..3 {
@@ -3132,6 +3321,7 @@ mod tests {
                 half_span_rad: 0.5,
                 rate_hz: 100.0,
                 return_sweep: true,
+                lead_in_rad: 0.0,
             },
             abort: None,
         };
@@ -3174,6 +3364,7 @@ mod tests {
                 half_span_rad: 0.5,
                 rate_hz: 100.0,
                 return_sweep: true,
+                lead_in_rad: 0.0,
             },
             abort: None,
         };

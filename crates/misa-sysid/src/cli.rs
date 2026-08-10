@@ -445,6 +445,7 @@ pub fn run_characterize(
                     half_span_rad: *span,
                     rate_hz: *rate,
                     return_sweep: !*single_pass,
+                    lead_in_rad: VelocitySweepSpec::lead_in_for(*span),
                 };
                 println!("velocity sweep x{reps}: ±{span} rad at {speed} rad/s ...");
                 let series =
@@ -459,6 +460,7 @@ pub fn run_characterize(
                 half_span_rad: *span,
                 rate_hz: *rate,
                 return_sweep: !*single_pass,
+                lead_in_rad: VelocitySweepSpec::lead_in_for(*span),
             };
             println!("velocity sweep: ±{span} rad at {speed} rad/s, logging at {rate} Hz ...");
             let r =

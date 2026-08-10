@@ -811,6 +811,10 @@ impl Worker {
                     half_span_rad,
                     rate_hz,
                     return_sweep,
+                    // Not a UI field: it exists to keep the reversal transient
+                    // out of the end bins, and a value that does not do that is
+                    // not a preference anyone should be offered.
+                    lead_in_rad: misa_sysid::VelocitySweepSpec::lead_in_for(half_span_rad),
                 };
                 misa_sysid::run_velocity_sweep(
                     &mut Counting {

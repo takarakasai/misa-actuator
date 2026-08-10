@@ -215,6 +215,13 @@ pub enum Command {
     /// One read, outside the polling cadence.
     Measure,
     ReadStatus,
+    /// Read every setting the motor reports. Read-only; there is no write
+    /// counterpart, deliberately — see `Actuator::read_parameters`.
+    ///
+    /// `deep` opts into reverse-engineered address spaces. It stops streaming
+    /// first: this is dozens of round trips and interleaving them with control
+    /// frames would disturb both.
+    ReadParameters { deep: bool },
     /// Begin an incremental bus scan. Progress arrives as
     /// [`Event::ScanProgress`]; the worker probes one id per tick so the UI
     /// keeps updating through it.
@@ -255,6 +262,67 @@ impl StopReason {
     /// asked for.
     pub fn is_unexpected(self) -> bool {
         matches!(self, StopReason::Watchdog | StopReason::Fault)
+    }
+}
+
+/// One motor setting, as [`misa_actuator::Parameter`] but serde-shaped.
+///
+/// The value is flattened to a string rather than kept as a tagged union.
+/// These are read-only and exist to be looked at and compared, so a UI never
+/// needs to do arithmetic on one — and a union would make the common case (a
+/// table, a TOML dump, a diff against last time) harder for nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParameterRow {
+    pub group: String,
+    pub name: String,
+    /// Formatted value, or empty when the read failed.
+    pub value: String,
+    /// Set instead of `value` when the motor would not answer, carrying why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+    pub unit: String,
+    /// Driver-native address, e.g. `"RID 21"`, `"0x2007"`, `"0xC0[0x3E]"`.
+    pub address: String,
+    /// From a reverse-engineered address space rather than a documented one.
+    pub undocumented: bool,
+}
+
+/// Six decimals, with the trailing zeros taken back off.
+///
+/// Both halves matter. Six decimals keeps a gain of `0.00453008` from
+/// rounding to `0.0045`; trimming keeps a limit of `225` from rendering as
+/// `225.000000`, which buries the numbers that do carry precision in a column
+/// of noise. Non-finite values are printed as-is — a `hard_knee` of `inf` is
+/// a real configuration meaning "no hard stop", not a formatting failure.
+fn format_float(v: f32) -> String {
+    if !v.is_finite() {
+        return format!("{v}");
+    }
+    let s = format!("{v:.6}");
+    let s = s.trim_end_matches('0');
+    s.trim_end_matches('.').to_string()
+}
+
+impl From<misa_actuator::Parameter> for ParameterRow {
+    fn from(p: misa_actuator::Parameter) -> Self {
+        use misa_actuator::ParamValue as V;
+        let (value, unavailable) = match p.value {
+            V::Float(v) => (format_float(v), None),
+            V::Int(v) => (v.to_string(), None),
+            V::Bool(v) => (v.to_string(), None),
+            V::Text(v) => (v, None),
+            V::Unavailable(why) => (String::new(), Some(why)),
+        };
+        Self {
+            group: p.group.to_string(),
+            name: p.name,
+            value,
+            unavailable,
+            unit: p.unit.to_string(),
+            address: p.address,
+            undocumented: p.undocumented,
+        }
     }
 }
 
@@ -345,6 +413,18 @@ pub enum Event {
     },
     Stopped {
         reason: StopReason,
+    },
+    /// The answer to [`Command::ReadParameters`].
+    ///
+    /// Rows arrive in the order the driver emitted them, which is its own
+    /// grouping — the families do not share a taxonomy and imposing one here
+    /// would only misfile things.
+    Parameters {
+        rows: Vec<ParameterRow>,
+        /// Whether reverse-engineered spaces were included, so a UI can say
+        /// which kind of dump it is showing rather than leaving the reader to
+        /// infer it from the row count.
+        deep: bool,
     },
     JobStarted {
         spec: JobSpec,
@@ -463,6 +543,33 @@ mod tests {
         assert_eq!(RunMode::from(ControlMode::Velocity), RunMode::Velocity);
         assert_eq!(RunMode::from(ControlMode::Torque), RunMode::Torque);
         assert_eq!(RunMode::from(ControlMode::Mit), RunMode::Mit);
+    }
+
+    #[test]
+    fn parameter_values_keep_precision_without_padding_it() {
+        use misa_actuator::{ParamValue, Parameter};
+
+        let row = |v: f32| ParameterRow::from(Parameter::float("g", "n", v, "", "a")).value;
+        // A round limit should not read as `225.000000`.
+        assert_eq!(row(225.0), "225");
+        assert_eq!(row(0.5), "0.5");
+        // ...but a gain must not round to `0.0045`.
+        assert_eq!(row(0.004_530_08), "0.00453");
+        assert_eq!(row(12.5), "12.5");
+        // `inf` is a real configuration ("no hard stop"), not a failure.
+        assert_eq!(row(f32::INFINITY), "inf");
+
+        // An unanswered read carries its reason and leaves the value empty,
+        // so a UI can tell "nothing there" from "zero".
+        let missing = ParameterRow::from(Parameter::new(
+            "g",
+            "n",
+            ParamValue::Unavailable("timeout".into()),
+            "",
+            "a",
+        ));
+        assert_eq!(missing.value, "");
+        assert_eq!(missing.unavailable.as_deref(), Some("timeout"));
     }
 
     #[test]

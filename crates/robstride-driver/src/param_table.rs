@@ -12,10 +12,11 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use misa_actuator::{ParamValue, Parameter};
 use robstride_protocol::{
     build_read_param_frame_ext, build_read_param_table_frame, lookup_param_type,
     lookup_param_type_by_name, parse_param_table_frame, parse_read_param_reply, MotorModel,
-    ParamType,
+    ParamIndex, ParamType,
 };
 
 use crate::bus::RobstrideBus;
@@ -272,6 +273,106 @@ impl<B: RobstrideBus> Motor<B> {
         let raw = self.read_single_param(APP_CODE_VERSION, timeout)?;
         let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
         Ok(String::from_utf8_lossy(&raw[..end]).trim().to_string())
+    }
+}
+
+impl<B: RobstrideBus> Motor<B> {
+    /// Every setting the motor will report, grouped for display.
+    ///
+    /// The documented classic space (`0x7xxx`) always. With `deep`, also the
+    /// bulk parameter table — which is where the interesting rows live, and
+    /// which is reverse-engineered, disagrees with the manual on a third of
+    /// its names, and has twice left a real RS-04 unresponsive until
+    /// power-cycled. That is why it is a flag and not the default.
+    pub fn read_parameters(&mut self, deep: bool) -> Vec<Parameter> {
+        // (ParamIndex, group, label, unit)
+        const CLASSIC: &[(ParamIndex, &str, &str, &str)] = &[
+            (ParamIndex::RunMode, "mode", "run_mode", ""),
+            (ParamIndex::LimitTorque, "limits", "limit_torque", "N·m"),
+            (ParamIndex::LimitSpd, "limits", "limit_spd", "rad/s"),
+            (ParamIndex::LimitCur, "limits", "limit_cur", "A"),
+            (ParamIndex::VelMax, "limits", "vel_max", "rad/s"),
+            (ParamIndex::AccSet, "limits", "acc_set", "rad/s²"),
+            (ParamIndex::AccRad, "limits", "acc_rad", "rad/s²"),
+            (ParamIndex::LocKp, "gains", "loc_kp", ""),
+            (ParamIndex::SpdKp, "gains", "spd_kp", ""),
+            (ParamIndex::SpdKi, "gains", "spd_ki", ""),
+            (ParamIndex::CurKp, "gains", "cur_kp", ""),
+            (ParamIndex::CurKi, "gains", "cur_ki", ""),
+            (ParamIndex::CurFiltGain, "gains", "cur_filt_gain", ""),
+            (ParamIndex::SpdFiltGain, "gains", "spd_filt_gain", ""),
+            (ParamIndex::MechOffset, "mechanical", "mech_offset", "rad"),
+            (ParamIndex::MechPos, "mechanical", "mech_pos", "rad"),
+            (ParamIndex::MechVel, "mechanical", "mech_vel", "rad/s"),
+            (ParamIndex::ZeroState, "mechanical", "zero_sta", ""),
+            (ParamIndex::Vbus, "telemetry", "vbus", "V"),
+            (ParamIndex::IqFilt, "telemetry", "iq_filt", "A"),
+            (ParamIndex::CanTimeout, "addressing", "can_timeout", ""),
+        ];
+
+        let mut out = Vec::new();
+        for &(idx, group, label, unit) in CLASSIC {
+            let address = format!("0x{:04X}", idx as u16);
+            out.push(match self.read_param(idx) {
+                Ok(v) => Parameter::float(group, label, v, unit, address),
+                Err(e) => Parameter::unavailable(group, label, e.to_string(), unit, address),
+            });
+        }
+
+        if !deep {
+            return out;
+        }
+
+        // The bulk table names its own rows, so it is self-describing in a way
+        // the classic space is not — and self-reported names are what to trust
+        // here, since the firmware's FunctionCode-to-name mapping differs from
+        // the manual on 32 of 84 rows.
+        match self.read_param_table(Duration::from_millis(1500)) {
+            Ok(rows) => {
+                for row in rows {
+                    let address = format!("0x{:04X}", row.function_code);
+                    let name = if row.name.is_empty() {
+                        address.clone()
+                    } else {
+                        row.name.clone()
+                    };
+                    let value = match row.value_current_typed() {
+                        Some(TypedValue::String(s)) => ParamValue::Text(s),
+                        Some(TypedValue::F32(v)) => ParamValue::Float(v),
+                        Some(TypedValue::U8(v)) => ParamValue::Int(v as i64),
+                        Some(TypedValue::U16(v)) => ParamValue::Int(v as i64),
+                        Some(TypedValue::I16(v)) => ParamValue::Int(v as i64),
+                        Some(TypedValue::U32(v)) => ParamValue::Int(v as i64),
+                        Some(TypedValue::I32(v)) => ParamValue::Int(v as i64),
+                        // No type known for this row: show the bytes rather
+                        // than guessing a width and printing a plausible
+                        // wrong number.
+                        None => ParamValue::Text(
+                            row.value_raw
+                                .iter()
+                                .map(|b| format!("{b:02X}"))
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        ),
+                    };
+                    out.push(
+                        Parameter::new("parameter table (undocumented)", name, value, "", address)
+                            .undocumented(),
+                    );
+                }
+            }
+            Err(e) => out.push(
+                Parameter::unavailable(
+                    "parameter table (undocumented)",
+                    "bulk read",
+                    e.to_string(),
+                    "",
+                    "comm type 19",
+                )
+                .undocumented(),
+            ),
+        }
+        out
     }
 }
 

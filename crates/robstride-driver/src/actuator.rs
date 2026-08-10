@@ -309,6 +309,10 @@ impl<B: RobstrideBus> Actuator for Motor<B> {
             scan_bus_on(self.bus(), host_id, motor_id..=motor_id, timeout, None)?;
         Ok(results.iter().any(|r| r.motor_id == motor_id))
     }
+
+    fn read_parameters(&mut self, deep: bool) -> MisaResult<Vec<misa_actuator::Parameter>> {
+        Ok(Motor::read_parameters(self, deep))
+    }
 }
 
 #[cfg(test)]

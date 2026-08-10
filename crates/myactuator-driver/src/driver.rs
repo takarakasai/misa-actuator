@@ -20,6 +20,8 @@
 use std::f32::consts::PI;
 use std::time::{Duration, Instant};
 
+use misa_actuator::Parameter;
+
 use myactuator_protocol::{
     build_brake_lock, build_brake_release, build_commit_params, build_function_control,
     build_motion_control, build_position_control, build_read_acceleration, build_read_motor_model,
@@ -318,6 +320,122 @@ impl<B: MyActuatorBus> MyActuatorMotor<B> {
 
     /// Read one parameter from the undocumented `0xC0` indexed space,
     /// selected by [`ParamIndex`] — Protect/Plan/Motor Parameters and a
+    /// Every setting the motor will report, grouped for display.
+    ///
+    /// The documented per-topic commands always. With `deep`, also the `0xC0`
+    /// indexed block, which was reverse-engineered from Setup Software V4.0
+    /// traffic — it holds the reduction ratio, `KT_OUT`, the current limits
+    /// and the second PID gain set, none of which appear anywhere documented.
+    pub fn read_parameters(&mut self, deep: bool) -> Vec<Parameter> {
+        let mut out = Vec::new();
+
+        // The documented commands, each read individually so one absent
+        // command does not cost the rest. `0x90` is direct-drive only and
+        // `0x71` is missing on some firmwares — both come back as an
+        // explained gap rather than an absence.
+        match self.read_status1() {
+            Ok(s) => {
+                out.push(Parameter::float("health", "temperature", s.temperature_c as f32, "°C", "0x9A"));
+                out.push(Parameter::float("health", "mos_temperature", s.mos_temperature_c as f32, "°C", "0x9A"));
+                out.push(Parameter::float("health", "voltage", s.voltage_v(), "V", "0x9A"));
+                out.push(Parameter::int("health", "brake_released", s.brake_released as i64, "", "0x9A"));
+                out.push(Parameter::int("health", "error_flags", s.error.0 as i64, "", "0x9A"));
+            }
+            Err(e) => out.push(Parameter::unavailable("health", "status1", e.to_string(), "", "0x9A")),
+        }
+
+        for (idx, label) in [
+            (PidIndex::CurrentKp, "current_kp"),
+            (PidIndex::CurrentKi, "current_ki"),
+            (PidIndex::SpeedKp, "speed_kp"),
+            (PidIndex::SpeedKi, "speed_ki"),
+            (PidIndex::PositionKp, "position_kp"),
+            (PidIndex::PositionKi, "position_ki"),
+            (PidIndex::PositionKd, "position_kd"),
+        ] {
+            out.push(match self.read_pid_gain(idx) {
+                Ok(v) => Parameter::float("PID gains", label, v, "", "0x30"),
+                Err(e) => Parameter::unavailable("PID gains", label, e.to_string(), "", "0x30"),
+            });
+        }
+
+        for (idx, label) in [
+            (AccelIndex::PositionAccel, "position_accel"),
+            (AccelIndex::PositionDecel, "position_decel"),
+            (AccelIndex::SpeedAccel, "speed_accel"),
+            (AccelIndex::SpeedDecel, "speed_decel"),
+        ] {
+            out.push(match self.read_acceleration(idx) {
+                Ok(v) => Parameter::int("motion profile", label, v as i64, "dps/s", "0x42"),
+                Err(e) => {
+                    Parameter::unavailable("motion profile", label, e.to_string(), "dps/s", "0x42")
+                }
+            });
+        }
+
+        out.push(match self.read_version_date() {
+            Ok(v) => Parameter::int("identity", "version_date", v as i64, "", "0xB2"),
+            Err(e) => Parameter::unavailable("identity", "version_date", e.to_string(), "", "0xB2"),
+        });
+        out.push(match self.read_motor_model() {
+            Ok(v) if !v.is_empty() => Parameter::text("identity", "motor_model", v, "0xB5"),
+            Ok(_) => Parameter::unavailable("identity", "motor_model", "empty", "", "0xB5"),
+            Err(e) => Parameter::unavailable("identity", "motor_model", e.to_string(), "", "0xB5"),
+        });
+
+        if !deep {
+            return out;
+        }
+
+        // (index, label, unit)
+        const C0: &[(ParamIndex, &str, &str)] = &[
+            (ParamIndex::MotorNumber, "motor_number", ""),
+            (ParamIndex::FactoryTime, "factory_time", ""),
+            (ParamIndex::ReductionRatio, "reduction_ratio", ""),
+            (ParamIndex::KtOut, "kt_out", "N·m/A"),
+            (ParamIndex::PolePairs, "pole_pairs", ""),
+            (ParamIndex::SingleResolutionPulses, "single_resolution", "pulses"),
+            (ParamIndex::RatedCurrent, "rated_current", "A"),
+            (ParamIndex::MaxCurrent, "max_current", "A"),
+            (ParamIndex::StallCurrent, "stall_current", "A"),
+            (ParamIndex::OverVoltage, "over_voltage", "V"),
+            (ParamIndex::LowVoltage, "low_voltage", "V"),
+            (ParamIndex::ShutdownTemp, "shutdown_temp", "°C"),
+            (ParamIndex::ResumeTemp, "resume_temp", "°C"),
+            (ParamIndex::MaxSpeed, "max_speed", "rpm"),
+            (ParamIndex::NominalSpeed, "nominal_speed", "rpm"),
+            (ParamIndex::StallTimeLimit, "stall_time_limit", "s"),
+            (ParamIndex::MaxPositivePosition, "max_positive_position", "°"),
+            (ParamIndex::MinNegativePosition, "min_negative_position", "°"),
+            (ParamIndex::PositionPlanMaxSpeed, "position_plan_max_speed", "rpm"),
+            (ParamIndex::PositionPlanMaxAcc, "position_plan_max_acc", "dps/s"),
+            (ParamIndex::PositionPlanMaxDec, "position_plan_max_dec", "dps/s"),
+            (ParamIndex::SpeedPlanMaxAcc, "speed_plan_max_acc", "dps/s"),
+            (ParamIndex::SpeedPlanMaxDec, "speed_plan_max_dec", "dps/s"),
+            (ParamIndex::MotorPositionZero, "motor_position_zero", ""),
+            (ParamIndex::BrakeMode, "brake_mode", ""),
+            (ParamIndex::ChangeMotorDirection, "change_motor_direction", ""),
+            (ParamIndex::AutomaticErrorRecovery, "automatic_error_recovery", ""),
+        ];
+        for &(idx, label, unit) in C0 {
+            let address = format!("0xC0[0x{:02X}]", idx as u8);
+            out.push(
+                match self.read_param(idx) {
+                    Ok(v) => Parameter::float("0xC0 block (undocumented)", label, v, unit, address),
+                    Err(e) => Parameter::unavailable(
+                        "0xC0 block (undocumented)",
+                        label,
+                        e.to_string(),
+                        unit,
+                        address,
+                    ),
+                }
+                .undocumented(),
+            );
+        }
+        out
+    }
+
     /// Adopt the torque constant the motor reports about itself
     /// (`KT_OUT`, `0xC0`), and return it.
     ///

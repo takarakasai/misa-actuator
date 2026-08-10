@@ -357,6 +357,38 @@ mod tests {
     }
 
     #[test]
+    fn read_parameters_answers_with_grouped_rows() {
+        let session = Session::connect(&sim_config()).expect("connect");
+        session
+            .send(Command::ReadParameters { deep: false })
+            .expect("send");
+
+        let ev = wait_event(&session, Duration::from_secs(3), |e| {
+            matches!(e, Event::Parameters { .. })
+        })
+        .expect("no Parameters event");
+        let Event::Parameters { rows, deep } = ev else {
+            unreachable!("filtered above")
+        };
+
+        assert!(!deep);
+        assert!(rows.len() > 5, "only {} rows", rows.len());
+        // Grouping is what the tab renders sections from; a dump where every
+        // row landed in one group would display as an undifferentiated wall.
+        let groups: Vec<&str> = rows.iter().map(|r| r.group.as_str()).collect();
+        assert!(groups.contains(&"friction"), "{groups:?}");
+        assert!(groups.contains(&"limits"), "{groups:?}");
+        // Every row needs an address: it is how an operator finds the same
+        // value in a vendor tool or a manual.
+        assert!(rows.iter().all(|r| !r.address.is_empty()));
+        // A row the motor would not report keeps its reason rather than
+        // rendering as an empty cell that looks like a zero.
+        let missing = rows.iter().find(|r| r.unavailable.is_some()).unwrap();
+        assert!(missing.value.is_empty());
+        assert!(!missing.unavailable.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
     fn a_bad_configuration_fails_at_connect_rather_than_later() {
         let cfg = DriverConfig {
             kind: DriverKind::Sim,

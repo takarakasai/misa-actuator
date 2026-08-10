@@ -174,6 +174,10 @@ impl<B: MyActuatorBus> Actuator for MyActuatorMotor<B> {
     fn probe_motor(&mut self, motor_id: u8, timeout: Duration) -> MisaResult<bool> {
         Ok(crate::scan::probe_one(self.bus(), motor_id, timeout)?)
     }
+
+    fn read_parameters(&mut self, deep: bool) -> MisaResult<Vec<misa_actuator::Parameter>> {
+        Ok(MyActuatorMotor::read_parameters(self, deep))
+    }
 }
 
 impl<B: MyActuatorBus> Drop for MyActuatorMotor<B> {

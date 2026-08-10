@@ -237,4 +237,12 @@ impl<B: DamiaoBus> Actuator for DamiaoMotor<B> {
         let found = scan_bus_on(self.bus(), motor_id..=motor_id, timeout, None)?;
         Ok(found.contains(&motor_id))
     }
+
+    /// `deep` is accepted and ignored: every DAMIAO register this driver reads
+    /// comes from the manuals' documented block, so there is no
+    /// reverse-engineered space to opt into. Returning the same set either way
+    /// is more honest than pretending the flag does something.
+    fn read_parameters(&mut self, _deep: bool) -> MisaResult<Vec<misa_actuator::Parameter>> {
+        Ok(DamiaoMotor::read_documented_parameters(self))
+    }
 }

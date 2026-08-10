@@ -132,4 +132,27 @@ pub trait Actuator {
         let found = self.scan_bus(motor_id..=motor_id, timeout)?;
         Ok(found.iter().any(|&id| id == motor_id))
     }
+
+    /// Read every setting the motor will report about itself.
+    ///
+    /// **Read-only by design.** There is no companion `write_parameter`, and
+    /// that is deliberate rather than unfinished: a real RS-04 in this project
+    /// vanished from its bus for a day when a value went to the address the
+    /// manual named `motor_baud` and the firmware actually used for `CAN_ID`.
+    /// A write path has to be built on per-driver whitelists of addresses
+    /// somebody has confirmed on hardware, not on a generic address poke.
+    ///
+    /// `deep` opts into address spaces that were reverse-engineered rather
+    /// than documented — RobStride's bulk parameter table, MyActuator's `0xC0`
+    /// block. They hold parameters available nowhere else, and the RobStride
+    /// one has twice left a motor unresponsive until power-cycled, so the
+    /// caller decides.
+    ///
+    /// Individual reads that fail are reported as [`Parameter::unavailable`]
+    /// rather than failing the whole call: one absent register should not cost
+    /// you the other eighty. Default returns [`Error::Unsupported`].
+    fn read_parameters(&mut self, deep: bool) -> Result<Vec<crate::Parameter>> {
+        let _ = deep;
+        Err(Error::Unsupported("read_parameters"))
+    }
 }

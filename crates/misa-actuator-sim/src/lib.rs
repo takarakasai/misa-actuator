@@ -427,6 +427,51 @@ impl Actuator for SimActuator {
         Ok(self.feedback(matches!(self.active, Active::Mit { .. })))
     }
 
+    /// The preset's own values, so the Params tab is exercisable with no
+    /// hardware — and so the numbers a simulated run is producing can be read
+    /// off rather than looked up in the source.
+    ///
+    /// `deep` is ignored: nothing here was reverse-engineered.
+    fn read_parameters(&mut self, _deep: bool) -> Result<Vec<misa_actuator::Parameter>> {
+        use misa_actuator::Parameter as P;
+        let c = &self.cfg;
+        Ok(vec![
+            P::text("preset", "name", c.name.clone(), "preset"),
+            P::float("plant", "inertia", c.inertia_kg_m2, "kg·m²", "config"),
+            P::float("plant", "kt", c.torque_constant_nm_per_a, "N·m/A", "config"),
+            P::float("friction", "stiction", c.friction.stiction_nm, "N·m", "config"),
+            P::float("friction", "kinetic", c.friction.kinetic_nm, "N·m", "config"),
+            P::float(
+                "friction",
+                "viscous",
+                c.friction.viscous_nm_s_per_rad,
+                "N·m·s/rad",
+                "config",
+            ),
+            P::float("load", "spring", c.load.spring_nm_per_rad, "N·m/rad", "config"),
+            P::float("load", "gravity", c.load.gravity_nm, "N·m", "config"),
+            P::float("load", "hard_knee", c.load.hard_knee_rad, "rad", "config"),
+            P::float("gains", "position_p", c.gains.position_p, "", "config"),
+            P::float("gains", "velocity_p", c.gains.velocity_p, "", "config"),
+            P::float("gains", "velocity_i", c.gains.velocity_i, "", "config"),
+            P::float("thermal", "ambient", c.thermal.ambient_c, "°C", "config"),
+            P::float("thermal", "cooling_tau", c.thermal.cooling_tau_s, "s", "config"),
+            P::float("limits", "torque_limit", c.torque_limit_nm, "N·m", "config"),
+            P::float(
+                "limits",
+                "velocity_limit",
+                c.velocity_limit_rad_s,
+                "rad/s",
+                "config",
+            ),
+            P::float("limits", "bus_voltage", c.bus_voltage_v, "V", "config"),
+            match c.faults.over_temperature_c {
+                Some(t) => P::float("faults", "over_temperature", t, "°C", "config"),
+                None => P::unavailable("faults", "over_temperature", "not modelled", "°C", "config"),
+            },
+        ])
+    }
+
     fn read_status(&mut self) -> Result<MotorStatus> {
         self.begin()?;
         let overheated = self

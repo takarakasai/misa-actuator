@@ -30,12 +30,14 @@
 
 pub mod error;
 pub mod feedback;
+pub mod parameter;
 pub mod realtime;
 pub mod shared;
 pub mod traits;
 
 pub use error::{Error, Result};
 pub use feedback::{ErrorFlags, MotorFeedback, MotorStatus, RunMode};
+pub use parameter::{groups_in_order, or_unavailable, ParamValue, Parameter};
 pub use realtime::{sleep_precise, sleep_until, TimerResolutionGuard};
 pub use shared::Shared;
 pub use traits::Actuator;

@@ -25,6 +25,8 @@ use damiao_protocol::{
     REGISTER_ID,
 };
 
+use misa_actuator::Parameter;
+
 use crate::bus::{AnyCanBus, DamiaoBus};
 use crate::error::{Error, Result};
 
@@ -640,6 +642,76 @@ impl<B: DamiaoBus> DamiaoMotor<B> {
         Err(last.unwrap_or(Error::Timeout {
             motor_id: self.can_id,
         }))
+    }
+
+    /// Every register in the manuals' documented `0x00`–`0x25` block, grouped
+    /// for display.
+    ///
+    /// `boot_ver` (`0x25`) is skipped on models whose register map does not
+    /// document it — the J3507-layout maps jump from `0x24` to `0x32`, so
+    /// reading it there targets an undocumented address rather than a missing
+    /// one. Registers above `0x25` are excluded entirely: their addresses
+    /// differ by model, so a flat sweep would read the wrong register on some
+    /// of them and report the answer as though it meant something.
+    pub fn read_documented_parameters(&mut self) -> Vec<Parameter> {
+        // (RID, group, label, unit)
+        const REGS: &[(u8, &str, &str, &str)] = &[
+            (Rid::UV_VALUE, "protection", "uv_value", "V"),
+            (Rid::OV_VALUE, "protection", "ov_value", "V"),
+            (Rid::OT_VALUE, "protection", "ot_value", "°C"),
+            (Rid::OC_VALUE, "protection", "oc_value", ""),
+            (Rid::ACC, "motion profile", "acc", ""),
+            (Rid::DEC, "motion profile", "dec", ""),
+            (Rid::MAX_SPD, "motion profile", "max_spd", "rad/s"),
+            (Rid::MST_ID, "addressing", "mst_id", ""),
+            (Rid::ESC_ID, "addressing", "esc_id", ""),
+            (Rid::CAN_BR, "addressing", "can_br", ""),
+            (Rid::TIMEOUT, "addressing", "timeout", ""),
+            (Rid::CTRL_MODE, "addressing", "ctrl_mode", ""),
+            (Rid::PMAX, "MIT ranges", "pmax", "rad"),
+            (Rid::VMAX, "MIT ranges", "vmax", "rad/s"),
+            (Rid::TMAX, "MIT ranges", "tmax", "N·m"),
+            (Rid::I_BW, "control gains", "i_bw", "Hz"),
+            (Rid::IQ_C1, "control gains", "iq_c1", ""),
+            (Rid::KP_ASR, "control gains", "kp_asr", ""),
+            (Rid::KI_ASR, "control gains", "ki_asr", ""),
+            (Rid::DETA, "control gains", "deta", ""),
+            (Rid::V_BW, "control gains", "v_bw", "Hz"),
+            (Rid::VL_C1, "control gains", "vl_c1", ""),
+            (Rid::KP_APR, "control gains", "kp_apr", ""),
+            (Rid::KI_APR, "control gains", "ki_apr", ""),
+            (Rid::KT_VALUE, "identified constants", "kt_value", "N·m/A"),
+            (Rid::RS, "identified constants", "rs", "Ω"),
+            (Rid::LS, "identified constants", "ls", "H"),
+            (Rid::FLUX, "identified constants", "flux", "Wb"),
+            (Rid::DAMP, "identified constants", "damp", ""),
+            (Rid::INERTIA, "identified constants", "inertia", "kg·m²"),
+            (Rid::NPP, "identified constants", "npp", ""),
+            (Rid::GR, "identified constants", "gr", ""),
+            (Rid::GREF, "identified constants", "gref", ""),
+            (Rid::SW_VER, "identity", "sw_ver", ""),
+            (Rid::SUB_VER, "identity", "sub_ver", ""),
+            (Rid::HW_VER, "identity", "hw_ver", ""),
+            (Rid::SN, "identity", "sn", ""),
+            (Rid::BOOT_VER, "identity", "boot_ver", ""),
+        ];
+
+        let has_boot_ver = self.model.has_boot_ver();
+        let mut out = Vec::with_capacity(REGS.len());
+        for &(rid, group, label, unit) in REGS {
+            if rid == Rid::BOOT_VER && !has_boot_ver {
+                continue;
+            }
+            let address = format!("RID {rid}");
+            out.push(match self.read_register(rid) {
+                Ok(r) if Rid::is_int(rid) => {
+                    Parameter::int(group, label, r.as_i32() as i64, unit, address)
+                }
+                Ok(r) => Parameter::float(group, label, r.as_f32(), unit, address),
+                Err(e) => Parameter::unavailable(group, label, e.to_string(), unit, address),
+            });
+        }
+        out
     }
 
     /// Ask the motor which model it is, by reading its reduction ratio

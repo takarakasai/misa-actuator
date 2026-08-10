@@ -363,6 +363,41 @@ impl Worker {
                 Err(e) => self.fault("measure", e),
             },
             Command::ReadStatus => self.read_status(),
+            Command::ReadParameters { deep } => {
+                // Dozens of round trips on the same wire the control loop
+                // uses. Streaming has to stop for the same reason a scan
+                // stops it, and saying so beats leaving the operator to
+                // wonder why the motor went limp mid-read.
+                if self.shared.streaming.swap(false, Ordering::AcqRel) {
+                    self.log(
+                        LogLevel::Info,
+                        "streaming paused while reading parameters".to_string(),
+                    );
+                }
+                self.log(
+                    LogLevel::Info,
+                    if deep {
+                        "reading parameters, including undocumented spaces".to_string()
+                    } else {
+                        "reading documented parameters".to_string()
+                    },
+                );
+                match self.actuator.read_parameters(deep) {
+                    Ok(params) => {
+                        let rows: Vec<ParameterRow> =
+                            params.into_iter().map(ParameterRow::from).collect();
+                        let _ = self.events.send(Event::Parameters { rows, deep });
+                    }
+                    // Not a fault: an unsupported read says nothing about the
+                    // motor's health, and marking it as one would arm the
+                    // fault counter over a driver that simply has no
+                    // parameter space wired up.
+                    Err(e) => self.log(
+                        LogLevel::Warn,
+                        format!("could not read parameters: {e}"),
+                    ),
+                }
+            }
             Command::StartScan {
                 from,
                 to,

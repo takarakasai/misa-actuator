@@ -211,6 +211,35 @@ pub enum CharacterizeJob {
         positive: bool,
         rate_hz: f32,
     },
+    /// Step through torque levels and fit torque against current: the **torque
+    /// constant**, N·m/A.
+    ///
+    /// Exists mostly to feed the other runs. Firmware that reports a constant
+    /// zero torque makes every torque-based measurement read zero, and the way
+    /// out is to derive torque from current — which needs a Kt that until now
+    /// the operator had to find elsewhere and type in. This run measures it on
+    /// the motor that is already connected, so the number stops being
+    /// something to look up.
+    ///
+    /// Needs a **leash**: a free shaft cannot be held at a torque level long
+    /// enough to read a steady-state current, so the levels are commanded in
+    /// MIT mode against a position hold. `leash_kp`/`leash_kd` of zero fall
+    /// back to plain torque control, which only works on a shaft that is
+    /// already restrained.
+    Kt {
+        /// Largest level in the sweep, N·m. Levels run from `-max` to `+max`,
+        /// so the fit sees both directions and any offset shows up as an
+        /// intercept rather than skewing the slope.
+        max_torque_nm: f32,
+        steps: u32,
+        /// Dwell at each level. Long enough that current has settled — this is
+        /// also what makes reading current affordable on families that need a
+        /// second transaction for it.
+        settle_s: f32,
+        rate_hz: f32,
+        leash_kp: f32,
+        leash_kd: f32,
+    },
 }
 
 impl CharacterizeJob {
@@ -220,8 +249,43 @@ impl CharacterizeJob {
             CharacterizeJob::LoadMap { .. } => "load map",
             CharacterizeJob::VelocitySweep { .. } => "velocity sweep",
             CharacterizeJob::Breakaway { .. } => "breakaway",
+            CharacterizeJob::Kt { .. } => "kt",
         }
     }
+
+    /// Whether the run reads motor current, and so needs current reporting
+    /// switched on for its duration.
+    ///
+    /// Only the Kt fit does. The others read torque, and on families where
+    /// current costs an extra transaction per sample, paying for it would
+    /// halve their sample rate for nothing.
+    pub fn needs_current(&self) -> bool {
+        matches!(self, CharacterizeJob::Kt { .. })
+    }
+}
+
+/// The limits and constants a characterization run is given, per run.
+///
+/// Per run rather than per connection, and this was not the first shape. Both
+/// values started as connect-time options, which meant reconnecting to change
+/// either one and put two fields in the connection bar that nothing else on
+/// screen used — the bar is about reaching a motor, and neither of these is.
+/// They belong to the measurement: the ceiling is how hard the operator is
+/// willing to push this rig for *this* run, and the Kt may be a figure a Kt
+/// run has only just produced.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RunEnvelope {
+    /// Torque ceiling for the run, N·m. `0.0` keeps
+    /// [`misa_sysid::SafetyLimits::gentle`]'s 1 N·m, which is sized for the
+    /// smallest motor in the workspace and is below what a geared joint needs
+    /// just to move.
+    pub max_torque_nm: f32,
+    /// Torque constant, N·m/A. `0.0` means "report the torque the motor
+    /// reports". Set it for firmware that reports a constant zero torque; the
+    /// driver then derives torque from current for the run's duration and puts
+    /// it back afterwards.
+    pub kt: f32,
 }
 
 /// What a characterization run produced.
@@ -262,7 +326,15 @@ pub struct CharacterizeData {
 #[serde(rename_all = "kebab-case", tag = "job")]
 pub enum JobSpec {
     Chirp(ChirpJob),
-    Characterize(CharacterizeJob),
+    Characterize {
+        /// Flattened, so the run's own tag stays at the top level and the
+        /// wire shape is `{"job":"characterize","run":"breakaway",…}` rather
+        /// than nesting a `run` object inside a `run` field.
+        #[serde(flatten)]
+        run: CharacterizeJob,
+        #[serde(default)]
+        envelope: RunEnvelope,
+    },
 }
 
 /// A Bode estimate, as [`misa_sysid::FreqResponse`] but serde-shaped.
@@ -532,6 +604,25 @@ pub enum Event {
         run: CharacterizeJob,
         data: Option<CharacterizeData>,
         aborted: bool,
+        /// The torque constant a [`CharacterizeJob::Kt`] run fitted, N·m/A.
+        ///
+        /// Typed rather than left in `data.summary`, because a UI acts on it:
+        /// it fills in the Kt the other runs need. A number a client has to
+        /// scrape back out of a display string is a number it will
+        /// occasionally scrape wrong.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fitted_kt: Option<f32>,
+        /// A ceiling worth retrying at, N·m, when the torque limit is what
+        /// stopped the run.
+        ///
+        /// Not a measurement of what the rig needs — the guard trips as soon
+        /// as torque exceeds the ceiling, so every observed sample sits just
+        /// above it and says nothing about how much more would be enough.
+        /// It is a stated multiple of the ceiling that was in force, offered
+        /// so the operator can retry in one click instead of guessing at a
+        /// field. Silently raising the limit would be the wrong favour.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suggested_torque_limit_nm: Option<f32>,
     },
     JobProgress {
         elapsed_s: f32,
@@ -736,32 +827,66 @@ mod tests {
         // runs are the pair most easily confused: one measures static friction,
         // the other kinetic, and they differ only by the tag.
         let json = serde_json::to_string(&Event::JobStarted {
-            spec: JobSpec::Characterize(CharacterizeJob::Breakaway {
-                ramp_nm_per_s: 0.2,
-                max_torque_nm: 1.0,
-                positive: true,
-                rate_hz: 200.0,
-            }),
+            spec: JobSpec::Characterize {
+                run: CharacterizeJob::Breakaway {
+                    ramp_nm_per_s: 0.2,
+                    max_torque_nm: 1.0,
+                    positive: true,
+                    rate_hz: 200.0,
+                },
+                envelope: RunEnvelope {
+                    max_torque_nm: 3.0,
+                    kt: 1.5872,
+                },
+            },
         })
         .unwrap();
         assert!(json.contains("\"job\":\"characterize\""), "{json}");
         assert!(json.contains("\"run\":\"breakaway\""), "{json}");
         assert!(json.contains("\"rampNmPerS\":0.2"), "{json}");
+        // The envelope is a sibling of the run's own fields, not a wrapper
+        // around them: flattening the run is what keeps the tag at the top
+        // level where every client already looks for it.
+        assert!(json.contains("\"envelope\":{"), "{json}");
+        assert!(json.contains("\"kt\":1.5872"), "{json}");
 
         let json = serde_json::to_string(&Event::JobStarted {
-            spec: JobSpec::Characterize(CharacterizeJob::VelocitySweep {
-                half_span_rad: 0.2,
-                speed_rad_s: 0.05,
-                rate_hz: 200.0,
-                return_sweep: true,
-                bins: 12,
-            }),
+            spec: JobSpec::Characterize {
+                run: CharacterizeJob::VelocitySweep {
+                    half_span_rad: 0.2,
+                    speed_rad_s: 0.05,
+                    rate_hz: 200.0,
+                    return_sweep: true,
+                    bins: 12,
+                },
+                envelope: RunEnvelope::default(),
+            },
         })
         .unwrap();
         assert!(json.contains("\"run\":\"velocity-sweep\""), "{json}");
         assert!(json.contains("\"halfSpanRad\":0.2"), "{json}");
         assert!(json.contains("\"speedRadS\":0.05"), "{json}");
         assert!(json.contains("\"returnSweep\":true"), "{json}");
+
+        // And it survives the round trip, which is the half that flatten can
+        // break: serde has to pull the run's tag back out of a buffered map.
+        let spec = JobSpec::Characterize {
+            run: CharacterizeJob::Kt {
+                max_torque_nm: 1.2,
+                steps: 9,
+                settle_s: 0.4,
+                rate_hz: 100.0,
+                leash_kp: 8.0,
+                leash_kd: 0.5,
+            },
+            envelope: RunEnvelope {
+                max_torque_nm: 3.0,
+                kt: 0.0,
+            },
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(json.contains("\"run\":\"kt\""), "{json}");
+        assert_eq!(serde_json::from_str::<JobSpec>(&json).unwrap(), spec);
 
         let json = serde_json::to_string(&Event::JobProgress {
             elapsed_s: 1.5,

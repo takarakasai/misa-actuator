@@ -106,27 +106,21 @@ pub struct DriverConfig {
     pub baud: u32,
     /// Lkmotor: gear ratio (e.g. 10.0 for 1:10 gearbox). Ignored for robstride.
     pub gear_ratio: f32,
-    /// Torque constant Kt (N·m/A). 0 means "use whatever the motor reports".
+    /// Torque constant Kt (N·m/A), where the driver needs it **to be opened at
+    /// all**. 0 means "use whatever the motor reports".
     ///
-    /// Lkmotor / Myactuator: 0 selects current-units mode. **RobStride: a
-    /// non-zero value makes the driver synthesize torque from current**, which is
-    /// the only way to measure anything torque-based on firmware that reports
-    /// `MeasuredTorque` as a constant zero. Measure it with
-    /// `robstride-cli characterize kt` (an RS-04 measured 1.5093) or take it from
-    /// the datasheet; a real reading is always preferred, so this changes nothing
-    /// on healthy firmware.
+    /// Lkmotor / Myactuator only: 0 selects current-units mode, so the value
+    /// decides what unit the driver's whole N·m API means and cannot be
+    /// changed later.
+    ///
+    /// RobStride does *not* take its Kt here. It can synthesize torque from
+    /// current — the only way to measure anything torque-based on firmware
+    /// that reports `MeasuredTorque` as a constant zero — but that is a
+    /// property of a measurement, not of the connection, so it arrives with
+    /// the run in [`crate::RunEnvelope`] and is undone afterwards. Setting it
+    /// here would mean reconnecting to change it, and would put a field in the
+    /// connection bar that only one tab ever uses.
     pub kt: f32,
-    /// Torque ceiling for the characterization envelope (N·m). 0 → the gentle
-    /// default.
-    ///
-    /// A property of the rig, not of a run, which is why it sits here beside
-    /// [`Self::kt`]: this crate cannot know what is bolted to the shaft. The
-    /// default is sized for the smallest motor in the workspace, and on
-    /// 2026-08-06 an RS-03 geared joint turned out to need over 1 N·m just to
-    /// move — so every friction run aborted on the ceiling the moment a Kt made
-    /// the torque visible at all. Raising it is a deliberate act about a specific
-    /// rig, and inheriting it from a default is what this avoids.
-    pub max_torque_nm: f32,
     /// Damiao: physical CAN layer (classic CAN or CAN-FD). Ignored otherwise.
     pub bus_kind: BusKind,
     /// Per-request timeout.
@@ -144,7 +138,6 @@ impl Default for DriverConfig {
             baud: 1_000_000,
             gear_ratio: 10.0,
             kt: 0.0,
-            max_torque_nm: 0.0,
             bus_kind: BusKind::Can,
             timeout: Duration::from_millis(100),
         }
@@ -262,23 +255,14 @@ pub fn build_actuator_checked(
             motor
                 .set_timeout(cfg.timeout)
                 .context("failed to set CAN socket timeout")?;
-            // Some firmware returns a constant 0 for `MeasuredTorque`, which
-            // leaves every torque-based measurement with nothing to measure —
-            // confirmed again on 2026-08-06 on an RS-03, where a velocity-mode
-            // spin reported 0.000 N·m throughout while the shaft turned at the
-            // commanded speed. `IqFilt` works there, so `torque = current · Kt`
-            // recovers it.
-            //
-            // Deriving torque needs a current reading, so a Kt implies asking for
-            // one — the same rule `robstride-cli --kt` follows, rather than
-            // accepting a Kt and silently doing nothing with it.
-            if cfg.kt > 0.0 {
-                motor.set_report_current(true);
-                motor.set_torque_constant(cfg.kt);
-                if motor.torque_constant().is_none() {
-                    bail!("kt must be finite and positive, got {}", cfg.kt);
-                }
-            }
+            // No Kt is applied here even if one was supplied. Some firmware
+            // returns a constant 0 for `MeasuredTorque` — confirmed again on
+            // 2026-08-06 on an RS-03, where a velocity-mode spin reported
+            // 0.000 N·m throughout while the shaft turned at the commanded
+            // speed — and `torque = current · Kt` recovers it. But that
+            // substitution also costs an extra transaction per sample, so it
+            // belongs to the run that needs it: the worker switches it on for a
+            // characterization run and off again afterwards.
             let report = robstride_identity(&mut motor, model, &cfg.model);
             Ok((Box::new(motor), report))
         }

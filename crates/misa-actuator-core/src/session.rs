@@ -71,14 +71,7 @@ impl Session {
             identity_warning: identity.warning.clone(),
         }));
 
-        let worker = Worker::new(
-            actuator,
-            shared.clone(),
-            cmd_rx,
-            evt_tx,
-            tel_tx,
-            cfg.max_torque_nm,
-        );
+        let worker = Worker::new(actuator, shared.clone(), cmd_rx, evt_tx, tel_tx);
         let join = std::thread::Builder::new()
             .name(format!("motor-{motor_id}"))
             .spawn(move || worker.run())

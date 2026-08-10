@@ -118,8 +118,6 @@ pub(crate) struct Worker {
     last_status: Instant,
     last_idle_poll: Instant,
     consecutive_faults: u32,
-    /// Torque ceiling for characterization runs (N·m); 0 keeps the gentle default.
-    envelope_max_torque_nm: f32,
 }
 
 impl Worker {
@@ -129,7 +127,6 @@ impl Worker {
         commands: Receiver<Command>,
         events: Sender<Event>,
         telemetry: SyncSender<TelemetryBatch>,
-        envelope_max_torque_nm: f32,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -148,7 +145,6 @@ impl Worker {
             last_status: now,
             last_idle_poll: now,
             consecutive_faults: 0,
-            envelope_max_torque_nm,
         }
     }
 
@@ -431,7 +427,9 @@ impl Worker {
     fn run_job(&mut self, spec: JobSpec) {
         let job = match spec {
             JobSpec::Chirp(job) => job,
-            JobSpec::Characterize(run) => return self.run_characterize(run),
+            JobSpec::Characterize { run, envelope } => {
+                return self.run_characterize(run, envelope);
+            }
         };
 
         // Starting with a stop already pending would abort instantly and look
@@ -605,15 +603,33 @@ impl Worker {
     /// progress to report beyond "running". Both leave the motor disabled on
     /// every exit path.
     #[allow(clippy::type_complexity)]
-    fn run_characterize(&mut self, run: CharacterizeJob) {
+    fn run_characterize(&mut self, run: CharacterizeJob, envelope: RunEnvelope) {
         let _ = self.shared.safety.take_stop();
         self.shared.safety.set_streaming(false);
         self.shared.safety.set_job_active(true);
         self.shared.safety.beat();
         let _ = self.events.send(Event::JobStarted {
-            spec: JobSpec::Characterize(run),
+            spec: JobSpec::Characterize { run, envelope },
         });
         self.log(LogLevel::Info, format!("{}: starting", run.name()));
+
+        // Apply the run's Kt and current reporting for the run only, then put
+        // both back. They used to be connect-time options, which meant
+        // reconnecting to change a Kt and paying for current reporting on
+        // every chirp that followed. Both are no-ops on drivers that do not
+        // derive torque from current.
+        if envelope.kt > 0.0 {
+            self.actuator.set_report_current(true);
+            self.actuator.set_torque_constant(envelope.kt);
+            self.log(
+                LogLevel::Info,
+                format!("{}: deriving torque from current at Kt {:.4} N·m/A", run.name(), envelope.kt),
+            );
+        } else if run.needs_current() {
+            // The Kt run is the one case where no Kt is known yet — that is
+            // what it is measuring — so it needs current on its own account.
+            self.actuator.set_report_current(true);
+        }
 
         // `gentle` rather than anything tuned: this envelope is survivable on
         // the smallest motor in the workspace, and the GUI does not know which
@@ -626,16 +642,29 @@ impl Worker {
         // soon as a Kt made the torque visible (2026-08-06). A limit that no run
         // can stay inside protects nothing and measures nothing.
         let mut limits = misa_sysid::SafetyLimits::gentle();
-        if self.envelope_max_torque_nm > 0.0 {
-            limits.max_torque_nm = self.envelope_max_torque_nm;
+        if envelope.max_torque_nm > 0.0 {
+            limits.max_torque_nm = envelope.max_torque_nm;
             self.log(
                 LogLevel::Warn,
                 format!(
-                    "torque envelope raised to {:.3} N·m for this session",
+                    "torque envelope raised to {:.3} N·m for this run",
                     limits.max_torque_nm
                 ),
             );
         }
+        let ceiling_nm = limits.max_torque_nm;
+
+        // Both are read out of the reports before the mappers consume them.
+        // An envelope abort comes back as `Ok` with a reason *inside* the
+        // report rather than as an `Err` — deliberately, so a run that was cut
+        // short still hands over what it measured — which makes this the only
+        // place the reason is visible.
+        let mut fitted_kt: Option<f32> = None;
+        let mut hit_torque_limit = false;
+        let mut note_abort = |abort: Option<misa_sysid::AbortReason>| {
+            hit_torque_limit = abort == Some(misa_sysid::AbortReason::TorqueLimit);
+        };
+
         let outcome = match run {
             CharacterizeJob::LoadMap {
                 from_rad,
@@ -655,7 +684,10 @@ impl Worker {
                     ..misa_sysid::LoadMapSpec::symmetric(0.5, 2)
                 };
                 misa_sysid::run_load_map(self.actuator.as_mut(), &spec, limits, self.shared.safety.abort_flag())
-                    .map(load_map_data)
+                    .map(|m| {
+                        note_abort(m.abort);
+                        load_map_data(m)
+                    })
             }
             CharacterizeJob::VelocitySweep {
                 half_span_rad,
@@ -676,7 +708,10 @@ impl Worker {
                     limits,
                     self.shared.safety.abort_flag(),
                 )
-                .map(|v| velocity_sweep_data(v, (bins as usize).max(1)))
+                .map(|v| {
+                    note_abort(v.abort);
+                    velocity_sweep_data(v, (bins as usize).max(1))
+                })
             }
             CharacterizeJob::Breakaway {
                 ramp_nm_per_s,
@@ -695,13 +730,63 @@ impl Worker {
                     ..misa_sysid::BreakawaySpec::slow(max_torque_nm, direction)
                 };
                 misa_sysid::run_breakaway(self.actuator.as_mut(), &spec, limits, self.shared.safety.abort_flag())
-                    .map(breakaway_data)
+                    .map(|b| {
+                        note_abort(b.abort);
+                        breakaway_data(b)
+                    })
+            }
+            CharacterizeJob::Kt {
+                max_torque_nm,
+                steps,
+                settle_s,
+                rate_hz,
+                leash_kp,
+                leash_kd,
+            } => {
+                let spec = misa_sysid::KtSpec {
+                    max_torque_nm,
+                    steps: (steps as usize).max(2),
+                    settle_s,
+                    rate_hz,
+                    leash_kp,
+                    leash_kd,
+                };
+                misa_sysid::run_kt(self.actuator.as_mut(), &spec, limits, self.shared.safety.abort_flag())
+                    .map(|k| {
+                        note_abort(k.abort);
+                        let (data, note, kt) = kt_data(k);
+                        fitted_kt = kt;
+                        (data, note)
+                    })
             }
         };
 
         self.shared.safety.set_job_active(false);
         self.enabled = false;
         let aborted = self.shared.safety.take_stop().is_some();
+
+        // Hand the driver back the way it was found. Leaving a Kt behind would
+        // make a later run report synthesized torque without anything on
+        // screen saying so, and leaving current reporting on would halve the
+        // rate of the next chirp.
+        self.actuator.set_torque_constant(0.0);
+        self.actuator.set_report_current(false);
+
+        // Only worth suggesting when the ceiling is what stopped the run.
+        // Doubling it is a starting point, not a finding — see the field's
+        // docs for why the samples cannot say more than this.
+        let suggested_torque_limit_nm = hit_torque_limit.then(|| (ceiling_nm * 2.0).max(0.5));
+        if let Some(t) = suggested_torque_limit_nm {
+            self.log(
+                LogLevel::Warn,
+                format!(
+                    "{}: stopped by the {:.3} N·m torque ceiling — this joint needs more than that to move; retry at {:.3} N·m if the rig can take it",
+                    run.name(),
+                    ceiling_nm,
+                    t
+                ),
+            );
+        }
 
         match outcome {
             Ok((data, note)) => {
@@ -719,6 +804,8 @@ impl Worker {
                     // looks exactly like a measurement of zero.
                     data: (!data.x.is_empty()).then_some(data),
                     aborted,
+                    fitted_kt,
+                    suggested_torque_limit_nm,
                 });
             }
             Err(e) => {
@@ -727,6 +814,8 @@ impl Worker {
                     run,
                     data: None,
                     aborted,
+                    fitted_kt: None,
+                    suggested_torque_limit_nm,
                 });
                 let _ = self.events.send(Event::JobFailed {
                     message: e.to_string(),
@@ -1122,6 +1211,69 @@ fn breakaway_data(b: misa_sysid::Breakaway) -> (CharacterizeData, String) {
             summary,
         },
         note,
+    )
+}
+
+/// Torque against current, plus the fitted constant for the UI to apply.
+///
+/// Returns the Kt separately from the summary rather than only as a display
+/// string, because the caller does arithmetic with it — the whole point of the
+/// run is that the operator no longer types the number in.
+fn kt_data(k: misa_sysid::KtSweep) -> (CharacterizeData, String, Option<f32>) {
+    let x: Vec<f32> = k.points.iter().map(|p| p.current_a).collect();
+    let y: Vec<f32> = k.points.iter().map(|p| p.torque_nm).collect();
+    let commanded: Vec<f32> = k.points.iter().map(|p| p.cmd).collect();
+
+    let fitted = k.kt_nm_per_a();
+    let mut summary = Vec::new();
+    let note = match fitted {
+        Some(kt) => {
+            summary.push(("Kt (fit)".to_string(), format!("{kt:.4} N·m/A")));
+            if let Some(p) = k.pointwise_kt_nm_per_a() {
+                // Shown beside the fit because the two disagreeing is the
+                // signal that the relation is not a line through the origin —
+                // saturation, or a torque offset the fit absorbed.
+                summary.push(("Kt (pointwise)".to_string(), format!("{p:.4} N·m/A")));
+            }
+            if let Some(r2) = k.r_squared() {
+                summary.push(("fit R²".to_string(), format!("{r2:.4}")));
+            }
+            format!("Kt {kt:.4} N·m/A")
+        }
+        None => {
+            // Two different failures land here and they need different fixes,
+            // so neither is described as the other: no current at all means
+            // the driver never reported it, no torque means the firmware is
+            // the one reporting zero.
+            let no_current = k.points.iter().all(|p| !p.current_a.is_finite());
+            let reason = if k.points.is_empty() {
+                "the run recorded nothing"
+            } else if no_current {
+                "this driver reports no current, so there is nothing to fit torque against"
+            } else {
+                "torque and current did not vary enough to fit a slope"
+            };
+            summary.push(("Kt".to_string(), format!("not measured — {reason}")));
+            format!("no Kt: {reason}")
+        }
+    };
+
+    (
+        CharacterizeData {
+            x_label: "current [A]".to_string(),
+            y_label: "torque [N·m]".to_string(),
+            x: x.clone(),
+            y,
+            series: "measured".to_string(),
+            // The commanded level on the same axes shows where the firmware's
+            // own scaling sits relative to the measurement.
+            x2: Some(x),
+            y2: Some(commanded),
+            series2: Some("commanded".to_string()),
+            summary,
+        },
+        note,
+        fitted,
     )
 }
 

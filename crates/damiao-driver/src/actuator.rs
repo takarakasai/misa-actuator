@@ -119,6 +119,15 @@ impl<B: DamiaoBus> Actuator for DamiaoMotor<B> {
         DamiaoMotor::can_id(self)
     }
 
+    // The same physical constant, applied in the opposite direction: this
+    // family reports torque and has no current field, so Kt fills in
+    // `current_a` rather than `torque_nm`. No `set_report_current` override —
+    // current here is derived from a frame that always arrives, so it costs
+    // nothing and is never suppressed.
+    fn set_torque_constant(&mut self, kt_nm_per_a: f32) {
+        DamiaoMotor::set_torque_constant(self, kt_nm_per_a);
+    }
+
     fn enable(&mut self) -> MisaResult<MisaFeedback> {
         let fb = DamiaoMotor::enable(self)?;
         let kt = self.torque_constant();

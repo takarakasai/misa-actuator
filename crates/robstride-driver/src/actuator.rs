@@ -134,6 +134,18 @@ impl<B: RobstrideBus> Actuator for Motor<B> {
         Motor::motor_id(self)
     }
 
+    // This family is the reason both of these exist on the trait: its
+    // feedback frame has no current field, and some firmware reports torque
+    // as a constant zero. See [`Motor::set_report_current`] for the loop-rate
+    // cost and [`Motor::set_torque_constant`] for the firmware evidence.
+    fn set_report_current(&mut self, on: bool) {
+        Motor::set_report_current(self, on);
+    }
+
+    fn set_torque_constant(&mut self, kt_nm_per_a: f32) {
+        Motor::set_torque_constant(self, kt_nm_per_a);
+    }
+
     fn enable(&mut self) -> MisaResult<MisaFeedback> {
         // Pre-enable: write a safe per-mode reference so that as soon as
         // the firmware turns on, it has something sensible to track.

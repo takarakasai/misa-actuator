@@ -104,6 +104,31 @@ pub trait Actuator {
         false
     }
 
+    /// Ask the driver to include motor current in [`Self::measure`], if it can.
+    ///
+    /// Off by default because on some families it is not free. RobStride's
+    /// feedback frame carries no current field, so its driver spends a second
+    /// transaction per sample and the achievable loop rate roughly halves —
+    /// which would quietly shrink the usable band of a chirp. Turn it on for
+    /// the span of a measurement that dwells anyway, then turn it off.
+    ///
+    /// Default does nothing, which is right for families whose feedback
+    /// already carries current and for the simulator.
+    fn set_report_current(&mut self, _on: bool) {}
+
+    /// Supply the torque constant (N·m/A) used to synthesize torque from
+    /// current, or `0.0` to go back to reporting what the motor reports.
+    ///
+    /// Only meaningful for drivers that *derive* torque this way, which they
+    /// need to do when the firmware reports a constant zero torque. Requires
+    /// [`Self::set_report_current`] — without a current reading there is
+    /// nothing to scale.
+    ///
+    /// This exists as a method rather than only a connect-time option so a
+    /// run can apply a constant it has just measured without reopening the
+    /// bus. Default does nothing.
+    fn set_torque_constant(&mut self, _kt_nm_per_a: f32) {}
+
     /// Probe the underlying bus for responding motors in `id_range`.
     ///
     /// Returns the list of motor IDs that responded. Implementations

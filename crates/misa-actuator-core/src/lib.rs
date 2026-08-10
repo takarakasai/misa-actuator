@@ -54,6 +54,7 @@
 //! 3. Dropping the [`Session`] stops the motor and waits for the worker to
 //!    confirm, so a closing window cannot outlive a driven motor.
 
+pub mod batch;
 pub mod export;
 pub mod factory;
 pub mod multi;

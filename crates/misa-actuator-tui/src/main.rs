@@ -44,8 +44,9 @@ struct Cli {
     driver: DriverKind,
 
     /// Bus interface. For the CAN drivers: `can0` (Linux SocketCAN),
-    /// `pcan:usb1` (PEAK adapter on Windows) or `slcan:COM5` (USB-CAN
-    /// adapter). For lkmotor: a serial port (`/dev/ttyUSB0`, `COM5`).
+    /// `pcan:usb1` (PEAK adapter on Windows) or `slcan:COM5` (an adapter
+    /// running **slcan** firmware — most dongles sold as "USB-CAN" speak
+    /// something else). For lkmotor: a serial port (`/dev/ttyUSB0`, `COM5`).
     #[arg(long)]
     interface: String,
 

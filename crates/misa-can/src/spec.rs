@@ -1,7 +1,21 @@
 //! Parsing of the `--interface` string into a backend + target.
 //!
 //! One flag has to name a Linux SocketCAN interface, a PEAK PCAN channel and
-//! a USB-CAN adapter on a COM port, so the spec is a tiny URI-ish grammar:
+//! an SLCAN adapter on a COM port, so the spec is a tiny URI-ish grammar:
+//!
+//! **`slcan:` means the Lawicel ASCII protocol, not "any USB-CAN dongle".**
+//! Adapters sold under that name speak several different protocols, and the
+//! hardware looks the same from the outside:
+//!
+//! | protocol | prefix | notes |
+//! |----------|--------|-------|
+//! | Lawicel ASCII (slcan firmware: CANable, USBtin) | `slcan:` | answers `V` + CR |
+//! | "USB-CAN Analyzer" binary (`0xAA` … `0x55`) | `usbcan:` | answers nothing to `V` + CR |
+//! | RobStride's own module, `41 54` … `0D 0A` | — | no backend; `robstride-protocol/ref/rs04_manual_en.md` |
+//!
+//! A bare `COM5` is taken as `slcan:` for compatibility, so a USB-CAN Analyzer
+//! must be named explicitly. Nothing in a port name distinguishes them; the
+//! test that does is to send `V` + CR and see whether ASCII comes back.
 //!
 //! ```text
 //! [<backend>:]<target>[@<bitrate>[,<data-bitrate>]][?<key>=<value>&...]
@@ -14,9 +28,11 @@
 //! | `pcan:usb1`                 | PEAK `PCAN_USBBUS1` @ 1 Mbit/s                    |
 //! | `PCAN_USBBUS1`              | same, using PEAK's own channel name               |
 //! | `pcan:usb1@1M,5M`           | PCAN, 1 Mbit/s arbitration, 5 Mbit/s FD data      |
-//! | `slcan:COM5`                | SLCAN adapter on COM5 @ 1 Mbit/s                  |
+//! | `slcan:COM5`                | slcan-firmware adapter on COM5 @ 1 Mbit/s         |
 //! | `slcan:COM5@500K?serial-baud=2000000` | 500 kbit/s CAN, 2 Mbaud on the USB link |
 //! | `slcan:/dev/ttyACM0`        | the same adapter on Linux                         |
+//! | `usbcan:COM1`               | USB-CAN Analyzer, 1 Mbit/s CAN, 2 Mbaud / 2 stop bits |
+//! | `usbcan:COM1@250K?stop-bits=1&serial-baud=1228800` | the framing the vendor note describes |
 //!
 //! A bare target with no backend prefix is resolved by platform: SocketCAN on
 //! Linux, and on Windows `COM*` → SLCAN, `PCAN_*` → PCAN.
@@ -34,6 +50,18 @@ pub const DEFAULT_DATA_BITRATE: u32 = 5_000_000;
 /// USB-CDC adapters ignore it, but the value still has to be legal.
 pub const DEFAULT_SLCAN_SERIAL_BAUD: u32 = 115_200;
 
+/// Default baud for a USB-CAN Analyzer.
+///
+/// From `canusb.c`, i.e. from code that has run against the hardware; the
+/// vendor's note says 1,228,800 instead. The working value wins the default and
+/// `?serial-baud=` reaches the other. Neither source is committed here — see
+/// [`crate::backend::usbcan`], which carries the whole format.
+///
+/// Unlike a CDC adapter this one is a real UART behind a CH340, so the value is
+/// not decorative — at the wrong baud the adapter simply never answers, and it
+/// never acknowledges anything either, so there is no error to read.
+pub const DEFAULT_USBCAN_SERIAL_BAUD: u32 = 2_000_000;
+
 /// Which transport implementation a spec selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -43,6 +71,13 @@ pub enum Backend {
     Pcan,
     /// Lawicel/SLCAN ASCII protocol over a serial port (any platform).
     Slcan,
+    /// "USB-CAN Analyzer" binary protocol over a serial port.
+    ///
+    /// A different protocol from SLCAN, on hardware that looks identical from
+    /// the outside — see the module docs. Never inferred from a bare `COM*`,
+    /// because SLCAN has that inference and the two cannot be told apart from
+    /// the port name.
+    UsbCan,
 }
 
 impl Backend {
@@ -51,6 +86,7 @@ impl Backend {
             Backend::SocketCan => "socketcan",
             Backend::Pcan => "pcan",
             Backend::Slcan => "slcan",
+            Backend::UsbCan => "usbcan",
         }
     }
 
@@ -59,8 +95,18 @@ impl Backend {
         match self {
             Backend::SocketCan => cfg!(target_os = "linux"),
             Backend::Pcan => cfg!(windows),
-            Backend::Slcan => true,
+            Backend::Slcan | Backend::UsbCan => true,
         }
+    }
+
+    /// Whether this backend can watch a bus without acknowledging on it.
+    ///
+    /// PCAN has a listen-only mode, and the USB-CAN Analyzer has a silent mode
+    /// in its settings command. The others must refuse rather than come up as a
+    /// participant: a monitor that quietly acknowledges frames changes the bus
+    /// it was opened to observe.
+    pub fn can_listen_only(self) -> bool {
+        matches!(self, Backend::Pcan | Backend::UsbCan)
     }
 }
 
@@ -74,8 +120,17 @@ pub struct InterfaceSpec {
     pub bitrate: u32,
     /// CAN-FD data-phase bitrate in bit/s. Ignored unless FD is requested.
     pub data_bitrate: u32,
-    /// SLCAN only: baud of the host↔adapter serial link.
+    /// Serial backends only: baud of the host↔adapter link. Defaults per
+    /// backend — see [`DEFAULT_SLCAN_SERIAL_BAUD`] and
+    /// [`DEFAULT_USBCAN_SERIAL_BAUD`].
     pub serial_baud: u32,
+    /// Serial backends only: stop bits on the host↔adapter link.
+    ///
+    /// Two by default for the USB-CAN Analyzer, because the working reference
+    /// sets `CSTOPB`; the vendor's note says one. The adapter does not
+    /// acknowledge its settings command, so a wrong value shows up only as a
+    /// receive timeout — which is why this is switchable.
+    pub stop_bits: u8,
     /// The original string, kept for error messages.
     pub raw: String,
 }
@@ -122,7 +177,17 @@ impl InterfaceSpec {
             }
         };
 
-        let mut serial_baud = DEFAULT_SLCAN_SERIAL_BAUD;
+        // Per backend, because the two serial protocols disagree: an slcan
+        // adapter is usually CDC and ignores the value, while a USB-CAN
+        // Analyzer is a real UART that answers at exactly one baud.
+        let mut serial_baud = match backend {
+            Backend::UsbCan => DEFAULT_USBCAN_SERIAL_BAUD,
+            _ => DEFAULT_SLCAN_SERIAL_BAUD,
+        };
+        let mut stop_bits = match backend {
+            Backend::UsbCan => 2,
+            _ => 1,
+        };
         if let Some(query) = query {
             for pair in query.split('&').filter(|p| !p.is_empty()) {
                 let (key, value) = pair
@@ -133,6 +198,18 @@ impl InterfaceSpec {
                         serial_baud = value.parse().map_err(|_| {
                             Error::bad_spec(raw, format!("bad serial baud {value:?}"))
                         })?;
+                    }
+                    "stop-bits" | "stop_bits" => {
+                        stop_bits = match value {
+                            "1" => 1,
+                            "2" => 2,
+                            other => {
+                                return Err(Error::bad_spec(
+                                    raw,
+                                    format!("stop-bits must be 1 or 2, not {other:?}"),
+                                ))
+                            }
+                        };
                     }
                     other => {
                         return Err(Error::bad_spec(raw, format!("unknown option {other:?}")));
@@ -147,6 +224,7 @@ impl InterfaceSpec {
             bitrate,
             data_bitrate,
             serial_baud,
+            stop_bits,
             raw: raw.to_string(),
         })
     }
@@ -164,6 +242,8 @@ impl InterfaceSpec {
             }
             Backend::Pcan => "PCAN-Basic is Windows-only. On Linux use SocketCAN (`can0`).",
             Backend::Slcan => "SLCAN needs a serial port this platform can open.",
+            Backend::UsbCan => "The USB-CAN Analyzer backend needs a serial port this \
+                                platform can open.",
         };
         Err(Error::bad_spec(&self.raw, hint))
     }
@@ -178,6 +258,7 @@ fn split_backend<'a>(locator: &'a str, raw: &str) -> Result<(Backend, &'a str)> 
             "socketcan" | "can" => Some(Backend::SocketCan),
             "pcan" | "peak" => Some(Backend::Pcan),
             "slcan" | "lawicel" | "serial" => Some(Backend::Slcan),
+            "usbcan" | "usb-can" | "canalyzer" => Some(Backend::UsbCan),
             _ => None,
         };
         if let Some(backend) = backend {
@@ -185,7 +266,7 @@ fn split_backend<'a>(locator: &'a str, raw: &str) -> Result<(Backend, &'a str)> 
         }
         return Err(Error::bad_spec(
             raw,
-            format!("unknown backend {scheme:?} (known: socketcan, pcan, slcan)"),
+            format!("unknown backend {scheme:?} (known: socketcan, pcan, slcan, usbcan)"),
         ));
     }
 
@@ -214,7 +295,7 @@ fn infer_backend(target: &str, raw: &str) -> Result<Backend> {
     Err(Error::bad_spec(
         raw,
         "cannot tell which CAN backend this is; prefix it, e.g. \
-         `pcan:usb1` for a PEAK adapter or `slcan:COM5` for a USB-CAN adapter",
+         `pcan:usb1` for a PEAK adapter or `slcan:COM5` for one running slcan firmware",
     ))
 }
 
@@ -321,6 +402,75 @@ mod tests {
         } else {
             assert!(parsed.is_err());
         }
+    }
+
+    /// The two serial backends must stay tellable apart, and a bare `COM*` must
+    /// keep meaning SLCAN — nothing in a port name distinguishes the protocols,
+    /// so silently changing that inference would break existing command lines
+    /// and mislead new ones.
+    #[test]
+    fn the_usb_can_analyzer_is_a_separate_backend_that_is_never_inferred() {
+        for name in ["usbcan:COM1", "usb-can:COM1", "canalyzer:COM1"] {
+            let s = InterfaceSpec::parse(name).unwrap();
+            assert_eq!(s.backend, Backend::UsbCan, "{name}");
+            assert_eq!(s.target, "COM1");
+        }
+        // Bare COM ports still mean SLCAN.
+        assert_eq!(
+            InterfaceSpec::parse("COM1").unwrap().backend,
+            Backend::Slcan
+        );
+        assert_eq!(
+            InterfaceSpec::parse("slcan:COM1").unwrap().backend,
+            Backend::Slcan
+        );
+    }
+
+    /// The baud is not decorative here: the adapter is a real UART behind a
+    /// CH340 and answers at exactly one rate, so the default has to be its own.
+    #[test]
+    fn the_usb_can_analyzer_defaults_to_its_documented_baud() {
+        let s = InterfaceSpec::parse("usbcan:COM1").unwrap();
+        assert_eq!(s.serial_baud, DEFAULT_USBCAN_SERIAL_BAUD);
+        assert_eq!(s.serial_baud, 2_000_000);
+        // SLCAN keeps its own default...
+        assert_eq!(
+            InterfaceSpec::parse("slcan:COM1").unwrap().serial_baud,
+            DEFAULT_SLCAN_SERIAL_BAUD
+        );
+        // ...and an explicit value still wins on either.
+        assert_eq!(
+            InterfaceSpec::parse("usbcan:COM1?serial-baud=115200")
+                .unwrap()
+                .serial_baud,
+            115_200
+        );
+    }
+
+    /// The two sources disagree on the serial framing — the working reference
+    /// uses two stop bits, the vendor note one — and a wrong choice is invisible
+    /// (the adapter never acknowledges), so both have to be reachable.
+    #[test]
+    fn the_usb_can_analyzer_defaults_to_the_reference_framing() {
+        let s = InterfaceSpec::parse("usbcan:COM1").unwrap();
+        assert_eq!(s.stop_bits, 2, "canusb.c sets CSTOPB");
+        // The vendor note's combination, spelled out in one spec.
+        let s = InterfaceSpec::parse("usbcan:COM1?stop-bits=1&serial-baud=1228800").unwrap();
+        assert_eq!(s.stop_bits, 1);
+        assert_eq!(s.serial_baud, 1_228_800);
+        // Everything else stays on one stop bit.
+        assert_eq!(InterfaceSpec::parse("slcan:COM1").unwrap().stop_bits, 1);
+        assert!(InterfaceSpec::parse("usbcan:COM1?stop-bits=3").is_err());
+    }
+
+    /// Silent mode is in this adapter's settings command, so it can monitor
+    /// without acknowledging. Everything except PCAN and it must still refuse.
+    #[test]
+    fn listen_only_is_offered_by_exactly_the_backends_that_have_it() {
+        assert!(Backend::Pcan.can_listen_only());
+        assert!(Backend::UsbCan.can_listen_only());
+        assert!(!Backend::Slcan.can_listen_only());
+        assert!(!Backend::SocketCan.can_listen_only());
     }
 
     #[test]

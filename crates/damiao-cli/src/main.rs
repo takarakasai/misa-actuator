@@ -42,8 +42,10 @@ use damiao_driver::{
 #[command(version, about = "Test CLI for DAMIAO CAN/CAN-FD servo motors")]
 struct Cli {
     /// CAN interface: `can0` (Linux SocketCAN), `pcan:usb1` (PEAK adapter on
-    /// Windows) or `slcan:COM5` (USB-CAN adapter, classic CAN only). Append
-    /// `@1M,5M` to set the arbitration and CAN-FD data bitrates.
+    /// Windows) or `slcan:COM5` (an adapter running **slcan** firmware, classic
+    /// CAN only — most dongles sold as "USB-CAN" speak something else and will
+    /// not work). Append `@1M,5M` to set the arbitration and CAN-FD data
+    /// bitrates.
     #[arg(short, long, default_value = misa_can::default_interface())]
     interface: String,
 

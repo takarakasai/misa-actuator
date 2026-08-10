@@ -108,6 +108,57 @@ robstride-cli.exe -i "slcan:COM5@1M?serial-baud=2000000" scan
 
 > Quote the interface in PowerShell when it contains `?` or `&`.
 
+### USB-CAN Analyzer (CH340) — a different protocol on similar-looking hardware
+
+The dongle labelled *USB-CAN Analyzer* is **not** an SLCAN adapter. It answers
+nothing at all to the Lawicel commands — verified 2026-08-05 with `V`+CR at
+1228800 / 2000000 / 115200 / 38400 / 9600 baud, silent at every one — and speaks
+its own binary protocol instead. It has its own backend:
+
+```powershell
+lkmotor-cli.exe ports                   # find the CH340's COM number
+robstride-cli.exe -i usbcan:COM1 scan
+```
+
+**Name it explicitly.** A bare `COM1` still means `slcan:`, because nothing in a
+port name distinguishes the two protocols and changing that inference would
+break working command lines.
+
+Bitrate and mode are set by the backend, from the adapter's settings command:
+**5 kbit/s … 1 Mbit/s** in twelve steps, and a silent mode, so `--listen-only`
+style monitoring works here as well as on PEAK.
+
+What it cannot do:
+
+- **No overrun count, no hardware timestamps.** The protocol carries neither, so
+  `rx_overruns()` stays 0 and there are no adapter timestamps. Those two are what
+  settled the DAMIAO CAN-FD investigation (`handover.md` §4) — for diagnostic
+  work this adapter is a step backwards.
+- **Classic CAN only.** No FD framing exists in the protocol.
+
+**If nothing is ever received, suspect the serial framing first.** Two protocol
+sources disagree about it, and the adapter never acknowledges its settings, so a
+wrong choice is silent. The default follows the one that has been run against
+hardware: 2 Mbaud, 8 data bits, **2 stop bits**. The vendor's note says 1,228,800
+and one stop bit:
+
+```powershell
+robstride-cli.exe -i "usbcan:COM1?serial-baud=1228800&stop-bits=1" scan
+```
+
+> Quote the interface in PowerShell when it contains `?` or `&`.
+
+One correctness note, because it matters for RobStride: a data frame is
+`DLC + 5` bytes for an 11-bit id and `DLC + 7` for a 29-bit one. The reference
+implementation uses `DLC + 5` for both, which declares an extended frame complete
+two bytes early and desyncs the stream. Our decoder counts per frame type and
+checks the trailing `0x55`, so a length mistake becomes a skipped packet instead
+of a mangled reading.
+
+The protocol itself is written out in `crates/misa-can/src/backend/usbcan.rs`.
+**The source material is not in the repository** — the licensing of some of it is
+unclear — so that module's documentation is the record, not a pointer to one.
+
 COM10 and above are handled for you — both the CAN and RS485 paths rewrite
 them to the `\\.\COM12` form the OS requires.
 

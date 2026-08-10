@@ -51,7 +51,20 @@ crates/
 |---------|----------|--------|-----------|
 | SocketCAN | Linux | yes | `can0` |
 | PCAN-Basic (PEAK) | Windows | yes | `pcan:usb1`, `pcan:usb2@1M,5M` |
-| SLCAN (CANable, …) | Linux + Windows | no | `slcan:COM5`, `slcan:/dev/ttyACM0` |
+| SLCAN (CANable, USBtin, …) | Linux + Windows | no | `slcan:COM5`, `slcan:/dev/ttyACM0` |
+| USB-CAN Analyzer (CH340) | Linux + Windows | no | `usbcan:COM1` |
+
+**Which protocol a cheap dongle speaks is not visible from the outside.** SLCAN
+is the Lawicel ASCII protocol; "USB-CAN" on the box does not imply it. The
+common *USB-CAN Analyzer* units exchange 20-byte binary packets instead — those
+have their own backend (`usbcan:`), which is **never inferred from a bare
+`COM*`**, so name it explicitly. RobStride's own module uses a third protocol
+(`41 54` … `0D 0A`) and has no backend here. Quick way to tell an slcan adapter:
+send `V` + CR to the port and look for an ASCII reply.
+
+`usbcan:` sets the bitrate itself (5 kbit/s … 1 Mbit/s) and can monitor silently,
+but reports **no receive overruns and no hardware timestamps** — prefer PEAK for
+diagnostic work, where those two are the whole point.
 
 RS485 needs no backend selection — pass the port name (`/dev/ttyUSB0`,
 `COM5`); `lkmotor-cli ports` lists what is attached.

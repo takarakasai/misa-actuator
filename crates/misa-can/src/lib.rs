@@ -40,6 +40,7 @@ pub use error::{Error, Result};
 pub use frame::{ExtendedId, Frame, Id, StandardId, MAX_DATA_LEN};
 pub use spec::{
     Backend, InterfaceSpec, DEFAULT_BITRATE, DEFAULT_DATA_BITRATE, DEFAULT_SLCAN_SERIAL_BAUD,
+    DEFAULT_USBCAN_SERIAL_BAUD,
 };
 
 /// Default per-receive timeout, matching what the drivers used to set on a
@@ -251,12 +252,12 @@ pub fn open_spec(spec: &InterfaceSpec, opts: &OpenOptions) -> Result<Box<dyn Can
     // Refuse rather than come up as a participant. A monitor that quietly
     // acknowledges frames is worse than no monitor: it changes the bus it was
     // opened to observe, and nothing downstream would say so.
-    if opts.listen_only && spec.backend != Backend::Pcan {
+    if opts.listen_only && !spec.backend.can_listen_only() {
         return Err(Error::bad_spec(
             &spec.raw,
             format!(
-                "{} cannot listen without acknowledging; only the PCAN backend \
-                 implements listen-only",
+                "{} cannot listen without acknowledging; the PCAN and usbcan backends \
+                 are the ones with a silent mode",
                 spec.backend.name()
             ),
         ));
@@ -275,6 +276,7 @@ pub fn open_spec(spec: &InterfaceSpec, opts: &OpenOptions) -> Result<Box<dyn Can
         #[cfg(windows)]
         Backend::Pcan => Ok(Box::new(backend::pcan::PcanBackend::open(spec, opts)?)),
         Backend::Slcan => Ok(Box::new(backend::slcan::SlcanBackend::open(spec, opts)?)),
+        Backend::UsbCan => Ok(Box::new(backend::usbcan::UsbCanBackend::open(spec, opts)?)),
         // `require_available` already rejected everything else; this arm only
         // exists so the match stays exhaustive on every target.
         #[allow(unreachable_patterns)]
@@ -301,9 +303,10 @@ pub const fn default_interface() -> &'static str {
 /// without reading the docs.
 pub fn interface_help() -> &'static str {
     if cfg!(target_os = "linux") {
-        "SocketCAN interface (can0), or slcan:/dev/ttyACM0 for a USB-CAN adapter"
+        "SocketCAN interface (can0), or slcan:/dev/ttyACM0 for an adapter running \
+         slcan firmware"
     } else {
-        "PEAK channel (pcan:usb1) or USB-CAN adapter (slcan:COM5); \
+        "PEAK channel (pcan:usb1) or an adapter running slcan firmware (slcan:COM5); \
          append @1M,5M to set the bitrates"
     }
 }

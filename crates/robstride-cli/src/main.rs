@@ -31,8 +31,9 @@ mod param_commands;
 #[command(version, about = "Test CLI for the Robstride CAN servo motor driver")]
 struct Cli {
     /// CAN interface: `can0` (Linux SocketCAN), `pcan:usb1` (PEAK adapter on
-    /// Windows) or `slcan:COM5` (USB-CAN adapter). Append `@500K` to override
-    /// the 1 Mbit/s default bitrate.
+    /// Windows) or `slcan:COM5` (an adapter running **slcan** firmware — most
+    /// dongles sold as "USB-CAN" speak something else and will not work).
+    /// Append `@500K` to override the 1 Mbit/s default bitrate.
     #[arg(short, long, default_value = misa_can::default_interface())]
     interface: String,
 

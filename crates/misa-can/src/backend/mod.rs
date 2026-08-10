@@ -5,6 +5,7 @@
 //! build never references `PCANBasic.dll`.
 
 pub mod slcan;
+pub mod usbcan;
 
 #[cfg(target_os = "linux")]
 pub mod socketcan;

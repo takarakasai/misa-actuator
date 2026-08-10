@@ -42,3 +42,10 @@ crates/*/ref/sdk/
 # committed — it is small, and diffing it shows what the markdown produced.
 /doc/assets/mermaid.min.js
 /doc/assets/mermaid-LICENSE.txt
+
+# Vendor and third-party material for the USB-CAN Analyzer protocol, kept out
+# because the licensing of some of it is unclear. `usbcan.rs` therefore carries
+# the whole wire format in its own module documentation rather than citing files
+# that are not here: nothing needed to maintain that backend may live only in
+# this directory.
+/crates/misa-can/ref/

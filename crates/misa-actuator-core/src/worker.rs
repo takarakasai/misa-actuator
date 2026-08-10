@@ -856,6 +856,41 @@ impl Worker {
                         breakaway_data(b)
                     })
             }
+            CharacterizeJob::BreakawayMap {
+                half_span_rad,
+                steps,
+                ramp_nm_per_s,
+                max_torque_nm,
+                rate_hz,
+                both_directions,
+            } => {
+                let ramp = misa_sysid::BreakawaySpec {
+                    ramp_nm_per_s,
+                    rate_hz,
+                    ..misa_sysid::BreakawaySpec::slow(max_torque_nm, misa_sysid::Direction::Positive)
+                };
+                let spec = misa_sysid::BreakawayMapSpec {
+                    both_directions,
+                    ..misa_sysid::BreakawayMapSpec::symmetric(
+                        half_span_rad,
+                        (steps as usize).max(1),
+                        ramp,
+                    )
+                };
+                misa_sysid::run_breakaway_map(
+                    &mut Counting {
+                        inner: self.actuator.as_mut(),
+                        safety: &self.shared.safety,
+                    },
+                    &spec,
+                    limits,
+                    self.shared.safety.abort_flag(),
+                )
+                .map(|m| {
+                    note_abort(m.abort);
+                    breakaway_map_data(m)
+                })
+            }
             CharacterizeJob::Kt {
                 max_torque_nm,
                 steps,
@@ -1215,6 +1250,23 @@ fn load_map_data(m: misa_sysid::LoadMap) -> (CharacterizeData, String) {
                 None => "needs a return sweep".to_string(),
             },
         ),
+        // `static_load_curve` is friction *per position*, and reporting only its
+        // mean threw the angle dependence away — which for a geared joint is
+        // often the interesting part. The range says whether one number can
+        // describe this joint at all.
+        (
+            "friction over angle".to_string(),
+            {
+                let f: Vec<f32> = m.static_load_curve().iter().map(|&(_, _, f)| f).collect();
+                match (
+                    f.iter().copied().reduce(f32::min),
+                    f.iter().copied().reduce(f32::max),
+                ) {
+                    (Some(lo), Some(hi)) => format!("{lo:.3} – {hi:.3} N·m"),
+                    _ => "needs a return sweep".to_string(),
+                }
+            },
+        ),
         (
             "peak hysteresis".to_string(),
             match m.peak_hysteresis_nm() {
@@ -1426,6 +1478,115 @@ fn breakaway_data(b: misa_sysid::Breakaway) -> (CharacterizeData, String) {
             x2: Some(x),
             y2: Some(measured),
             series2: Some("measured".to_string()),
+            summary,
+        },
+        note,
+    )
+}
+
+/// Stiction against angle, one point per position, both directions.
+///
+/// The two series are the two ramp directions rather than a curve and its
+/// smoothing: what the run measures is their *separation* at each angle, and
+/// plotting a single averaged line would erase it — the same reason a load map
+/// keeps its two legs apart.
+fn breakaway_map_data(m: misa_sysid::BreakawayMap) -> (CharacterizeData, String) {
+    // Only the positions that actually broke loose in that direction. A
+    // position that never moved has no torque to plot, and plotting the ramp
+    // ceiling there would read as a measurement of the ceiling.
+    let series_of = |pick: fn(&misa_sysid::BreakawayMapPoint) -> Option<f32>| {
+        let pts: Vec<(f32, f32)> = m
+            .points
+            .iter()
+            .filter_map(|p| pick(p).map(|v| (p.position_rad, v)))
+            .collect();
+        (
+            pts.iter().map(|&(x, _)| x).collect::<Vec<_>>(),
+            pts.iter().map(|&(_, y)| y).collect::<Vec<_>>(),
+        )
+    };
+    let (x, y) = series_of(|p| p.positive_nm);
+    let (x2, y2) = series_of(|p| p.negative_nm);
+
+    let stictions: Vec<f32> = m.points.iter().filter_map(|p| p.stiction_nm()).collect();
+    let mut summary = Vec::new();
+
+    match m.mean_stiction_nm() {
+        Some(mean) => {
+            summary.push(("mean stiction".to_string(), format!("{mean:.3} N·m")));
+            // The point of sweeping angle at all: a spread comparable to the
+            // mean means one figure cannot describe the joint, and that is the
+            // finding rather than a caveat about it.
+            if let (Some(lo), Some(hi)) = (
+                stictions.iter().copied().reduce(f32::min),
+                stictions.iter().copied().reduce(f32::max),
+            ) {
+                summary.push((
+                    "stiction over angle".to_string(),
+                    format!("{lo:.3} – {hi:.3} N·m"),
+                ));
+                if mean.abs() > 0.0 {
+                    summary.push((
+                        "angle dependence".to_string(),
+                        format!("{:.0}% of the mean", 100.0 * (hi - lo) / mean.abs()),
+                    ));
+                }
+            }
+        }
+        None => {
+            summary.push((
+                "mean stiction".to_string(),
+                if m.points.is_empty() {
+                    "the run recorded nothing".to_string()
+                } else if m.spec.both_directions {
+                    "no position broke loose in both directions".to_string()
+                } else {
+                    // Stiction is half the spread between directions, so one
+                    // direction cannot yield it however well that ramp went.
+                    "needs both directions".to_string()
+                },
+            ));
+        }
+    }
+
+    summary.push((
+        "peak static load".to_string(),
+        match m.peak_static_load_nm() {
+            Some(l) => format!("{l:+.3} N·m"),
+            None => "needs both directions".to_string(),
+        },
+    ));
+    summary.push(("positions".to_string(), m.points.len().to_string()));
+
+    // A ramp that started while the shaft was still moving measured drag, not
+    // stiction. Reported per run because it invalidates the figures rather than
+    // just adding noise to them.
+    let unrested = m.points.iter().filter(|p| !p.rested).count();
+    if unrested > 0 {
+        summary.push((
+            "not at rest".to_string(),
+            format!("{unrested} of {} positions", m.points.len()),
+        ));
+    }
+
+    let note = match m.mean_stiction_nm() {
+        Some(mean) => format!(
+            "{} positions, mean stiction {mean:.3} N·m",
+            m.points.len()
+        ),
+        None => format!("{} positions, no stiction figure", m.points.len()),
+    };
+
+    (
+        CharacterizeData {
+            x_label: "position [rad]".to_string(),
+            y_label: "breakaway torque [N·m]".to_string(),
+            x,
+            y,
+            series: "positive".to_string(),
+            series2: (!y2.is_empty()).then(|| "negative".to_string()),
+            x2: (!x2.is_empty()).then_some(x2),
+            y2: (!y2.is_empty()).then_some(y2),
             summary,
         },
         note,

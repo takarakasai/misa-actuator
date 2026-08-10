@@ -211,6 +211,29 @@ pub enum CharacterizeJob {
         positive: bool,
         rate_hz: f32,
     },
+    /// [`Self::Breakaway`] repeated across a span of positions: **static
+    /// friction as a function of angle**.
+    ///
+    /// The single-position breakaway answers "will it start moving", which is a
+    /// question about one pose. Stiction varies around a revolution — bearing
+    /// preload, seal contact and gear mesh are all angle-dependent — so a joint
+    /// characterised at one angle can be described by a figure that is wrong
+    /// everywhere else in its travel.
+    ///
+    /// Ramping **both ways at each position** is what separates the two things
+    /// measured here: the mean of the two directions is the static load
+    /// (gravity, spring) at that angle, and half their spread is the stiction.
+    /// One direction alone gives their sum.
+    BreakawayMap {
+        /// Positions are swept over ± this far around the start.
+        half_span_rad: f32,
+        /// Positions visited.
+        steps: u32,
+        ramp_nm_per_s: f32,
+        max_torque_nm: f32,
+        rate_hz: f32,
+        both_directions: bool,
+    },
     /// Step through torque levels and fit torque against current: the **torque
     /// constant**, N·m/A.
     ///
@@ -249,6 +272,7 @@ impl CharacterizeJob {
             CharacterizeJob::LoadMap { .. } => "load map",
             CharacterizeJob::VelocitySweep { .. } => "velocity sweep",
             CharacterizeJob::Breakaway { .. } => "breakaway",
+            CharacterizeJob::BreakawayMap { .. } => "breakaway map",
             CharacterizeJob::Kt { .. } => "kt",
         }
     }
@@ -264,6 +288,12 @@ impl CharacterizeJob {
     /// `is_upper_bound` is true for [`Self::Breakaway`], which stops as soon as
     /// the shaft moves and so normally finishes well before its ramp completes.
     /// Every other run dwells for a fixed schedule.
+    /// Travel speed a breakaway map uses between positions (rad/s), mirroring
+    /// [`misa_sysid::BreakawayMapSpec::symmetric`]. Only used to estimate how
+    /// long the run will take, so drifting out of step costs a slightly wrong
+    /// progress bar and nothing else.
+    const TRAVEL_SPEED: f32 = 0.3;
+
     pub fn expected_duration(&self) -> (Duration, bool) {
         let secs = match *self {
             CharacterizeJob::LoadMap {
@@ -309,6 +339,31 @@ impl CharacterizeJob {
                     0.0
                 }
             }
+            CharacterizeJob::BreakawayMap {
+                half_span_rad,
+                steps,
+                ramp_nm_per_s,
+                max_torque_nm,
+                both_directions,
+                ..
+            } => {
+                let steps = steps.max(1) as f32;
+                let ramp = if ramp_nm_per_s > 0.0 {
+                    max_torque_nm.abs() / ramp_nm_per_s
+                } else {
+                    0.0
+                };
+                // Travel between positions is not negligible here: each visit
+                // is a full position move at the spec's travel speed, and there
+                // is a rest window before each ramp.
+                let travel = if steps > 1.0 {
+                    2.0 * half_span_rad.abs() / (steps - 1.0) / Self::TRAVEL_SPEED
+                } else {
+                    0.0
+                };
+                let per_position = ramp * if both_directions { 2.0 } else { 1.0 } + travel;
+                steps * per_position
+            }
             CharacterizeJob::Kt {
                 steps, settle_s, ..
             } => steps.max(2) as f32 * settle_s.max(0.0),
@@ -318,7 +373,10 @@ impl CharacterizeJob {
         let secs = if secs.is_finite() && secs > 0.0 { secs } else { 0.0 };
         (
             Duration::from_secs_f32(secs),
-            matches!(self, CharacterizeJob::Breakaway { .. }),
+            matches!(
+                self,
+                CharacterizeJob::Breakaway { .. } | CharacterizeJob::BreakawayMap { .. }
+            ),
         )
     }
 

@@ -308,6 +308,47 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 There is no `--setup` equivalent: on Windows the bitrate travels in the
 interface string, so there is nothing to bring up first.
 
+### RS485 port pairing on a multi-port adapter
+
+`lkmotor-cli ports` lists the COM numbers the OS reports, but on a multi-port
+RS485 adapter it cannot say which of them face each other — and a CH348 comes
+back with a bare `Unknown` detail, because the `serialport` crate does not
+classify it as a USB port on Windows and so there is not even a VID:PID to
+group the ports by. `scripts\win\rs485_pair_probe.cmd` answers that by
+transmitting a tag from one port at a time and reporting who hears it:
+
+```powershell
+.\scripts\win\rs485_pair_probe.cmd                              # sweep COM12-COM19
+.\scripts\win\rs485_pair_probe.cmd -Ports "COM12,COM13"         # just this pair
+```
+
+The 16-byte tag proves the wiring, not that the link survives 1 Mbit/s — the
+rate the LK motors run at. `rs485_pair_bulk.cmd` pushes 8 KB per direction and
+reports the first mismatching offset, with the theoretical wire time alongside
+so a link that arrives intact but slowly is still visible:
+
+```powershell
+.\scripts\win\rs485_pair_bulk.cmd
+.\scripts\win\rs485_pair_bulk.cmd -Pairs "COM13,COM12;COM15,COM14"   # reverse
+```
+
+Both take a list as **one quoted string** through the `.cmd` wrapper —
+semicolons between pairs for the bulk script. `powershell.exe -File` does not
+re-parse its command line, so separate tokens would bind to the next parameter
+instead of building an array. Called as `.ps1` directly, an ordinary PowerShell
+array works too.
+
+Ports have to be free: close the GUI and any `lkmotor-cli` run first. Power the
+motors down as well — the payload carries no vendor header or checksum and so
+cannot decode into a valid command, but nothing stops a motor midway through
+its own reply from being confused by unsolicited traffic.
+
+Bench result 2026-08-17 (CH348 as COM12-COM19): the pairs are COM12/COM13,
+COM14/COM15 and **COM16/COM19**, with COM17 and COM18 wired to nothing. The
+third pair breaks the adjacent numbering, so guessing COM16/COM17 and
+COM18/COM19 tests a wire that does not exist and reads as a dead link. All six
+directions passed 8 KB at 1 Mbit/s with zero byte errors.
+
 ## 7. Troubleshooting
 
 **`PCANBasic.dll not found`** — the PEAK device driver is not installed, or a

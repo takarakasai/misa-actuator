@@ -201,9 +201,109 @@ fn slug(text: &str) -> String {
     }
 }
 
+/// `YYYYmmdd_HHMM` in UTC — the run-group folder's stamp.
+///
+/// Minutes, not seconds: the folder holds every run of one execution, and a
+/// batch's runs are seconds apart, so a second-resolution name would make one
+/// folder per run and defeat the grouping. See [`begin_run_group`] for why the
+/// stamp is taken once rather than per run.
+pub fn utc_stamp_minute(secs: u64) -> String {
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    let (h, m) = (rem / 3600, (rem % 3600) / 60);
+    let (y, mo, d) = civil_from_days(days);
+    format!("{y:04}{mo:02}{d:02}_{h:02}{m:02}")
+}
+
+/// The folder one execution's files go in: `id5_20260812_0802Z`.
+///
+/// `Z` for the same reason [`utc_stamp`] carries it — a timestamp whose zone is
+/// unstated is worse than one in a zone nobody lives in, and this crate cannot
+/// obtain local time without a dependency.
+pub fn run_dir_name(motor_id: u8, secs: u64) -> String {
+    format!("id{motor_id}_{}Z", utc_stamp_minute(secs))
+}
+
+/// The stamp shared by every run of the execution in progress.
+///
+/// Process-wide because the alternative is threading a group id through
+/// `JobSpec` → `Command` → the worker, and the worker is the only thing that
+/// writes files: three types would gain a field that only one function reads.
+/// [`data_dir`] is already process-wide state consulted at write time, so a
+/// reader of this module has one pattern to learn rather than two.
+static RUN_GROUP: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+/// Fix one folder stamp for every run that follows, until [`end_run_group`].
+///
+/// Taken once at the start rather than per run, because a batch straddles a
+/// minute boundary routinely — the RS-04 batch of 2026-08-12 ran 08:02:49
+/// through 08:03:09, which a per-run stamp would have split across two folders
+/// with three runs in one and two in the other.
+///
+/// The motor id is *not* part of the stamp: a batch walks several motors and
+/// they should share a timestamp, which [`run_dir_name`] then separates by id.
+pub fn begin_run_group(secs: u64) {
+    if let Ok(mut g) = RUN_GROUP.lock() {
+        *g = Some(secs);
+    }
+}
+
+/// Release the fixed stamp, so later single runs each get their own folder.
+pub fn end_run_group() {
+    if let Ok(mut g) = RUN_GROUP.lock() {
+        *g = None;
+    }
+}
+
+/// Where this motor's run should be written: the group's folder, or a fresh one.
+///
+/// A single run outside a batch has no group, so it gets a folder of its own
+/// named for the minute it happened in. Two single runs started inside the same
+/// minute land together, which is the same answer grouping would have given.
+pub fn run_dir(motor_id: u8) -> PathBuf {
+    let secs = RUN_GROUP
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .unwrap_or_else(now_secs);
+    data_dir().join(run_dir_name(motor_id, secs))
+}
+
 /// The file name a run is saved under, without a directory.
 pub fn run_file_name(stamp: &str, run: &str, motor_id: u8) -> String {
     format!("{stamp}Z-{}-id{motor_id}.csv", slug(run))
+}
+
+/// The PNG beside a run's CSV, named so the pair sorts together.
+///
+/// Derived from the CSV's name rather than rebuilt from the stamp, so the two
+/// cannot drift apart: the plot is only meaningful as the picture of *that*
+/// file's numbers, and a mismatched pair would be worse than no picture.
+pub fn png_file_name(csv_file_name: &str) -> String {
+    match csv_file_name.strip_suffix(".csv") {
+        Some(base) => format!("{base}.png"),
+        None => format!("{csv_file_name}.png"),
+    }
+}
+
+/// Write a plot rendered by the front end next to its run.
+///
+/// The bytes come from the webview's canvas because that is where the plot
+/// exists — re-plotting in Rust would mean a second implementation of the axes,
+/// the two-leg merge and the y-range padding, which would then disagree with
+/// what the operator saw. `file_name` is slugged by the caller via
+/// [`png_file_name`]; it is joined, never trusted, so the traversal test that
+/// guards [`write_run_csv`] covers this too.
+pub fn write_run_png(dir: &Path, file_name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to write a plot to {file_name:?}"),
+        ));
+    }
+    fs::create_dir_all(dir)?;
+    let path = dir.join(file_name);
+    fs::write(&path, bytes)?;
+    Ok(path)
 }
 
 /// Write one run: `#` metadata lines, then the samples.
@@ -243,7 +343,7 @@ pub fn write_run_csv(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Serialises the tests that touch process-wide state.
@@ -253,7 +353,11 @@ mod tests {
     /// each other's setup and fail on assertions about the fallback — observed
     /// 2026-08-08, passing under `--test-threads=1` and failing without it,
     /// which is the signature of exactly this.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ///
+    /// `pub(crate)` because `batch`'s output-layout test redirects the same
+    /// variable, and a second lock would serialise each module against itself
+    /// while still letting the two collide.
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn the_stamp_is_a_real_utc_date() {
@@ -291,6 +395,69 @@ mod tests {
         let name = run_file_name("20260807-041530", "../oops", 96);
         assert!(!name.contains('/') && !name.contains('\\'), "{name}");
         assert_eq!(name, "20260807-041530Z-oops-id96.csv");
+    }
+
+    /// The folder carries the motor and the minute, and says which zone.
+    #[test]
+    fn a_run_folder_names_the_motor_and_the_minute() {
+        // 2026-08-12 08:02:50 UTC — the RS-04 batch this grouping was built for.
+        let secs = 1_786_521_770;
+        assert_eq!(utc_stamp_minute(secs), "20260812_0802");
+        assert_eq!(run_dir_name(5, secs), "id5_20260812_0802Z");
+    }
+
+    /// The whole point of the group: runs seconds apart either side of a minute
+    /// boundary land in one folder, which a per-run stamp would have split.
+    #[test]
+    fn a_group_holds_a_batch_that_crosses_a_minute() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 08:02:49 and 08:03:09 — the real span of the 2026-08-12 batch.
+        let start = 1_786_521_769;
+        begin_run_group(start);
+        let first = run_dir(5);
+        let last = run_dir(5);
+        end_run_group();
+
+        assert_eq!(first, last, "one execution must be one folder");
+        assert!(
+            first.ends_with("id5_20260812_0802Z"),
+            "{}",
+            first.display()
+        );
+
+        // Two motors in the same batch share the stamp and differ by id.
+        begin_run_group(start);
+        let a = run_dir(5);
+        let b = run_dir(6);
+        end_run_group();
+        assert_ne!(a, b);
+        assert!(b.ends_with("id6_20260812_0802Z"), "{}", b.display());
+    }
+
+    /// A plot is named for the run it pictures, so the pair cannot drift apart.
+    #[test]
+    fn a_plot_is_named_after_its_run() {
+        assert_eq!(
+            png_file_name("20260812-080250Z-load-map-id5.csv"),
+            "20260812-080250Z-load-map-id5.png"
+        );
+        // Not a CSV: still gets a suffix rather than losing one.
+        assert_eq!(png_file_name("odd-name"), "odd-name.png");
+    }
+
+    #[test]
+    fn a_plot_cannot_escape_its_directory() {
+        let dir = std::env::temp_dir().join(format!("misa-png-test-{}", now_secs()));
+        for bad in ["../oops.png", r"..\oops.png", "sub/oops.png"] {
+            let e = write_run_png(&dir, bad, b"x").expect_err("must refuse");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{bad}");
+        }
+
+        // And a good name lands, byte for byte.
+        let path = write_run_png(&dir, "plot.png", b"\x89PNG\r\n\x1a\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"\x89PNG\r\n\x1a\n");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Serialised, because it mutates process-wide environment state and the

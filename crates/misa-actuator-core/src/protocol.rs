@@ -450,7 +450,13 @@ pub struct CharacterizeData {
 /// it. Stopping one therefore goes through [`crate::Session::stop`], not
 /// through the command queue.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "job")]
+// `rename_all_fields` was missing here until 2026-08-08 and nothing had noticed:
+// every variant's inline fields were single words, and the two that carry
+// structs (`Chirp`, `Characterize`) get their casing from those structs' own
+// attribute. The first multi-word inline field would have shipped as
+// snake_case and read `undefined` in the UI — the same silent break `Command`
+// documents below, which has caused a black screen twice.
+#[serde(rename_all = "kebab-case", rename_all_fields = "camelCase", tag = "job")]
 pub enum JobSpec {
     Chirp(ChirpJob),
     Characterize {
@@ -461,6 +467,29 @@ pub enum JobSpec {
         run: CharacterizeJob,
         #[serde(default)]
         envelope: RunEnvelope,
+    },
+    /// Travel to a position recorded earlier, given in the **motor's own
+    /// frame** — see [`misa_actuator::Actuator::position_zero_in_motor_frame_rad`].
+    ///
+    /// Motor-frame rather than the reported frame because the point of a saved
+    /// home is to survive a reconnect, and every family that anchors a soft
+    /// zero on connect re-defines the reported frame when it does. A home in
+    /// reported coordinates is a number that means somewhere else tomorrow.
+    ///
+    /// **A job rather than a setpoint.** A setpoint is instant and does not
+    /// occupy the worker, but it is only pushed while streaming, so the button
+    /// would silently do nothing from idle — which is the state you are most
+    /// likely to press it from, and the same trap the Multi tab's targets fell
+    /// into. Blocking for a second while the shaft moves is the honest cost.
+    GoHome {
+        /// Target in the motor's own frame (rad).
+        target_motor_frame_rad: f32,
+        /// Speed cap while travelling (rad/s).
+        max_speed_rad_s: f32,
+        /// Give up and stop after this long (s). A shaft that cannot reach the
+        /// target — an end stop, a load it cannot lift — must not hold against
+        /// it indefinitely.
+        timeout_s: f32,
     },
 }
 
@@ -503,6 +532,19 @@ pub enum Command {
     Enable,
     Disable,
     SetZero,
+    /// Record where the shaft is now as this motor's home, and report it back
+    /// as [`Event::HomeSet`] so the client can keep it.
+    ///
+    /// The answer is in the motor's own frame, not the reported one, so it
+    /// stays meaningful after a reconnect re-anchors the soft zero. The client
+    /// stores it because the worker does not outlive a disconnect.
+    ///
+    /// **Valid modulo one output turn across a power cycle.** Both families
+    /// measured so far keep the origin but lose the turn count, folding the
+    /// reported position into ±180° at power-up (2026-08-08, RMD-X4 and
+    /// RS-04). A home more than half a turn from the origin can therefore come
+    /// back ambiguous — see `doc/handover.md` §4.
+    SetHomeHere,
     /// Pre-configure the run mode without issuing a control command.
     SetRunMode { mode: ControlMode },
     /// One read, outside the polling cadence.
@@ -706,6 +748,14 @@ pub enum Event {
     },
     Stopped {
         reason: StopReason,
+    },
+    /// The answer to [`Command::SetHomeHere`].
+    ///
+    /// `None` when the driver cannot say where its zero sits in the motor's
+    /// frame — recording a home that cannot be converted back would be a
+    /// number that silently means the wrong place after a reconnect.
+    HomeSet {
+        position_motor_frame_rad: Option<f32>,
     },
     /// The answer to [`Command::ReadParameters`].
     ///
@@ -962,6 +1012,34 @@ mod tests {
         // A characterization run is the same nesting again, and the two friction
         // runs are the pair most easily confused: one measures static friction,
         // the other kinetic, and they differ only by the tag.
+        // Going home is the one job whose payload is a *coordinate*, so a
+        // silent rename here would not fail to parse — it would move the shaft
+        // somewhere else. The frame is in the field name for the same reason.
+        let json = serde_json::to_string(&Event::JobStarted {
+            spec: JobSpec::GoHome {
+                target_motor_frame_rad: 1.7139,
+                max_speed_rad_s: 1.0,
+                timeout_s: 10.0,
+            },
+        })
+        .unwrap();
+        assert!(json.contains("\"job\":\"go-home\""), "{json}");
+        assert!(json.contains("\"targetMotorFrameRad\":1.7139"), "{json}");
+        assert!(json.contains("\"maxSpeedRadS\":1.0"), "{json}");
+
+        // A home the driver could not place in the motor frame must arrive as
+        // `null`, not 0.0 — the frame origin is a perfectly ordinary home, so
+        // a zero-defaulted "unknown" would read as "home is at the origin".
+        let json = serde_json::to_string(&Event::HomeSet {
+            position_motor_frame_rad: None,
+        })
+        .unwrap();
+        assert!(json.contains("\"event\":\"home-set\""), "{json}");
+        assert!(json.contains("\"positionMotorFrameRad\":null"), "{json}");
+
+        let json = serde_json::to_string(&Command::SetHomeHere).unwrap();
+        assert!(json.contains("\"kind\":\"set-home-here\""), "{json}");
+
         let json = serde_json::to_string(&Event::JobStarted {
             spec: JobSpec::Characterize {
                 run: CharacterizeJob::Breakaway {

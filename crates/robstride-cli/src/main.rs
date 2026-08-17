@@ -106,7 +106,18 @@ enum Command {
     Enable,
     /// Disable the motor (coast).
     Disable,
-    /// Set the current position as the mechanical zero.
+    /// Set the current position as the mechanical zero. **Persistent.**
+    ///
+    /// Unlike DAMIAO's `zero --nvm` and MyActuator's `zero --rom`, there is no
+    /// flag here to opt into persistence: this command always writes it.
+    /// Measured 2026-08-08 on an RS-04 — `MechOffset` came back bit-identical
+    /// after a power cycle. Persistent means flash, and flash wears.
+    ///
+    /// Nothing in this CLI writes the previous value back. It is printed before
+    /// the write so it can be recorded, and restoring it means positioning the
+    /// shaft and running this again.
+    ///
+    /// Every position measured before this is in the frame it replaces.
     SetZero,
     /// Move to an absolute position (rad) using the position-control mode.
     MoveTo {
@@ -608,6 +619,36 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::SetZero => {
             let mut motor = open_motor(&cli)?;
+            // Every other family gates its persistent zero behind a flag —
+            // DAMIAO's `--nvm`, MyActuator's `--rom` — and warns when it is
+            // used. RobStride has no flag at all: this one command always
+            // writes the persistent zero, which made it the quietest
+            // irreversible operation in the workspace until it was measured.
+            //
+            // Measured 2026-08-08 on an RS-04 (0.4.1.32): `MechOffset`
+            // (`0x2005`) came back bit-identical after a power cycle, and the
+            // position still read zero. Persistent means flash, and flash
+            // wears.
+            //
+            // Warn and continue, like the rest of the CLI — there are no
+            // confirmation prompts anywhere here. The previous value is read
+            // back first so the operator has something to write down, since
+            // nothing in this CLI can put it back.
+            match motor.read_param(ParamIndex::MechOffset) {
+                Ok(prev) => eprintln!(
+                    "warning: this replaces the motor's persistent zero. It survives a power \
+                     cycle (measured), flash wears, and there is no command here that writes \
+                     it back — restoring it means positioning the shaft and re-running this. \
+                     The previous MechOffset was {prev} (motor-frame rad, mod 2pi); write it \
+                     down. Every position recorded before now is in the frame this replaces."
+                ),
+                Err(e) => eprintln!(
+                    "warning: this replaces the motor's persistent zero, it survives a power \
+                     cycle, and there is no command here that writes it back. The previous \
+                     MechOffset could not be read first ({e}), so it is being overwritten \
+                     unrecorded."
+                ),
+            }
             motor.set_zero()?;
             println!("zero set on motor {}", cli.motor_id);
         }

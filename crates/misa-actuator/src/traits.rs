@@ -97,6 +97,48 @@ pub trait Actuator {
         None
     }
 
+    /// The angle, in the motor's own frame, that this driver is currently
+    /// reporting as `position_rad = 0` (rad).
+    ///
+    /// Add it to any reported position to get the motor's own angle. That is
+    /// what makes two runs comparable: `position_rad` alone is measured from a
+    /// soft zero the driver placed, so identical numbers from two runs can be
+    /// different physical angles. Recording this turns a run's positions back
+    /// into something another run can be laid over.
+    ///
+    /// `Some(0.0)` means the reported frame *is* the motor's — nothing to add
+    /// (RobStride, DAMIAO). `None` means the driver cannot say, which is not
+    /// the same answer and must not be recorded as zero: a file that cannot
+    /// distinguish "no offset" from "not asked" lies about what it contains.
+    ///
+    /// **How absolute the motor's own frame is, is a per-family question.** On
+    /// an RMD-X4 it is the output shaft and survives a power cycle only modulo
+    /// one turn — the encoder ROM offset persists but the turn count does not
+    /// (measured 2026-08-08).
+    fn position_zero_in_motor_frame_rad(&self) -> Option<f32> {
+        None
+    }
+
+    /// The motor's **own** persistent origin, formatted so the value carries
+    /// its own meaning. `None` when the family has none, or cannot be asked.
+    ///
+    /// Distinct from [`Self::position_zero_in_motor_frame_rad`], which is the
+    /// host-side offset. This is the one stored in the motor, which a
+    /// documented command moves: `robstride-cli set-zero`, `myactuator-cli zero
+    /// --rom`, `damiao-cli zero --nvm`. When it moves, every position recorded
+    /// before is in a frame that no longer exists — and nothing else in a saved
+    /// run would show it, because the host-side offset can be unchanged while
+    /// the motor's zero has shifted underneath it (measured 2026-08-08: an
+    /// RS-04's `MechOffset` went 0.428 → 5.559 while the driver reported the
+    /// same frame throughout).
+    ///
+    /// Recorded for **detection, not arithmetic** — the families store it in
+    /// different units and frames, so the string is compared, not converted.
+    /// Costs one transaction; called once per saved run, not per sample.
+    fn motor_origin(&mut self) -> Option<String> {
+        None
+    }
+
     /// Whether the driver thinks the motor is currently enabled. Same
     /// caveat as [`Self::current_run_mode_hint`]: this is a tracked flag,
     /// not a fresh query.

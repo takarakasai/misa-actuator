@@ -619,6 +619,34 @@ pub struct Breakaway {
     pub abort: Option<AbortReason>,
 }
 
+impl Breakaway {
+    /// How coarsely [`Self::breakaway_torque_nm`] could be resolved (N·m).
+    ///
+    /// The ramp advances on wall-clock, so the torque only takes the values it
+    /// happened to be commanded at. Motion is detected at the first command
+    /// that causes it, which means the true breakaway lies in
+    /// `(reported - resolution, reported]` — the figure is an **upper bound
+    /// quantised by this step**, not a centred estimate.
+    ///
+    /// Worth reporting because the step is not the one the spec implies. At 200
+    /// Hz and 0.2 N·m/s it is 0.001 N·m, but the loop is a bus transaction: one
+    /// slow round trip stretches the interval and coarsens exactly the sample
+    /// that matters. Quoting three decimals off a run whose step was 0.3 N·m is
+    /// the same false precision as the 1°/LSB angle printed to three places.
+    ///
+    /// `None` when nothing broke away, since there is no figure to qualify.
+    pub fn resolution_nm(&self) -> Option<f32> {
+        let at = self.breakaway_torque_nm?;
+        let i = self.points.iter().position(|p| p.cmd == at)?;
+        Some(match i {
+            // The first sample was already at some magnitude, so the true value
+            // is bounded by that, not by a step from a previous one.
+            0 => self.points[0].cmd.abs(),
+            i => self.points[i].cmd.abs() - self.points[i - 1].cmd.abs(),
+        })
+    }
+}
+
 /// Ramp torque from zero until the shaft starts moving, and report the torque it
 /// took.
 ///
@@ -633,6 +661,13 @@ pub fn run_breakaway(
     abort: &AtomicBool,
 ) -> Result<Breakaway> {
     act.set_run_mode(RunMode::Torque)?;
+    // Re-enabling here is load-bearing (the previous ramp ended disabled) and it
+    // relies on `enable` being frame-preserving: a driver that re-anchors its
+    // soft zero on every enable makes every position this run reports come back
+    // as ~0. That is not a visible failure — it is a map of five samples that
+    // all claim to be at the same angle, which is what a real angle-independent
+    // rig looks like. Measured on an RMD-X4 (2026-08-08) whose `enable` called
+    // `rezero`; see `MyActuatorMotor::engage_hold`.
     act.enable()?;
 
     // Settle first: the motion test that ends the ramp would otherwise trip on
@@ -1204,6 +1239,28 @@ impl BreakawayMap {
     pub fn mean_stiction_nm(&self) -> Option<f32> {
         let v: Vec<f32> = self.points.iter().filter_map(|p| p.stiction_nm()).collect();
         (!v.is_empty()).then(|| v.iter().sum::<f32>() / v.len() as f32)
+    }
+
+    /// The coarsest ramp step anywhere in the map (N·m) — a bound on the
+    /// resolution of **every** figure it reports.
+    ///
+    /// Per-ramp rather than per-map would be more precise, but the map keeps
+    /// its samples concatenated and a single worst case is what a reader needs:
+    /// it says how many digits of the stiction and static-load numbers mean
+    /// anything. See [`Breakaway::resolution_nm`] for why the step is not the
+    /// one the spec implies.
+    ///
+    /// `None` when there are too few samples to see a step.
+    pub fn resolution_nm(&self) -> Option<f32> {
+        let worst = self
+            .samples
+            .windows(2)
+            // A non-increasing time is the next ramp restarting its own clock,
+            // not a sample interval — the step across that seam is meaningless.
+            .filter(|w| w[1].t_s > w[0].t_s)
+            .map(|w| w[1].cmd.abs() - w[0].cmd.abs())
+            .fold(f32::NAN, f32::max);
+        worst.is_finite().then_some(worst)
     }
 
     /// Largest |static load| across the positions (N·m).
@@ -2907,13 +2964,71 @@ mod tests {
         assert_eq!(m.points.len(), 3);
         assert_eq!(m.abort, None);
 
-        // Friction recovered at every position, static load ~0.
+        // The bound comes from the ramp's own granularity, not from a round
+        // number.
+        //
+        // `run_breakaway` advances on wall-clock (`magnitude = ramp_nm_per_s *
+        // elapsed`), which is correct — a torque *rate* has to be real time —
+        // but it means a breakaway can only ever be resolved to how far the
+        // ramp moved between two samples. On a loaded machine the 0.5 ms period
+        // stretches and that step grows; a fixed +/-0.1 N·m tolerance then
+        // failed a measurement that was exactly as accurate as it could be.
+        // This test used to fail only under the full suite for that reason.
+        //
+        // This rig moves iff |cmd| > mu, so the arithmetic is exact. The ramp
+        // records the command from when motion *started*, so with
+        // `positive = mu + a` and `-negative = mu + b`, where `a` and `b` are
+        // each in `(0, step]`:
+        //
+        //   stiction    = (positive - negative) / 2 = mu + (a + b) / 2
+        //   static load = (positive + negative) / 2 =      (a - b) / 2
+        //
+        // giving `stiction` in `(mu, mu + step]` and `|static load| < step/2`.
+        // Both tighten to nothing as the machine gets quieter, so a real
+        // regression still fails.
+        let step = spec.ramp.ramp_nm_per_s
+            * m.samples
+                .windows(2)
+                .map(|w| w[1].t_s - w[0].t_s)
+                // A negative gap is the next ramp restarting its own clock, not
+                // a sample interval.
+                .filter(|dt| *dt > 0.0)
+                .fold(0.0f32, f32::max);
+        let eps = 1e-3;
+
         let stic = m.mean_stiction_nm().expect("stiction");
-        assert!((stic - mu).abs() < 0.1, "stiction {stic} vs planted {mu}");
         assert!(
-            m.peak_static_load_nm().unwrap() < 0.1,
-            "static load should vanish, got {:?}",
-            m.peak_static_load_nm()
+            stic > mu - eps,
+            "stiction {stic} is below the planted {mu}: the ramp cannot detect \
+             breakaway before it commands enough torque to cause it"
+        );
+        assert!(
+            stic - mu <= step + eps,
+            "stiction {stic} overshoots the planted {mu} by {:.4} N·m, more than \
+             the ramp's own step of {step:.4} N·m ({} samples)",
+            stic - mu,
+            m.samples.len()
+        );
+        let load = m.peak_static_load_nm().expect("static load");
+        assert!(
+            load < step / 2.0 + eps,
+            "static load {load} exceeds half the ramp step ({:.4} N·m); the two \
+             directions should differ only by where the ramp happened to sample",
+            step / 2.0
+        );
+
+        // The map reports that same bound, so a reader can tell how many digits
+        // of the figures above mean anything. Derived from the run rather than
+        // from the spec: the spec's implied step is the one a quiet machine
+        // takes, and the whole point is that the real one can be much coarser.
+        let reported = m.resolution_nm().expect("a resolution");
+        assert!(
+            (reported - step).abs() < eps,
+            "reported resolution {reported} disagrees with the observed step {step}"
+        );
+        assert!(
+            stic - mu <= reported + eps,
+            "the reported resolution must bound the error it is there to explain"
         );
         // And it worked despite torque never being reported.
         assert!(m.samples.iter().all(|p| p.torque_nm.is_nan()));

@@ -336,6 +336,13 @@ impl Actuator for SimActuator {
         Ok(())
     }
 
+    fn position_zero_in_motor_frame_rad(&self) -> Option<f32> {
+        // Always answerable: reported positions already subtract
+        // `unwrap_or(0.0)`, so an un-anchored sim *is* in the shaft's frame and
+        // the honest answer is 0.0 rather than "cannot say".
+        Some(self.zero_offset_rad.unwrap_or(0.0))
+    }
+
     fn set_zero(&mut self) -> Result<()> {
         self.begin()?;
         self.zero_offset_rad = Some(self.plant.state.pos_rad);

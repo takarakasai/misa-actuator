@@ -208,7 +208,14 @@ pub fn spawn(spec: BatchSpec) -> Batch {
     std::thread::Builder::new()
         .name("batch".to_string())
         .spawn(move || {
+            // Every run this batch performs shares one folder stamp, including
+            // the motors it has not reached yet: a batch is one execution, and
+            // its runs are seconds apart either side of a minute boundary.
+            // Released at the end so a later single run gets its own folder even
+            // if the batch failed part way.
+            export::begin_run_group(export::now_secs());
             run(spec, &progress, &cancel);
+            export::end_run_group();
             if let Ok(mut p) = progress.lock() {
                 p.running = false;
                 p.cancelled = cancel.load(Ordering::Acquire);
@@ -609,6 +616,82 @@ mod tests {
             assert!(Instant::now() < deadline, "batch did not finish: {p:?}");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// A batch's files land in one folder per motor, named for the motor and the
+    /// minute, with every run of that motor inside it.
+    ///
+    /// Runs a real batch rather than asserting on `run_dir` alone, because the
+    /// thing that can break is the wiring: the stamp is fixed in `spawn` and read
+    /// in the worker, and nothing else connects the two.
+    #[test]
+    fn a_batch_groups_its_runs_into_one_folder_per_motor() {
+        // Shared with `export`'s tests, which redirect the same variable.
+        let _guard = crate::export::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = std::env::temp_dir().join(format!("misa-batch-dir-{}", export::now_secs()));
+        let previous = std::env::var_os(export::DATA_DIR_ENV);
+        std::env::set_var(export::DATA_DIR_ENV, &dir);
+
+        let batch = spawn(sim_spec(vec![7, 8], vec![quick_breakaway()]));
+        let p = wait_done(&batch, Duration::from_secs(60));
+
+        match previous {
+            Some(v) => std::env::set_var(export::DATA_DIR_ENV, v),
+            None => std::env::remove_var(export::DATA_DIR_ENV),
+        }
+
+        // Everything is a directory: runs go inside their folder, never loose
+        // beside it.
+        let mut all: Vec<String> = std::fs::read_dir(&dir)
+            .expect("the batch should have created its output directory")
+            .map(|e| {
+                let e = e.unwrap();
+                assert!(e.path().is_dir(), "loose file beside the run folders: {e:?}");
+                e.file_name().to_string_lossy().into_owned()
+            })
+            .collect();
+        all.sort();
+
+        // Only this batch's ids, because the variable is process-wide and the
+        // other batch tests — which use ids 1..3 and take no lock — write here
+        // too while this one holds it. Filtering is what makes the assertion
+        // about *this* batch rather than about the runner's scheduling.
+        let names: Vec<&String> = all
+            .iter()
+            .filter(|n| n.starts_with("id7_") || n.starts_with("id8_"))
+            .collect();
+        assert_eq!(names.len(), 2, "expected one folder per motor, got {all:?}");
+        assert!(names[0].starts_with("id7_"), "{names:?}");
+        assert!(names[1].starts_with("id8_"), "{names:?}");
+
+        // Both motors share the batch's stamp: that is what makes the two
+        // folders one execution rather than two.
+        assert_eq!(
+            names[0].trim_start_matches("id7_"),
+            names[1].trim_start_matches("id8_"),
+            "the motors of one batch must share a stamp: {names:?}"
+        );
+
+        // And each run's CSV is inside its motor's folder.
+        for (name, id) in names.iter().zip([7u8, 8]) {
+            let files: Vec<_> = std::fs::read_dir(dir.join(name))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                files.iter().any(|f| f.ends_with(&format!("-id{id}.csv"))),
+                "no run for id{id} in {name}: {files:?}"
+            );
+        }
+
+        // The batch itself still succeeded — a layout change must not have cost
+        // a measurement.
+        assert!(p.results.iter().all(|r| r.ok), "{:?}", p.results);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Every motor is visited, and every run recorded — the batch's whole job.

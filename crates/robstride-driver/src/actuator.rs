@@ -50,6 +50,45 @@ use crate::scan::scan_bus_on;
 /// that a freshly-enabled motor doesn't run away at maximum speed.
 const POSITION_DEFAULT_LIMIT_SPD: f32 = 5.0;
 
+/// Stiffness used when the trait asks for position control, which this driver
+/// realises over MIT — see [`Actuator::set_run_mode`].
+///
+/// 30 N·m/rad, sized from what the quasi-static runs actually do. Their offsets
+/// reach ±0.3 rad, so the largest demand is 9 N·m: above the ~2.5 N·m of stiction
+/// measured on the RS-04 at id 5, so the shaft reaches its target, and below the
+/// motor's 12 N·m rating, so a target at the end of the sweep does not ask for
+/// more than the motor should give. The same number the CLI's `mit-hold` has
+/// always defaulted to.
+///
+/// Deliberately *not* the motor's own `loc_kp`, which reads 80 on that unit: at
+/// 80 N·m/rad one radian of error demands 80 N·m from a 12 N·m motor, which is
+/// how the old path turned a stale reference into a saturated slam. The point of
+/// moving to MIT is that this number is chosen, visible and changeable here
+/// rather than left in a motor register.
+const POSITION_MIT_KP: f32 = 30.0;
+
+/// Damping for the same. 1 N·m·s/rad — enough to stop the shaft ringing around
+/// each dwell point, which is what a quasi-static reading needs, without adding
+/// so much drag that the settle time dominates the run.
+const POSITION_MIT_KD: f32 = 1.0;
+
+/// Velocity-tracking gain for the same reason, since velocity mode is realised
+/// over MIT too — see [`Actuator::set_run_mode`].
+///
+/// 50 N·m·s/rad, sized from the standing start. MIT tracks velocity as
+/// `tau = kd·(vel_ref − vel)`, so a joint at rest asked for the sweeps' 0.05 rad/s
+/// sees `50 × 0.05 = 2.5 N·m` — which is the stiction measured on the RS-04 at
+/// id 5, so the shaft can break away at all. The firmware's own speed loop could
+/// not: `spd_kp = 6` on that unit yields 0.3 N·m against the same 2.5, and the
+/// velocity sweep of 2026-08-12 recorded **zero samples** because the shaft never
+/// moved far enough to leave the lead-in.
+///
+/// A joint whose stiction exceeds `kd × commanded speed` still will not move, and
+/// that is not hidden: `VelocitySweep` reports `speed-travelled X of Y
+/// commanded`, which is the reading to look at before believing a friction
+/// figure.
+const VELOCITY_MIT_KD: f32 = 50.0;
+
 /// Fetch current only when the caller opted in, since it costs an extra bus
 /// round-trip. `NaN` otherwise — RobStride's feedback frame has no current
 /// field, so reporting a zero would be a fabrication.
@@ -183,12 +222,88 @@ impl<B: RobstrideBus> Actuator for Motor<B> {
         Ok(())
     }
 
+    fn position_zero_in_motor_frame_rad(&self) -> Option<f32> {
+        // No software anchor: feedback positions are already the motor's own
+        // frame (`set_zero` moves the motor's zero, not a host-side offset).
+        Some(0.0)
+    }
+
+    fn motor_origin(&mut self) -> Option<String> {
+        // `MechOffset` is what `set_zero` writes — confirmed by predicting the
+        // change and matching it to 0.07% (2026-08-08). It is a *motor-frame*
+        // angle folded into one motor turn, not an output-shaft one, so it is
+        // recorded verbatim rather than converted: the point is to notice that
+        // two runs were taken against different zeros, not to do arithmetic
+        // across them.
+        let v = Motor::read_param(self, ParamIndex::MechOffset).ok()?;
+        // No comma: this lands in a `#` line of a CSV.
+        Some(format!("mech-offset {v} rad (motor frame; mod 2pi)"))
+    }
+
     fn set_zero(&mut self) -> MisaResult<()> {
         Motor::set_zero(self)?;
         Ok(())
     }
 
     fn set_run_mode(&mut self, mode: MisaRunMode) -> MisaResult<()> {
+        // **Torque is realised over MIT, not over the firmware's current mode.**
+        //
+        // Measured 2026-08-12 on the RS-04 at id 5 (firmware 0.4.1.32), shaft
+        // horizontal with the output pointing up so gravity exerts no torque
+        // about the axis: with the firmware in current mode and `IqRef = 0`, the
+        // motor drove a **sustained 1 Hz oscillation**, ±0.9 rad, peaking at
+        // 7 rad/s, that did not decay across 5 s. Velocity mode with
+        // `SpdRef = 0` moved the shaft too. A MIT frame with
+        // `kp = kd = torque_ff = 0` held it dead still — 1.745 rad unchanged
+        // over the same 5 s.
+        //
+        // Ruled out before changing this: the adapter (upgraded to WeAct
+        // V1.0.0.6, whose 16→128 buffers did not change the behaviour, with the
+        // CAN error register reading 0 throughout), a mechanical load (disabled,
+        // the shaft is dead still across ten reads), and a stale reference
+        // (`enable` writes `IqRef = 0` before energising).
+        //
+        // A zero command that makes the shaft oscillate at 7 rad/s is not a
+        // measurement nuance, so the exact route the docs already named — "use
+        // MIT mode with `torque_ff`" — becomes the only route. `set_torque`
+        // sends the frame; this is where the firmware is put somewhere that
+        // runs no loop of its own.
+        //
+        // Note this changes the *mechanism* behind the numbers in
+        // `doc/handover.md` §4, which were taken through `IqRef` over PCAN on
+        // other units. Comparing across the change means comparing two paths.
+        // **Position goes the same way, and for a defect of its own.**
+        //
+        // The firmware ignores `LocRef` writes while disabled, so a Position-mode
+        // enable necessarily runs its loop for a round trip or two against
+        // *whatever reference was left there*. Measured 2026-08-12: the shaft sat
+        // at +53 rad while `LocRef` held a single-digit value from an earlier
+        // command, and `loc_kp = 80 N·m/rad` turned that ~48 rad error into a
+        // demand of thousands of N·m, clamped to `limit_torque = 115`. Every
+        // Position-mode run therefore began with tens of milliseconds of
+        // saturated torque, which the safety guard caught after one sample —
+        // reported from the bench as "a huge torque immediately, then it stops".
+        //
+        // MIT carries the target in every frame, so there is no stored reference
+        // to be stale and nothing for the enable to act on: `enable` writes no
+        // reference in MIT mode, and the firmware runs no loop of its own until
+        // the first frame arrives with both a target and the gains to use.
+        //
+        // `Motor::set_run_mode(Position)` still exists for callers that go
+        // straight to the inherent API — the CLI's `move-to` does — and keeps
+        // the old `LocRef` + `LimitSpd` path.
+        // **Velocity joins them, because the firmware's speed loop has no
+        // authority.** `spd_kp` reads 6 on the RS-04 at id 5, so the 0.05 rad/s
+        // a sweep asks for buys 0.3 N·m against 2.5 N·m of stiction: the shaft
+        // never left the lead-in and the run of 2026-08-12 logged zero samples.
+        // MIT's `kd` is ours to choose — see [`VELOCITY_MIT_KD`].
+        let mode = match mode {
+            MisaRunMode::Torque | MisaRunMode::Position | MisaRunMode::Velocity => {
+                MisaRunMode::Mit
+            }
+            other => other,
+        };
+
         // Robstride firmware silently ignores `RunMode` writes while the
         // motor is enabled — the CLI works around this by always issuing
         // `disable → set_run_mode → enable`. We do the same here, AND we
@@ -205,45 +320,68 @@ impl<B: RobstrideBus> Actuator for Motor<B> {
         Ok(())
     }
 
-    fn set_position(&mut self, pos_rad: f32, max_speed_rad_s: f32) -> MisaResult<MisaFeedback> {
-        require_mode(self, RunMode::Position, "set_position")?;
-        Motor::set_position_with_speed(self, pos_rad, max_speed_rad_s)?;
-        let fb = Motor::measure_safe(self)?;
-        let current = optional_current(self);
-        let kt = self.torque_constant();
-        Ok(rs_to_misa_feedback(fb, current, kt))
+    fn set_position(&mut self, pos_rad: f32, _max_speed_rad_s: f32) -> MisaResult<MisaFeedback> {
+        // MIT, not `LocRef` — see `set_run_mode` for the enable-time slam that
+        // decided this. The mode check names MIT because that is where
+        // `set_run_mode` actually put the firmware.
+        require_mode(self, RunMode::Mit, "set_position")?;
+
+        // `max_speed_rad_s` is not enforceable here and is deliberately dropped
+        // rather than approximated. A PD law has no speed clamp: `LimitSpd` was
+        // a firmware feature of the mode we just stopped using, and faking it
+        // with a velocity reference would make the frame a velocity command with
+        // a position bias, which is not what the caller asked for. What bounds
+        // motion now is the caller's own envelope — `misa_sysid`'s `Guard` stops
+        // a run that leaves its span — and `POSITION_MIT_KD` below.
+        //
+        // Silent would be wrong, so this is stated in the doc comment rather
+        // than left for someone to discover from a shaft that overspeeds.
+        Actuator::mit_control(
+            self,
+            pos_rad,
+            0.0,
+            POSITION_MIT_KP,
+            POSITION_MIT_KD,
+            0.0,
+        )
     }
 
     fn set_velocity(&mut self, vel_rad_s: f32) -> MisaResult<MisaFeedback> {
-        require_mode(self, RunMode::Velocity, "set_velocity")?;
-        Motor::set_velocity(self, vel_rad_s)?;
-        let fb = Motor::measure_safe(self)?;
-        let current = optional_current(self);
-        let kt = self.torque_constant();
-        Ok(rs_to_misa_feedback(fb, current, kt))
+        // MIT, not `SpdRef` — see `set_run_mode`. The mode check names MIT
+        // because that is where `set_run_mode` actually put the firmware.
+        require_mode(self, RunMode::Mit, "set_velocity")?;
+
+        // `kp = 0` so the position argument does nothing: this must be velocity
+        // tracking, not a position hold that happens to move. Anything non-zero
+        // there would make the shaft chase a point rather than a speed, and a
+        // kinetic-friction reading taken while the shaft is being pulled toward
+        // a target is not a kinetic-friction reading.
+        Actuator::mit_control(self, 0.0, vel_rad_s, 0.0, VELOCITY_MIT_KD, 0.0)
     }
 
     fn set_torque(&mut self, torque_nm: f32) -> MisaResult<MisaFeedback> {
-        require_mode(self, RunMode::Torque, "set_torque")?;
-        // Robstride's torque-mode parameter is `IqRef` — a quadrature *current*,
-        // in amps. So the trait's N·m must be divided by the torque constant;
-        // passing it through raw silently commands amps and understates the
-        // torque by a factor of Kt (1.5093 on an RS04, i.e. a third of what was
-        // asked for). Verified on hardware: commanded IqRef tracks measured
-        // current to within 0.0001 A, so this conversion is the whole story.
+        // MIT, not `IqRef` — see `set_run_mode` for the measurement that decided
+        // this. The mode check names MIT because that is where `set_run_mode`
+        // actually put the firmware.
+        require_mode(self, RunMode::Mit, "set_torque")?;
+
+        // `torque_ff` is newton-metres, so no Kt is needed to command it: the
+        // old `IqRef` path had to divide by Kt (amps in, N·m out) and therefore
+        // could not command an exact torque at all on firmware that reports
+        // `MeasuredTorque` as a constant zero. Quantisation is the model's MIT
+        // range over 16 bits — 0.0037 N·m on an RS-04's ±120 N·m, which is 0.4%
+        // of the ~0.9 N·m stiction these runs measure, and the runs report their
+        // own `ramp-resolution` besides.
         //
-        // Without a Kt there is nothing to convert with, so the old raw
-        // behaviour stands — see `Motor::set_torque_constant`. For an exact N·m
-        // command regardless, use MIT mode with `torque_ff`.
-        let iq = match self.torque_constant() {
-            Some(kt) => torque_nm / kt,
-            None => torque_nm,
-        };
-        Motor::set_torque(self, iq)?;
-        let fb = Motor::measure_safe(self)?;
-        let current = optional_current(self);
-        let kt = self.torque_constant();
-        Ok(rs_to_misa_feedback(fb, current, kt))
+        // Zero gains: this must be a pure feed-forward torque. Any kp or kd
+        // would make the frame a position or velocity command wearing a torque's
+        // clothes, and a breakaway ramp would then measure the impedance we
+        // supplied rather than the friction we came for.
+        //
+        // Qualified: `Motor` has an inherent `mit_control` of its own, and an
+        // unqualified call resolves to that one and returns the protocol crate's
+        // feedback type rather than the trait's.
+        Actuator::mit_control(self, 0.0, 0.0, 0.0, 0.0, torque_nm)
     }
 
     fn mit_control(

@@ -232,6 +232,64 @@ mod tests {
         assert!(m.is_enabled_hint());
     }
 
+    /// Re-enabling must be a hold-where-you-are, not a redefinition of the
+    /// coordinate frame.
+    ///
+    /// `enable` used to `rezero` unconditionally, which broke every caller that
+    /// re-enables while stepping through absolute positions. `run_breakaway`
+    /// does exactly that before each ramp, so a breakaway map's five points all
+    /// came back at ~0 — on an RMD-X4 it spanned 0.047 rad of a requested 0.600
+    /// (2026-08-08) and read as angle-independent stiction measured at one
+    /// place, when in fact the shaft was walking and the frame was chasing it.
+    #[test]
+    fn re_enable_keeps_the_anchor_and_holds_where_the_shaft_is() {
+        let mut m = motor();
+        m.bus().multi_turn_centideg = 0;
+        Actuator::enable(&mut m).unwrap();
+        assert_eq!(m.zero_centideg(), Some(0));
+
+        // The shaft moves to +180.00° — a ramp broke it away, or a hand did.
+        m.bus().multi_turn_centideg = 18_000;
+        m.bus().sent.clear();
+        Actuator::enable(&mut m).unwrap();
+
+        assert_eq!(
+            m.zero_centideg(),
+            Some(0),
+            "re-enable must not re-anchor the frame"
+        );
+        // Held at +180.00°, not walked back to the anchor at 0.
+        let (_, frame) = *m.bus().sent.last().unwrap();
+        assert_eq!(frame[0], 0xA4);
+        let target = i32::from_le_bytes(frame[4..8].try_into().unwrap());
+        assert!(
+            (target - 18_000).abs() <= 1,
+            "re-enable commanded {target} centideg; it should hold at 18000"
+        );
+    }
+
+    /// The motor's own zero has to come off the wire, not out of driver state.
+    ///
+    /// It is the half of the frame the host cannot see: `zero --rom` moves it
+    /// while the soft anchor reads the same, so a run saved either side of that
+    /// looks comparable and is not. Recording it is the only way a file shows
+    /// the difference.
+    #[test]
+    fn the_motor_origin_is_read_from_the_encoder_not_from_state() {
+        let mut m = motor();
+        let origin = Actuator::motor_origin(&mut m).expect("an origin");
+        assert!(
+            sent_cmds(&mut m).contains(&0x62),
+            "the ROM zero must be read from the motor"
+        );
+        // Self-describing, because the families store this in different units
+        // and the value is compared between files rather than converted.
+        assert!(origin.contains("encoder-rom-zero"), "{origin}");
+        assert!(origin.contains("pulses"), "{origin}");
+        // A `#` line of a CSV — a comma here would read as another field.
+        assert!(!origin.contains(','), "{origin}");
+    }
+
     #[test]
     fn disable_sends_stop() {
         let mut m = motor();

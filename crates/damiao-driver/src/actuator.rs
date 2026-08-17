@@ -141,6 +141,12 @@ impl<B: DamiaoBus> Actuator for DamiaoMotor<B> {
         Ok(())
     }
 
+    fn position_zero_in_motor_frame_rad(&self) -> Option<f32> {
+        // No software anchor: MIT feedback positions are already the motor's
+        // own frame (`zero` moves the motor's zero, not a host-side offset).
+        Some(0.0)
+    }
+
     fn set_zero(&mut self) -> MisaResult<()> {
         DamiaoMotor::set_zero(self)?;
         Ok(())

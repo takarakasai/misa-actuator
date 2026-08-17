@@ -197,6 +197,16 @@ impl Motor {
         self.turns
     }
 
+    /// The motor-frame angle this handle reports as `position_rad = 0`, in
+    /// **output-frame rad**. `None` before the first [`Self::rezero`].
+    ///
+    /// Add it to a reported position to recover the motor's own angle, which
+    /// is what lets two runs be laid over each other.
+    pub fn zero_in_motor_frame_rad(&self) -> Option<f32> {
+        let centideg = self.motor_zero_centideg?;
+        Some(centideg as f32 / 100.0 / DEG_PER_RAD / self.config.gear_ratio)
+    }
+
     /// Resume motor operation (`0x88`). Must precede control commands when
     /// the motor was previously `motor_stop`'d.
     pub fn enable<B: LkBus + ?Sized>(&mut self, bus: &mut B) -> Result<()> {
@@ -218,6 +228,32 @@ impl Motor {
         self.turns = 0;
         self.motor_zero_centideg = Some(bus.read_multi_turn_angle(self.id)?);
         Ok(())
+    }
+
+    /// Engage the position controller where the shaft already is, anchoring
+    /// only if [`Self::rezero`] has never run.
+    ///
+    /// The unconditional variant is a trap, and the RMD-X4 driver was measured
+    /// falling into it (2026-08-08): `Actuator::enable` used to rezero every
+    /// time, so `misa_sysid::run_breakaway` — which re-enables before each ramp
+    /// — had the coordinate frame redefined underneath it and reported every
+    /// position as ~0. Holding at `0.0` rather than at the measured position is
+    /// the other half of the trap: once the anchor is kept, commanding zero
+    /// drives the shaft back to wherever zero was set.
+    pub fn engage_hold<B: LkBus + ?Sized>(
+        &mut self,
+        bus: &mut B,
+        max_speed_rad_s: f32,
+    ) -> Result<MotorFeedback> {
+        let here = if self.motor_zero_centideg.is_none() {
+            // A fresh anchor puts the origin under the shaft, so "here" is 0 by
+            // construction — no need to spend a State2 read asking.
+            self.rezero(bus)?;
+            0.0
+        } else {
+            self.measure(bus)?.position_rad
+        };
+        self.set_position(bus, here, max_speed_rad_s)
     }
 
     /// Read State2 only — no command sent. Updates the turn tracker.

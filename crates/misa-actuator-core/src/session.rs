@@ -438,6 +438,87 @@ mod tests {
         assert!(reached.is_some(), "never reached the commanded position");
     }
 
+    /// A saved home has to survive the frame being re-anchored, so it is stored
+    /// in the motor's own frame and converted back on the way out.
+    ///
+    /// The round trip is the whole feature: `SetHomeHere` at a position, then
+    /// `GoHome` with what it reported, has to land back on that position. If
+    /// either half forgot the offset the shaft would go somewhere else, and
+    /// because both numbers look plausible nothing would report an error.
+    #[test]
+    fn a_home_survives_the_round_trip_through_the_motor_frame() {
+        let session = Session::connect_with(&sim_config(), 200.0, None).expect("connect");
+        session.send(Command::Enable).unwrap();
+        session.set_setpoint(Setpoint {
+            mode: ControlMode::Position,
+            position_rad: 0.4,
+            max_speed_rad_s: 5.0,
+            ..Setpoint::default()
+        });
+        session.send(Command::SetStreaming { on: true }).unwrap();
+        assert!(
+            wait_for(Duration::from_secs(5), || session
+                .drain_samples()
+                .into_iter()
+                .find(|s| (s.position_rad - 0.4).abs() < 0.02))
+            .is_some(),
+            "never reached the position to record as home"
+        );
+
+        session.send(Command::SetHomeHere).unwrap();
+        let home = wait_for(Duration::from_secs(2), || {
+            session.poll_events().into_iter().find_map(|e| match e {
+                Event::HomeSet {
+                    position_motor_frame_rad,
+                } => Some(position_motor_frame_rad),
+                _ => None,
+            })
+        })
+        .expect("no HomeSet event");
+        let home = home.expect("the sim can place its zero in the motor frame");
+
+        // Drive well away, then ask to go back.
+        session.set_setpoint(Setpoint {
+            mode: ControlMode::Position,
+            position_rad: -0.3,
+            max_speed_rad_s: 5.0,
+            ..Setpoint::default()
+        });
+        assert!(
+            wait_for(Duration::from_secs(5), || session
+                .drain_samples()
+                .into_iter()
+                .find(|s| (s.position_rad + 0.3).abs() < 0.02))
+            .is_some(),
+            "never travelled away from home"
+        );
+        session.send(Command::SetStreaming { on: false }).unwrap();
+
+        session
+            .send(Command::StartJob {
+                spec: JobSpec::GoHome {
+                    target_motor_frame_rad: home,
+                    max_speed_rad_s: 5.0,
+                    timeout_s: 5.0,
+                },
+            })
+            .unwrap();
+
+        // The job runs from idle — that is the point of making it a job — so
+        // the arrival has to be read back explicitly rather than off the stream.
+        let settled = wait_for(Duration::from_secs(8), || {
+            session.send(Command::Measure).ok()?;
+            session.poll_events().into_iter().find_map(|e| match e {
+                Event::Reading(s) if (s.position_rad - 0.4).abs() < 0.03 => Some(s),
+                _ => None,
+            })
+        });
+        assert!(
+            settled.is_some(),
+            "go home did not return the shaft to where the home was recorded"
+        );
+    }
+
     #[test]
     fn the_setpoint_is_overwritten_not_queued() {
         // Hammer the setpoint the way a dragged slider would. If these were

@@ -604,6 +604,55 @@ impl<B: MyActuatorBus> MyActuatorMotor<B> {
         Ok(())
     }
 
+    /// Put the soft zero on the motor's own zero, so every commanded and
+    /// reported position is in the frame `0x92` reports.
+    ///
+    /// Costs no transaction — it only decides what `position_rad` means from
+    /// here on. Use it when positions have to mean the same thing across
+    /// processes; [`Self::rezero`] is for "measure from where I am now".
+    ///
+    /// **Scope of "absolute" (measured 2026-08-08, RMD-X4-P36-36).** The frame
+    /// is the output shaft, `2^18 = 262144` encoder pulses per output turn, and
+    /// the encoder ROM offset (`0x62`) survives a power cycle — but the *turn
+    /// count* does not. Power-cycled with the shaft held still, `0x92` came back
+    /// 359.85° away (+249.16° → −110.69°) while the encoder reading modulo one
+    /// turn moved only 95 pulses (0.13°, the shaft relaxing). So a position here
+    /// is **unique only modulo one output revolution** across a power cycle, and
+    /// fully absolute only within one.
+    pub fn anchor_at_motor_zero(&mut self) {
+        self.zero_centideg = Some(0);
+    }
+
+    /// Engage the position controller where the shaft already is, anchoring the
+    /// soft zero only if there is no anchor yet.
+    ///
+    /// This is what `Actuator::enable` means for a family with no bare "servo
+    /// on". Two properties matter and neither is optional:
+    ///
+    /// - **Re-enabling must not move the coordinate frame.** `enable` used to
+    ///   call [`Self::rezero`] unconditionally, so a caller stepping through
+    ///   absolute positions had its frame redefined underneath it. `run_breakaway`
+    ///   re-enables before every ramp, which made every reported position come
+    ///   back as ~0 and collapsed a breakaway map's `span travelled` to 0.047 of
+    ///   a requested 0.600 rad on an RMD-X4 (2026-08-08) — the map read as five
+    ///   samples of one angle while the shaft was in fact walking.
+    /// - **Hold *here*, not at zero.** With the anchor kept, commanding 0.0
+    ///   would drive the shaft back to a zero set long ago, possibly far away.
+    ///   Reading the current angle first is what keeps re-enable a no-op.
+    ///
+    /// Costs the same two transactions as the old path: the `0x92` read serves
+    /// as both the anchor and "where am I".
+    pub fn engage_hold(&mut self, max_speed_rad_s: f32) -> Result<MotorFeedback> {
+        let centideg = self.read_multi_turn_centideg()? as i64;
+        if self.zero_centideg.is_none() {
+            self.zero_centideg = Some(centideg);
+        }
+        let here = self.centideg_to_position_rad(centideg);
+        let fb = self.set_position(here, max_speed_rad_s)?;
+        self.enabled = true;
+        Ok(fb)
+    }
+
     /// Write the current position to encoder ROM as the motor zero (`0x64`).
     /// Takes effect after [`Self::system_reset`]; wears flash — for routine
     /// re-zeroing use [`Self::rezero`] instead.

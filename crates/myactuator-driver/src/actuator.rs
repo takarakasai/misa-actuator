@@ -5,9 +5,11 @@
 //! - **No run-mode parameter** — like lkmotor V3, each command picks its own
 //!   controller, so `set_run_mode` is a no-op and the mode hint is `None`.
 //! - **`enable`** — V3 has no servo-on command; motion commands activate the
-//!   controller directly. `enable` therefore anchors zero and engages the
-//!   position controller at the current location (holding torque), matching
-//!   the lkmotor driver's behaviour.
+//!   controller directly. `enable` therefore engages the position controller at
+//!   the current location (holding torque), matching the lkmotor driver's
+//!   behaviour. It anchors zero only on the *first* call: re-enabling is a
+//!   hold-where-you-are, never a redefinition of the coordinate frame — see
+//!   [`MyActuatorMotor::engage_hold`].
 //! - **`disable`** — motor stop (`0x81`), which halts output but keeps the
 //!   closed loop armed. Use [`MyActuatorMotor::shutdown`] for a full output-off.
 //! - **`mit_control`** — native motion mode (`0x400 + ID`), real on-motor PD.
@@ -73,18 +75,35 @@ impl<B: MyActuatorBus> Actuator for MyActuatorMotor<B> {
     }
 
     fn enable(&mut self) -> MisaResult<MisaFeedback> {
-        // Anchor zero at the current physical position, then engage the
-        // position controller there — V3 has no bare "servo on", so holding
-        // the current position is what gives the expected enable feel.
-        self.rezero()?;
-        let fb = MyActuatorMotor::set_position(self, 0.0, DEFAULT_HOLD_MAX_SPEED)?;
-        self.enabled = true;
-        Ok(to_misa_feedback(fb))
+        // Engage the position controller where the shaft is — V3 has no bare
+        // "servo on", so holding the current position is what gives the
+        // expected enable feel. See [`MyActuatorMotor::engage_hold`] for why
+        // this must not re-anchor zero on every call.
+        Ok(to_misa_feedback(MyActuatorMotor::engage_hold(
+            self,
+            DEFAULT_HOLD_MAX_SPEED,
+        )?))
     }
 
     fn disable(&mut self) -> MisaResult<()> {
         self.stop()?;
         Ok(())
+    }
+
+    fn position_zero_in_motor_frame_rad(&self) -> Option<f32> {
+        // `None` until an anchor exists — before that the driver has no frame
+        // to describe, and reporting 0.0 would claim one.
+        let centideg = MyActuatorMotor::zero_centideg(self)?;
+        Some((centideg as f32 / 100.0).to_radians())
+    }
+
+    fn motor_origin(&mut self) -> Option<String> {
+        // The encoder ROM zero (`0x62`), which `zero --rom` moves. Measured
+        // 2026-08-08: it survives a power cycle even though the turn count does
+        // not, so it is the durable half of this family's frame — and the half
+        // a run has no other way to record.
+        let pulses = MyActuatorMotor::read_multi_turn_zero_offset(self).ok()?;
+        Some(format!("encoder-rom-zero {pulses} pulses (2^18 per output turn)"))
     }
 
     fn set_zero(&mut self) -> MisaResult<()> {

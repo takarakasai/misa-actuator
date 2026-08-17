@@ -202,10 +202,24 @@ enum Command {
         #[arg(long, default_value_t = 3.0)]
         duration: f32,
     },
-    /// Position move relative to the soft zero (anchored at start).
+    /// Move to an absolute output-shaft position, in the motor's own frame
+    /// (the angle `angle` prints).
+    ///
+    /// Absolute by default so that repeating the command holds the shaft
+    /// instead of walking it. `--relative` restores the older behaviour of
+    /// measuring from wherever the shaft happens to be.
+    ///
+    /// **"Absolute" is unique only modulo one output turn.** The encoder ROM
+    /// offset survives a power cycle but the turn count does not (measured
+    /// 2026-08-08: a stationary shaft came back 359.85° away). Within one power
+    /// session the frame is exact.
     MoveTo {
         #[arg(allow_hyphen_values = true)]
         position: f32,
+        /// Treat `position` as an offset from the current position instead of
+        /// an absolute angle.
+        #[arg(long)]
+        relative: bool,
         /// Max output-shaft speed (rad/s).
         #[arg(long, default_value_t = 2.0)]
         speed: f32,
@@ -564,11 +578,42 @@ fn main() -> Result<()> {
         }
         Command::MoveTo {
             position,
+            relative,
             speed,
             duration,
         } => {
-            motor.rezero()?;
-            let r = control_loop(Some(*duration), || motor.set_position(*position, *speed));
+            // Read where the shaft is *before* choosing the frame, so the move
+            // can be announced in the same units it is commanded in. `0x92` is
+            // 0.01°/LSB, ~7x finer than the control reply's 1°/LSB angle.
+            let here = motor.read_multi_turn_centideg()? as f32 / 100.0;
+            let here_rad = here.to_radians();
+            if *relative {
+                motor.rezero()?;
+            } else {
+                motor.anchor_at_motor_zero();
+            }
+            let target_rad = if *relative { here_rad + *position } else { *position };
+            let delta = target_rad - here_rad;
+
+            // Announce before moving, never after. The hazard of an absolute
+            // default is a command that reads small and moves far — `move-to
+            // 0.5` is a nudge when the shaft is near zero and most of a turn
+            // when it is not. Printing the delta is what makes that visible;
+            // the CLI warns and continues rather than prompting, as everywhere
+            // else here.
+            println!(
+                "move: {here_rad:+.4} -> {target_rad:+.4} rad  (delta {delta:+.4} rad, {:+.2}°)",
+                delta.to_degrees()
+            );
+            if delta.abs() > std::f32::consts::PI {
+                eprintln!(
+                    "warning: this is more than half an output turn ({:+.2}°). \
+                     Check the shaft is free and nothing is tethered to it.",
+                    delta.to_degrees()
+                );
+            }
+
+            let r = control_loop(Some(*duration), || motor.set_position(target_rad, *speed));
             motor.stop()?;
             r?;
             print_settled(&mut motor);

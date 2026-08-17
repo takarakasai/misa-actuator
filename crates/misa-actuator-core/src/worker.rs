@@ -429,6 +429,7 @@ impl Worker {
                 }
             }
             Command::SetRate { hz } => self.shared.safety.set_rate(hz),
+            Command::SetHomeHere => self.set_home_here(),
             Command::StartJob { spec } => self.run_job(spec),
             // Handled by the caller so it can break the loop.
             Command::Shutdown => unreachable!("shutdown is handled in run()"),
@@ -526,11 +527,119 @@ impl Worker {
     /// bus would corrupt it. Two things still work because they do not go
     /// through the loop — the stop flag (which `misa-sysid` reads as its
     /// abort) and the watchdog thread that can set it.
+    /// Record the current position as home, in the motor's own frame.
+    fn set_home_here(&mut self) {
+        let offset = self.actuator.position_zero_in_motor_frame_rad();
+        let here = match self.actuator.measure() {
+            Ok(fb) => fb.position_rad,
+            Err(e) => {
+                self.fault("set home", e);
+                let _ = self.events.send(Event::HomeSet {
+                    position_motor_frame_rad: None,
+                });
+                return;
+            }
+        };
+        // Both halves have to be there. A home recorded without the offset
+        // could not be converted back after a reconnect re-anchored the zero,
+        // and a number that means somewhere else tomorrow is worse than none.
+        let home = match (offset, here.is_finite()) {
+            (Some(offset), true) => Some(here + offset),
+            _ => None,
+        };
+        match home {
+            Some(h) => self.log(LogLevel::Info, format!("home set at {h:+.4} rad (motor frame)")),
+            None => self.log(
+                LogLevel::Warn,
+                "home not set: this driver cannot say where its zero sits in the motor's frame"
+                    .to_string(),
+            ),
+        }
+        let _ = self.events.send(Event::HomeSet {
+            position_motor_frame_rad: home,
+        });
+    }
+
+    /// Travel to a saved home, converting it out of the motor frame first.
+    ///
+    /// Blocks the worker like any other job. The abort flag is polled every
+    /// step: this is a motion command, so it is exactly when STOP has to work.
+    fn run_go_home(&mut self, target_motor_frame_rad: f32, max_speed_rad_s: f32, timeout_s: f32) {
+        let Some(offset) = self.actuator.position_zero_in_motor_frame_rad() else {
+            self.log(
+                LogLevel::Warn,
+                "go home: this driver cannot say where its zero sits in the motor's frame, \
+                 so a saved home cannot be converted — not moving"
+                    .to_string(),
+            );
+            return;
+        };
+        let target = target_motor_frame_rad - offset;
+
+        let _ = self.shared.safety.take_stop();
+        self.shared.safety.set_streaming(false);
+        self.shared.safety.set_job_active(true);
+        self.shared.safety.beat();
+        self.log(
+            LogLevel::Info,
+            format!(
+                "go home: {target_motor_frame_rad:+.4} rad (motor frame) = {target:+.4} rad here, \
+                 at up to {max_speed_rad_s} rad/s"
+            ),
+        );
+
+        let outcome = self.travel_to(target, max_speed_rad_s, timeout_s);
+
+        // Leave the shaft held where it arrived rather than de-energised: a
+        // joint that goes limp the instant it reaches home is not parked.
+        self.shared.safety.set_job_active(false);
+        match outcome {
+            Ok(reached) => self.log(
+                LogLevel::Info,
+                format!("go home: settled at {reached:+.4} rad"),
+            ),
+            Err(e) => self.fault("go home", e),
+        }
+    }
+
+    /// Command a position until the shaft arrives, the deadline passes, or a
+    /// stop arrives. Returns the last position read.
+    fn travel_to(
+        &mut self,
+        target_rad: f32,
+        max_speed_rad_s: f32,
+        timeout_s: f32,
+    ) -> Result<f32, ActuatorError> {
+        const ARRIVE_TOLERANCE_RAD: f32 = 0.01;
+        self.actuator.set_run_mode(misa_actuator::RunMode::Position)?;
+        self.actuator.enable()?;
+        let deadline = Instant::now() + Duration::from_secs_f32(timeout_s.max(0.0));
+        let mut fb = self.actuator.set_position(target_rad, max_speed_rad_s)?;
+        while (fb.position_rad - target_rad).abs() > ARRIVE_TOLERANCE_RAD {
+            // Checked before the next command, not after it, so a stop that
+            // arrives mid-travel does not buy one more move first.
+            if self.shared.safety.stop_pending() || Instant::now() >= deadline {
+                break;
+            }
+            self.shared.safety.beat();
+            fb = self.actuator.set_position(target_rad, max_speed_rad_s)?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(fb.position_rad)
+    }
+
     fn run_job(&mut self, spec: JobSpec) {
         let job = match spec {
             JobSpec::Chirp(job) => job,
             JobSpec::Characterize { run, envelope } => {
                 return self.run_characterize(run, envelope);
+            }
+            JobSpec::GoHome {
+                target_motor_frame_rad,
+                max_speed_rad_s,
+                timeout_s,
+            } => {
+                return self.run_go_home(target_motor_frame_rad, max_speed_rad_s, timeout_s);
             }
         };
 
@@ -1236,7 +1345,7 @@ impl Worker {
     /// throwing it away because a directory was read-only would be the worse
     /// outcome by far.
     fn save_run(
-        &self,
+        &mut self,
         run: &str,
         samples: &[misa_sysid::Point],
         summary: &[(String, String)],
@@ -1246,19 +1355,51 @@ impl Worker {
             // be found later and mistaken for a run.
             return None;
         }
-        let dir = crate::export::data_dir();
+        // One folder per execution, named for the motor and the minute, so a
+        // batch's five runs and their plots stay together instead of scattering
+        // across a directory that grows by five files every time.
+        let dir = crate::export::run_dir(self.actuator.motor_id());
         let name = crate::export::run_file_name(
             &crate::export::utc_stamp(crate::export::now_secs()),
             run,
             self.actuator.motor_id(),
         );
+
+        // Say what frame the positions are in, in the file itself.
+        //
+        // `position_rad` is measured from a zero the driver placed, so two runs
+        // can report the same number from different physical angles — and used
+        // to, on every family that anchors on connect. Adding this value back
+        // recovers the motor's own angle, which is what makes one run
+        // superimposable on another. Recorded only in the CSV: the app plots
+        // one run at a time, so cross-run alignment happens in the file.
+        //
+        // Absent rather than zero when the driver cannot say, so a reader can
+        // tell "no offset" from "not recorded" (§ the PCAN enumeration lesson:
+        // an empty answer that cannot distinguish those two lies).
+        let mut meta: Vec<(String, String)> = summary.to_vec();
+        if let Some(offset) = self.actuator.position_zero_in_motor_frame_rad() {
+            meta.push((
+                "position zero in motor frame rad".to_string(),
+                format!("{offset:.5}"),
+            ));
+        }
+        // And the motor's own zero, which the host-side offset above cannot
+        // see. A `set-zero` moves the frame under both of them: the offset can
+        // read the same before and after while every position means a different
+        // angle. Without this, two files taken either side of that look
+        // comparable and are not — which happened to an RS-04 on 2026-08-08.
+        if let Some(origin) = self.actuator.motor_origin() {
+            meta.push(("motor origin".to_string(), origin));
+        }
+
         match crate::export::write_run_csv(
             &dir,
             &name,
             run,
             self.actuator.motor_id(),
             "",
-            summary,
+            &meta,
             samples,
         ) {
             Ok(path) => {
@@ -1576,12 +1717,27 @@ fn breakaway_data(b: misa_sysid::Breakaway, envelope_ceiling_nm: f32) -> (Charac
     // entry and nothing else, so an unrested 0.669 N·m sat in it looking exactly
     // like a good measurement (2026-08-07).
     let caveat = if b.rested { "" } else { " (not at rest)" };
+    // How coarsely the figure could be resolved, carried on the figure for the
+    // same reason `rested` is: three decimals off a ramp that stepped by 0.3
+    // N·m is the false precision §8 warns about, and a reader quoting the
+    // number will not go looking for a neighbouring tile.
+    let resolution = b.resolution_nm();
+    let step = resolution.map_or(String::new(), |r| format!(" (step {r:.3})"));
     let note = match b.breakaway_torque_nm {
         Some(t) => {
             summary.push((
                 "breakaway torque".to_string(),
-                format!("{t:.3} N·m{caveat}"),
+                format!("{t:.3} N·m{step}{caveat}"),
             ));
+            if let Some(r) = resolution {
+                summary.push((
+                    "ramp resolution".to_string(),
+                    format!(
+                        "{r:.3} N·m — the figure is the first commanded torque that moved \
+                         the shaft, so the true breakaway is up to this much lower"
+                    ),
+                ));
+            }
             if let Some(p) = b.breakaway_position_rad {
                 summary.push(("at position".to_string(), format!("{p:+.4} rad")));
             }
@@ -1673,6 +1829,19 @@ fn breakaway_map_data(m: misa_sysid::BreakawayMap) -> (CharacterizeData, String)
                     summary.push((
                         "angle dependence".to_string(),
                         format!("{:.0}% of the mean", 100.0 * (hi - lo) / mean.abs()),
+                    ));
+                }
+                // Angle dependence is the headline of this run, and it is the
+                // difference between two quantised numbers — so the step is
+                // what says whether a spread is a finding or the grid. A 13%
+                // dependence built on a step half that size is not a finding.
+                if let Some(r) = m.resolution_nm() {
+                    summary.push((
+                        "ramp resolution".to_string(),
+                        format!(
+                            "{r:.3} N·m — the coarsest step any ramp took, so no figure \
+                             here is resolved better than this"
+                        ),
                     ));
                 }
             }

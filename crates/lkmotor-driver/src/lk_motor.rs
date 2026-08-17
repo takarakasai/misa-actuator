@@ -188,20 +188,20 @@ impl<B: LkBus> Actuator for LkMotor<B> {
         // Step 1: wake the motor from a possible MotorStop (0x81) state.
         self.motor.enable(&mut self.bus)?;
 
-        // Step 2: anchor zero at the current physical position. Required
-        // for set_position (lkmotor V3 firmware always reports motor-frame
-        // absolute angle, so a software-side anchor is needed for relative
-        // `set_position(0.0, …) → "stay where you are"` semantics).
-        self.motor.rezero(&mut self.bus)?;
-
-        // Step 3: engage the position controller at the current location.
+        // Step 2: engage the position controller at the current location.
         // `MotorRun` alone doesn't activate any closed-loop controller —
-        // sending a position-control command (0xA4) at the anchored zero
+        // sending a position-control command (0xA4) where the shaft already is
         // makes the motor hold in place (= "servo on" feel that the user
         // expects from Enable).
+        //
+        // The zero anchor is set here only on the first call (lkmotor V3
+        // firmware always reports motor-frame absolute angle, so a software-side
+        // anchor is needed at all). A *re*-enable keeps the existing frame —
+        // see [`Motor::engage_hold`] for the breakaway-map failure that
+        // re-anchoring caused on the sibling MyActuator driver.
         let fb = self
             .motor
-            .set_position(&mut self.bus, 0.0, DEFAULT_HOLD_MAX_SPEED)?;
+            .engage_hold(&mut self.bus, DEFAULT_HOLD_MAX_SPEED)?;
 
         self.enabled = true;
         Ok(lk_to_misa_feedback(fb))
@@ -211,6 +211,10 @@ impl<B: LkBus> Actuator for LkMotor<B> {
         self.motor.disable(&mut self.bus)?;
         self.enabled = false;
         Ok(())
+    }
+
+    fn position_zero_in_motor_frame_rad(&self) -> Option<f32> {
+        self.motor.zero_in_motor_frame_rad()
     }
 
     fn set_zero(&mut self) -> MisaResult<()> {
@@ -449,6 +453,32 @@ mod tests {
             .expect("a position frame was sent");
         let centideg = i64::from_le_bytes(frame.2[0..8].try_into().unwrap());
         assert!((centideg - 18_000).abs() <= 1, "centideg={centideg}");
+    }
+
+    /// Re-enabling must not re-anchor. `0x92` is the read that defines the
+    /// frame, so its absence on the second call is the contract.
+    ///
+    /// The sibling MyActuator driver had the unconditional version, and it cost
+    /// a breakaway map: `misa_sysid::run_breakaway` re-enables before every
+    /// ramp, so each ramp's position was reported against a frame anchored a
+    /// millisecond earlier and came back as ~0 (2026-08-08, RMD-X4).
+    #[test]
+    fn re_enable_does_not_re_anchor_the_frame() {
+        let mut m = motor();
+        Actuator::enable(&mut m).unwrap();
+        assert!(
+            sent_commands(&mut m).contains(&0x92),
+            "the first enable anchors the frame"
+        );
+
+        m.bus().sent.clear();
+        Actuator::enable(&mut m).unwrap();
+        let cmds = sent_commands(&mut m);
+        assert!(
+            !cmds.contains(&0x92),
+            "re-enable must keep the existing anchor: {cmds:02X?}"
+        );
+        assert!(cmds.contains(&0xA4), "it should still engage the hold");
     }
 
     #[test]

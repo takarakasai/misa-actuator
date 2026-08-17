@@ -375,6 +375,39 @@ warning about the timer resolution in the log output (`RUST_LOG=warn`, the
 default). If it appears, `winmm.dll` could not be loaded, which is unusual and
 worth investigating before trusting any timing-sensitive result.
 
+**WSL says every file is modified while Windows says the tree is clean** — two
+independent causes, and the first one hides the second. Both bite when this
+directory is worked on from Windows and from WSL at the same path under
+`/mnt/c`: one `.git`, two git installations, no shared global config.
+
+*Line endings.* Git for Windows ships `core.autocrlf=true` in its system
+config; WSL's git leaves it unset. The same bytes then get two verdicts. This
+is fixed for good by `.gitattributes`, which pins `eol=lf` and so does not
+depend on either installation's setting — if you see this symptom with content
+differences (`git diff --stat` reporting a huge symmetric insertion and
+deletion count), check that `.gitattributes` is present and that the files were
+checked out after it landed.
+
+*File modes.* drvfs reports every file under `/mnt/c` as `0755`, so with
+`core.filemode=true` WSL's git reads a mode change on all of them. The tell is
+a diff of `old mode 100644 / new mode 100755` with **zero** insertions and
+deletions — files listed, no lines changed. `core.filemode` lives in
+`.git/config`, which both installations share, so one command settles it:
+
+```powershell
+git config core.filemode false
+```
+
+Correct here regardless: nothing in this repo is recorded executable
+(`git ls-files -s` shows no `100755`), and Windows cannot represent the bit
+anyway. It is per-clone configuration, so a Linux-native clone is unaffected
+and needs nothing.
+
+Beware reading the two symptoms as one. `git diff --ignore-cr-at-eol --stat`
+strips the line-ending noise, but files with a mode change stay listed with a
+zero count — that residue is the second cause, not a rounding artefact of the
+first.
+
 ## 8. Building and shipping the GUI
 
 The desktop app is a Tauri shell around a React front end. Every other crate

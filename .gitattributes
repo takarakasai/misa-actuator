@@ -1,0 +1,28 @@
+# Line endings, pinned.
+#
+# This tree gets worked on from Windows and from WSL against the *same*
+# directory under /mnt/c, by two git installations that do not share a global
+# config. Without this file each of them applies its own `core.autocrlf`: the
+# Git for Windows install has it on and normalises CRLF away on read, while
+# WSL's git 2.34 leaves it unset. Same bytes, two verdicts — WSL reported 231
+# files modified with 81763 insertions and 81763 deletions, all of it carriage
+# returns (2026-08-17). Real edits are invisible in that noise, and `git
+# rebase` refuses to start at all.
+#
+# eol=lf rather than crlf because LF is what the repository already stores and
+# what the tools need: a .sh checked out with CRLF cannot run under WSL at all
+# (`bad interpreter: /bin/sh^M`), which is what scripts/hw_check.sh had become.
+# Rust, TypeScript, TOML, JSON and Markdown are indifferent, and PowerShell
+# reads LF happily.
+* text=auto eol=lf
+
+# Batch files are the exception: cmd.exe is the one consumer here that is
+# genuinely happier with CRLF.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Never let the heuristic guess at these. It gets them right today, but a
+# mis-detected binary that goes through eol conversion is corrupted silently.
+*.png binary
+*.ico binary
+*.pdf binary

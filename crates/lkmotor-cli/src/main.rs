@@ -4,6 +4,7 @@
 //! ```text
 //! lkmotor-cli ports                          # list serial ports (Windows: COM*)
 //! lkmotor-cli -i /dev/ttyUSB0 -m 1 scan       # -i COM5 on Windows
+//! lkmotor-cli -i /dev/ttyUSB0 -m 1 dialect    # 0xC0 table, or legacy 0x30/0x33?
 //! lkmotor-cli -i /dev/ttyUSB0 -m 1 status
 //! lkmotor-cli -i /dev/ttyUSB0 -m 1 zero
 //! lkmotor-cli -i /dev/ttyUSB0 -m 1 move-to 1.57 --speed 5 --duration 3
@@ -16,6 +17,13 @@
 //!   motor-shaft units (10× the output).
 //! - `--baud` must match the motor's configured RS485 baud (the MG4005 here
 //!   runs at 1000000; LK V3 default is often 115200).
+//! - Which parameter commands a motor answers varies **between units of the
+//!   same model**: of five MG4005 on one bench, some answered `0xC0` and the
+//!   rest legacy `0x30`/`0x33`, never both. It does not track the `V2`/`V3`
+//!   marking on the housing — units of both markings answered `0xC0`.
+//!   `dialect` reports which family a unit speaks, and `pid` falls back
+//!   automatically. There is no version/model/serial read in the protocol to
+//!   ask directly — see `lkmotor-driver::dialect`.
 //! - `spin` / `torque` *latch* on the firmware; the CLI re-sends for the
 //!   requested duration and the motor is disabled on exit (Drop), so motion
 //!   stops when the command ends.
@@ -161,6 +169,22 @@ enum Command {
         from: u8,
         #[arg(long, default_value_t = 32)]
         to: u8,
+    },
+    /// Report which parameter dialect this driver board speaks — the `0xC0`
+    /// control-parameter table, or the legacy `0x30`/`0x33` commands.
+    ///
+    /// This is **not** the `V2`/`V3` suffix on the housing: units marked `V3`
+    /// and units marked `V2` have both answered `0xC0` on this bench, so the
+    /// dialect does not track the marking. The protocol has no version, model
+    /// or serial read of any kind, so nothing here is read off the motor —
+    /// it is inferred from which commands answer. Side-effect-free reads
+    /// only.
+    Dialect {
+        /// Attempts per probed command. More than one is required: on a
+        /// marginal link a lost frame is indistinguishable from an
+        /// unsupported command.
+        #[arg(long, default_value_t = lkmotor_driver::dialect::DEFAULT_ATTEMPTS)]
+        attempts: u8,
     },
     /// Read status (voltage, temperature, error) and a motion snapshot.
     Status,
@@ -425,14 +449,41 @@ fn main() -> Result<()> {
         Command::Ports => unreachable!("handled before the port is opened"),
         Command::Scan { from, to } => {
             println!("scanning ids {from}..={to} on {} ...", cli.interface);
-            let timeout = Duration::from_millis(cli.timeout_ms);
-            let found = motor.scan_bus(*from..=*to, timeout)?;
-            if found.is_empty() {
-                println!("no motors responded");
-            } else {
-                for id in found {
+            let mut found = 0usize;
+            let mut duplicates = Vec::new();
+            let mut checked = false;
+            for id in *from..=*to {
+                let r = motor.probe_motor_report(id)?;
+                checked |= r.duplicate_check_ran;
+                if !r.present {
+                    continue;
+                }
+                found += 1;
+                if r.duplicate {
+                    duplicates.push(id);
+                    println!("  motor id {id} responded   *** MORE THAN ONE DEVICE ON THIS ID ***");
+                } else {
                     println!("  motor id {id} responded");
                 }
+            }
+            if found == 0 {
+                println!("no motors responded");
+            }
+            if !duplicates.is_empty() {
+                println!();
+                for id in &duplicates {
+                    println!("id {id}: a single request drew more than one reply.");
+                }
+                println!(
+                    "Two motors sharing an id collide on every transaction, so reads on this"
+                );
+                println!(
+                    "bus cannot be trusted until it is fixed. Give each motor a distinct id"
+                );
+                println!("(the setting needs a power cycle to take effect).");
+            } else if found > 0 && !checked {
+                println!();
+                println!("note: this transport cannot check for duplicate ids.");
             }
         }
         Command::Status => {
@@ -548,15 +599,91 @@ fn main() -> Result<()> {
             })?;
             motor.disable()?;
         }
+        Command::Dialect { attempts } => {
+            let id = MotorId::new(cli.motor_id).context("invalid motor id")?;
+            let r = lkmotor_driver::probe_dialect(motor.bus(), id, *attempts)?;
+
+            println!("motor {} on {}", cli.motor_id, cli.interface);
+            println!(
+                "  0x9A state read (presence)   {}/{}",
+                r.state_hits, r.attempts
+            );
+            println!(
+                "  0xC0 control-param table     {}/{}",
+                r.control_param_hits, r.attempts
+            );
+            println!(
+                "  0x30 legacy read-PID         {}/{}",
+                r.legacy_pid_hits, r.attempts
+            );
+            println!(
+                "  0x33 legacy read-accel       {}/{}",
+                r.legacy_accel_hits, r.attempts
+            );
+            println!();
+
+            if !r.present {
+                println!("no motor answered — nothing to classify.");
+                println!("check the id, the baud rate, and that the motor is powered.");
+                return Ok(());
+            }
+            println!("dialect: {}", r.dialect.label());
+            match r.dialect {
+                lkmotor_driver::Dialect::ControlParamTable => {
+                    println!("  `pid` and `params` read the full table, kd included.");
+                }
+                lkmotor_driver::Dialect::Legacy => {
+                    println!("  `pid` falls back to 0x30 (no kd term); `params` cannot read this board.");
+                }
+                lkmotor_driver::Dialect::Both => {
+                    println!("  unexpected: the two families were mutually exclusive on every");
+                    println!("  board seen so far. Worth recording — it breaks the assumption");
+                    println!("  this inference rests on.");
+                }
+                lkmotor_driver::Dialect::Neither => {
+                    println!("  the motor answers state reads but no parameter command. Either a");
+                    println!("  third dialect, or the link dropped every parameter probe.");
+                }
+            }
+            if !r.link_was_clean() {
+                println!();
+                println!("warning: some probes answered only part of the time, so frames are");
+                println!("being lost on this link. The verdict above rests on fewer samples");
+                println!("than it looks — re-run with a larger --attempts to confirm.");
+            }
+        }
         Command::Pid => {
             let id = MotorId::new(cli.motor_id).context("invalid motor id")?;
             let bus = motor.bus();
-            let pos = bus.read_position_pid(id)?;
-            let spd = bus.read_speed_pid(id)?;
-            let cur = bus.read_current_pid(id)?;
-            println!("position PID: kp={} ki={} kd={}", pos.kp, pos.ki, pos.kd);
-            println!("speed    PID: kp={} ki={} kd={}", spd.kp, spd.ki, spd.kd);
-            println!("current  PID: kp={} ki={} kd={}", cur.kp, cur.ki, cur.kd);
+            // Which parameter interface answers depends on the driver board,
+            // not the motor model: `0xC0` on some, legacy `0x30` on others,
+            // never both. Try the richer one first and fall back, so the same
+            // command works on either board.
+            match (
+                bus.read_position_pid(id),
+                bus.read_speed_pid(id),
+                bus.read_current_pid(id),
+            ) {
+                (Ok(pos), Ok(spd), Ok(cur)) => {
+                    println!("position PID: kp={} ki={} kd={}", pos.kp, pos.ki, pos.kd);
+                    println!("speed    PID: kp={} ki={} kd={}", spd.kp, spd.ki, spd.kd);
+                    println!("current  PID: kp={} ki={} kd={}", cur.kp, cur.ki, cur.kd);
+                }
+                _ => {
+                    let p = bus.read_legacy_pids(id).context(
+                        "neither the 0xC0 control-parameter table nor the legacy 0x30 \
+                         ReadPid answered",
+                    )?;
+                    println!("position PID: kp={} ki={}  (legacy 0x30)", p.position_kp, p.position_ki);
+                    println!("speed    PID: kp={} ki={}  (legacy 0x30)", p.speed_kp, p.speed_ki);
+                    println!("current  PID: kp={} ki={}  (legacy 0x30)", p.current_kp, p.current_ki);
+                    println!("note: the legacy 0x30 response carries no kd term.");
+                    match bus.read_legacy_accel(id) {
+                        Ok(a) => println!("accel       : {a} dps/s  (legacy 0x33)"),
+                        Err(e) => println!("accel       : <no reply: {e}>"),
+                    }
+                }
+            }
         }
         Command::Params { toml, out } => {
             let id = MotorId::new(cli.motor_id).context("invalid motor id")?;

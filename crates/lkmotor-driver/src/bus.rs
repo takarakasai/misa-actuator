@@ -6,11 +6,14 @@
 //! blanket-implemented for any [`LkBus`] type. New transports only need to
 //! wire up the wire I/O — every typed helper comes for free.
 
+use std::time::Duration;
+
 use lkmotor_protocol::command::{Command, ControlParamId, SettingParamId};
 use lkmotor_protocol::response::{
-    ControlParamValue, MotorState1, MotorState2, PidTriple, SettingParamValue,
-    parse_brake_state, parse_control_param, parse_multi_turn_angle, parse_setting_param,
-    parse_state1, parse_state2, parse_state2_payload,
+    ControlParamValue, LegacyPids, MotorState1, MotorState2, PidTriple, SettingParamValue,
+    parse_brake_state, parse_control_param, parse_legacy_accel, parse_legacy_pids,
+    parse_multi_turn_angle, parse_setting_param, parse_state1, parse_state2,
+    parse_state2_payload,
 };
 
 use misa_actuator::Shared;
@@ -45,6 +48,27 @@ pub trait LkBus {
 
     /// Discard any buffered/in-flight bytes on the wire.
     fn flush_rx(&mut self) -> Result<()>;
+
+    /// Listen for a *further* frame addressed to `motor_id` without sending
+    /// anything, and return it if one arrives inside `window`.
+    ///
+    /// One request should produce one reply. A second one means two devices
+    /// hold the same id — see [`crate::lk_motor::ProbeReport`] for why that
+    /// matters and how badly a plain "did anyone answer" probe misreads it.
+    ///
+    /// The default returns `Ok(None)`, so a transport that cannot listen
+    /// passively simply never reports a duplicate. Pair it with
+    /// [`Self::can_detect_duplicate_ids`] to tell "no duplicate" apart from
+    /// "cannot tell".
+    fn recv_extra(&mut self, motor_id: MotorId, window: Duration) -> Result<Option<Response>> {
+        let _ = (motor_id, window);
+        Ok(None)
+    }
+
+    /// Whether [`Self::recv_extra`] really listens on this transport.
+    fn can_detect_duplicate_ids(&self) -> bool {
+        false
+    }
 }
 
 /// Share one RS485 bus across several [`crate::LkMotor`] handles (a multi-drop
@@ -62,6 +86,14 @@ impl<B: LkBus> LkBus for Shared<B> {
 
     fn flush_rx(&mut self) -> Result<()> {
         self.lock().flush_rx()
+    }
+
+    fn recv_extra(&mut self, motor_id: MotorId, window: Duration) -> Result<Option<Response>> {
+        self.lock().recv_extra(motor_id, window)
+    }
+
+    fn can_detect_duplicate_ids(&self) -> bool {
+        self.lock().can_detect_duplicate_ids()
     }
 }
 
@@ -114,6 +146,25 @@ pub trait LkCommands: LkBus {
     fn read_state2(&mut self, motor_id: MotorId) -> Result<MotorState2> {
         let resp = self.transact(Command::ReadMotorState2.code(), motor_id, &[])?;
         Ok(parse_state2(resp.command, &resp.data)?)
+    }
+
+    /// Read all three PID loops through the legacy `ReadPid` (`0x30`) command.
+    ///
+    /// Use when [`Self::read_position_pid`] and friends return an error: which
+    /// of the two parameter interfaces answers is a property of the driver
+    /// board, so a tool that supports both boards needs this fallback. Note
+    /// the legacy response carries no `kd` — see [`LegacyPids`].
+    fn read_legacy_pids(&mut self, motor_id: MotorId) -> Result<LegacyPids> {
+        let resp = self.transact(Command::ReadPid.code(), motor_id, &[])?;
+        Ok(parse_legacy_pids(resp.command, &resp.data)?)
+    }
+
+    /// Read the acceleration setting through the legacy `ReadAccel` (`0x33`)
+    /// command, in 1 dps/s. Same board-dependent availability as
+    /// [`Self::read_legacy_pids`].
+    fn read_legacy_accel(&mut self, motor_id: MotorId) -> Result<i32> {
+        let resp = self.transact(Command::ReadAccel.code(), motor_id, &[])?;
+        Ok(parse_legacy_accel(resp.command, &resp.data)?)
     }
 
     /// Read one control parameter (`0xC0`). Returns the typed value.

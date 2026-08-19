@@ -26,6 +26,7 @@
 //! ```
 
 pub mod bus;
+pub mod dialect;
 pub mod driver;
 pub mod error;
 pub mod lk_motor;
@@ -35,10 +36,11 @@ pub mod serial;
 
 pub use bus::{LkBus, LkCommands, Response, parse_state2_from_response};
 pub use lkmotor_protocol::SettingParamId;
+pub use dialect::{Dialect, DialectReport, probe_dialect};
 pub use driver::Rs485Driver;
 pub use serial::{default_serial_port, list_ports, normalize_port_name};
 pub use error::{Error, Result};
-pub use lk_motor::{LkMotor, PositionAnchor};
+pub use lk_motor::{LkMotor, PositionAnchor, ProbeReport};
 pub use motor::{ErrorFlags, Motor, MotorConfig, MotorFeedback, MotorStatus};
 pub use motor_id::MotorId;
 

@@ -46,6 +46,27 @@ use crate::motor_id::MotorId;
 /// `Actuator::mit_control` when `vel_rad_s == 0`.
 const DEFAULT_HOLD_MAX_SPEED: f32 = 1.0;
 
+/// How many times [`LkMotor::probe_motor`] asks before reporting an id absent.
+///
+/// A single lost frame must not read as "no motor here". On a marginal RS485
+/// link the per-transaction loss rate is a few percent and drifts over time —
+/// measured between 1% and 13% on one bench at 1 Mbit/s — which a single-shot
+/// probe turns directly into a missed motor. Three tries take that from ~13%
+/// to ~0.2% at the same loss rate.
+///
+/// Only *absent* ids pay for the retries: a motor that answers returns on the
+/// first try, so a scan slows down in proportion to the empty ids it walks,
+/// not the motors it finds.
+const PROBE_ATTEMPTS: usize = 3;
+
+/// How long to keep listening after a probe reply, watching for a second
+/// device that holds the same id.
+///
+/// Long enough for a slower unit's reply to land after a faster one's — the
+/// two observed sharing an id answered close enough together that both frames
+/// were already buffered, so this mostly guards against the wider spacing.
+const DUPLICATE_LISTEN: Duration = Duration::from_millis(20);
+
 /// Position-anchoring policy for the first `set_position` call.
 ///
 /// `set_position` requires an absolute zero anchor (lkmotor V3 has no
@@ -335,8 +356,77 @@ impl<B: LkBus> Actuator for LkMotor<B> {
         let Some(motor_id) = MotorId::new(id) else {
             return Ok(false);
         };
-        let _ = self.bus.flush_rx();
-        Ok(self.bus.read_state1(motor_id).is_ok())
+        // Retry before concluding the id is empty — see `PROBE_ATTEMPTS`. A
+        // motor that answers returns immediately, so only absent ids pay.
+        for _ in 0..PROBE_ATTEMPTS {
+            let _ = self.bus.flush_rx();
+            if self.bus.read_state1(motor_id).is_ok() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// What [`LkMotor::probe_motor_report`] found at one id.
+///
+/// `Actuator::probe_motor` answers "did anyone reply", which is not the same
+/// question as "is exactly one device here". Two motors sharing an id both
+/// reply, so the plain probe reports the id as healthy — twice on this bench a
+/// duplicate id went unnoticed by a scan while every transaction on that bus
+/// was quietly colliding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeReport {
+    /// At least one device answered.
+    pub present: bool,
+    /// A second reply arrived for a single request: two devices hold this id.
+    /// Only ever true on a transport that can listen passively — check
+    /// [`Self::duplicate_check_ran`] before reading `false` as "no duplicate".
+    pub duplicate: bool,
+    /// Whether the duplicate check actually ran on this transport.
+    pub duplicate_check_ran: bool,
+}
+
+impl<B: LkBus> LkMotor<B> {
+    /// Probe one id and report both whether anyone answered and whether more
+    /// than one device did.
+    ///
+    /// Detection is one-sided: a second reply proves a duplicate, but silence
+    /// does not prove there is only one device. Two motors that transmit at
+    /// exactly the same moment collide on the half-duplex line and can destroy
+    /// each other's frames rather than producing two readable ones. That case
+    /// still shows up — as checksum failures rather than as a duplicate — so
+    /// the bus never looks healthy when it is not.
+    pub fn probe_motor_report(&mut self, id: u8) -> MisaResult<ProbeReport> {
+        let can_check = self.bus.can_detect_duplicate_ids();
+        let Some(motor_id) = MotorId::new(id) else {
+            return Ok(ProbeReport {
+                present: false,
+                duplicate: false,
+                duplicate_check_ran: false,
+            });
+        };
+
+        for _ in 0..PROBE_ATTEMPTS {
+            let _ = self.bus.flush_rx();
+            if self.bus.read_state1(motor_id).is_ok() {
+                let duplicate = self
+                    .bus
+                    .recv_extra(motor_id, DUPLICATE_LISTEN)
+                    .unwrap_or(None)
+                    .is_some();
+                return Ok(ProbeReport {
+                    present: true,
+                    duplicate,
+                    duplicate_check_ran: can_check,
+                });
+            }
+        }
+        Ok(ProbeReport {
+            present: false,
+            duplicate: false,
+            duplicate_check_ran: can_check,
+        })
     }
 }
 
@@ -392,6 +482,107 @@ mod tests {
             MotorId::new(1).unwrap(),
             MotorConfig::current_units(1.0),
         )
+    }
+
+    /// Bus that models a bench with a chosen set of ids populated, and
+    /// optionally one id held by two devices at once.
+    struct DupBus {
+        present: Vec<u8>,
+        /// Id that two devices answer on, if any.
+        shared: Option<u8>,
+        /// Set when `recv_extra` has already handed over the second reply, so
+        /// one duplicate produces one extra frame rather than an endless run.
+        drained: bool,
+        can_detect: bool,
+    }
+
+    impl LkBus for DupBus {
+        fn transact(&mut self, command: u8, motor_id: MotorId, _d: &[u8]) -> LkResult<Response> {
+            if !self.present.contains(&motor_id.get()) {
+                return Err(crate::error::Error::Timeout {
+                    motor_id: motor_id.get(),
+                });
+            }
+            self.drained = false;
+            Ok(Response {
+                command,
+                motor_id: motor_id.get(),
+                data: vec![0u8; 7],
+            })
+        }
+        fn send_only(&mut self, _c: u8, _m: MotorId, _d: &[u8]) -> LkResult<()> {
+            Ok(())
+        }
+        fn flush_rx(&mut self) -> LkResult<()> {
+            Ok(())
+        }
+        fn recv_extra(&mut self, motor_id: MotorId, _w: Duration) -> LkResult<Option<Response>> {
+            if self.shared == Some(motor_id.get()) && !self.drained {
+                self.drained = true;
+                return Ok(Some(Response {
+                    command: 0x9A,
+                    motor_id: motor_id.get(),
+                    data: vec![0u8; 7],
+                }));
+            }
+            Ok(None)
+        }
+        fn can_detect_duplicate_ids(&self) -> bool {
+            self.can_detect
+        }
+    }
+
+    fn dup_motor(present: &[u8], shared: Option<u8>, can_detect: bool) -> LkMotor<DupBus> {
+        LkMotor::new(
+            DupBus {
+                present: present.to_vec(),
+                shared,
+                drained: false,
+                can_detect,
+            },
+            MotorId::new(1).unwrap(),
+            MotorConfig::current_units(1.0),
+        )
+    }
+
+    #[test]
+    fn probe_report_flags_two_devices_on_one_id() {
+        let mut m = dup_motor(&[1, 2, 3], Some(3), true);
+        let clean = m.probe_motor_report(2).unwrap();
+        assert!(clean.present);
+        assert!(!clean.duplicate, "id 2 has a single device");
+
+        let dup = m.probe_motor_report(3).unwrap();
+        assert!(dup.present);
+        assert!(dup.duplicate, "id 3 is held by two devices");
+    }
+
+    #[test]
+    fn probe_report_marks_absent_ids() {
+        let mut m = dup_motor(&[1], None, true);
+        let r = m.probe_motor_report(7).unwrap();
+        assert!(!r.present);
+        assert!(!r.duplicate);
+    }
+
+    #[test]
+    fn duplicate_flag_stays_false_when_the_transport_cannot_look() {
+        // A transport that cannot listen passively must not have its silence
+        // read as "no duplicate" — `duplicate_check_ran` is what says so.
+        let mut m = dup_motor(&[1], None, false);
+        let r = m.probe_motor_report(1).unwrap();
+        assert!(r.present);
+        assert!(!r.duplicate);
+        assert!(!r.duplicate_check_ran);
+    }
+
+    #[test]
+    fn plain_probe_motor_still_reports_a_duplicated_id_as_present() {
+        // The narrower `Actuator::probe_motor` answers "did anyone reply", and
+        // a duplicate replies. Keeping this explicit records why `scan` needed
+        // `probe_motor_report` instead.
+        let mut m = dup_motor(&[1, 2, 3], Some(3), true);
+        assert!(m.probe_motor(3, Duration::from_millis(50)).unwrap());
     }
 
     fn sent_commands(m: &mut LkMotor<MockBus>) -> Vec<u8> {

@@ -179,6 +179,63 @@ impl Rs485Driver {
         Ok(out)
     }
 
+    /// Listen for another frame addressed to `motor_id` without transmitting.
+    ///
+    /// Used to catch two devices sharing one id: the first reply arrives
+    /// through the normal transaction, and this picks up the second one.
+    /// Returns `Ok(None)` if the window passes quietly, which is the normal
+    /// case on a healthy bus.
+    pub fn recv_extra_for(
+        &mut self,
+        motor_id: MotorId,
+        window: Duration,
+    ) -> Result<Option<Response>> {
+        let deadline = Instant::now() + window;
+        let mut scratch = [0u8; 64];
+
+        loop {
+            match try_decode(&self.rx_buf) {
+                Ok((frame, used)) => {
+                    let resp = Response {
+                        command: frame.command,
+                        motor_id: frame.motor_id,
+                        data: frame.data.to_vec(),
+                    };
+                    self.rx_buf.drain(..used);
+                    if resp.motor_id == motor_id.get() {
+                        return Ok(Some(resp));
+                    }
+                    // A frame from a different id is not what this is looking
+                    // for, but it is still traffic — keep draining.
+                    continue;
+                }
+                Err(DecodeError::NeedMore { .. }) => {}
+                Err(_) => {
+                    // Garbage here is expected: two motors answering at once
+                    // collide on a half-duplex line. Resync a byte at a time
+                    // rather than giving up, same as `recv_for`.
+                    if !self.rx_buf.is_empty() {
+                        self.rx_buf.remove(0);
+                    }
+                    continue;
+                }
+            }
+
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+
+            match self.port.read(&mut scratch) {
+                Ok(0) => {}
+                Ok(n) => self.rx_buf.extend_from_slice(&scratch[..n]),
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     /// Discard any buffered bytes (queued + already-on-wire).
     pub fn flush_rx(&mut self) -> Result<()> {
         self.rx_buf.clear();
@@ -338,5 +395,13 @@ impl LkBus for Rs485Driver {
 
     fn flush_rx(&mut self) -> Result<()> {
         Rs485Driver::flush_rx(self)
+    }
+
+    fn recv_extra(&mut self, motor_id: MotorId, window: Duration) -> Result<Option<Response>> {
+        Rs485Driver::recv_extra_for(self, motor_id, window)
+    }
+
+    fn can_detect_duplicate_ids(&self) -> bool {
+        true
     }
 }

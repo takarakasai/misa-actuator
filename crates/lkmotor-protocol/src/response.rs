@@ -134,6 +134,87 @@ pub struct PidTriple {
     pub kd: u16,
 }
 
+/// All three PID loops as returned by the legacy `ReadPid` (`0x30`) response.
+///
+/// This is the older parameter interface, and it is not simply an alias for
+/// the `0xC0` one: gains are single bytes rather than `u16`, and there is no
+/// derivative term at all. A board answers `0x30` or `0xC0`, not both — see
+/// [`parse_legacy_pids`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LegacyPids {
+    pub position_kp: u8,
+    pub position_ki: u8,
+    pub speed_kp: u8,
+    pub speed_ki: u8,
+    pub current_kp: u8,
+    pub current_ki: u8,
+}
+
+impl LegacyPids {
+    /// The position loop widened into the [`PidTriple`] shape the `0xC0`
+    /// interface returns, so callers can present either board the same way.
+    /// `kd` is always 0 — the legacy response carries no derivative term,
+    /// which is a gap in the data, not a gain that was read as zero.
+    #[inline]
+    pub fn position_triple(self) -> PidTriple {
+        PidTriple {
+            kp: u16::from(self.position_kp),
+            ki: u16::from(self.position_ki),
+            kd: 0,
+        }
+    }
+
+    /// The speed loop as a [`PidTriple`]. See [`Self::position_triple`].
+    #[inline]
+    pub fn speed_triple(self) -> PidTriple {
+        PidTriple {
+            kp: u16::from(self.speed_kp),
+            ki: u16::from(self.speed_ki),
+            kd: 0,
+        }
+    }
+
+    /// The current loop as a [`PidTriple`]. See [`Self::position_triple`].
+    #[inline]
+    pub fn current_triple(self) -> PidTriple {
+        PidTriple {
+            kp: u16::from(self.current_kp),
+            ki: u16::from(self.current_ki),
+            kd: 0,
+        }
+    }
+}
+
+/// Parse the payload of a legacy `ReadPid` (`0x30`) response.
+///
+/// Wire layout (6 bytes): `anglePidKp | anglePidKi | speedPidKp | speedPidKi
+/// | iqPidKp | iqPidKi`.
+///
+/// Which of `0x30` and `0xC0` a motor answers depends on the driver board,
+/// not the motor model. Two MG4005 units on one bench answered exactly one
+/// each, so a caller that wants to work with both has to try both.
+pub fn parse_legacy_pids(command: u8, data: &[u8]) -> Result<LegacyPids, ParseError> {
+    expect_cmd(Command::ReadPid, command)?;
+    expect_len(data, 6)?;
+    Ok(LegacyPids {
+        position_kp: data[0],
+        position_ki: data[1],
+        speed_kp: data[2],
+        speed_ki: data[3],
+        current_kp: data[4],
+        current_ki: data[5],
+    })
+}
+
+/// Parse the payload of a legacy `ReadAccel` (`0x33`) response.
+///
+/// Wire layout (4 bytes): acceleration as an `i32` little-endian, in 1 dps/s.
+pub fn parse_legacy_accel(command: u8, data: &[u8]) -> Result<i32, ParseError> {
+    expect_cmd(Command::ReadAccel, command)?;
+    expect_len(data, 4)?;
+    Ok(i32::from_le_bytes([data[0], data[1], data[2], data[3]]))
+}
+
 /// Parsed value of a `ReadControlParam` (`0xC0`) response. Variant is selected
 /// by the [`ControlParamId`] echoed in `DATA[0]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,6 +411,53 @@ mod tests {
         assert_eq!(s.voltage_centivolt, 2400);
         assert!((s.voltage_v() - 24.0).abs() < 1e-3);
         assert_eq!(s.error_state, 0x07);
+    }
+
+    #[test]
+    fn legacy_pids_parse() {
+        // Captured from an MG4005 whose driver board answers 0x30 but not
+        // 0xC0. The same gains read back through 0xC0 on the other board,
+        // which is what makes the two interfaces interchangeable here.
+        let payload = [0x64, 0x64, 0x28, 0x0e, 0x3c, 0x28];
+        let p = parse_legacy_pids(Command::ReadPid.code(), &payload).unwrap();
+        assert_eq!(p.position_kp, 100);
+        assert_eq!(p.position_ki, 100);
+        assert_eq!(p.speed_kp, 40);
+        assert_eq!(p.speed_ki, 14);
+        assert_eq!(p.current_kp, 60);
+        assert_eq!(p.current_ki, 40);
+        // Widening must not invent a derivative term.
+        assert_eq!(p.position_triple(), PidTriple { kp: 100, ki: 100, kd: 0 });
+        assert_eq!(p.speed_triple(), PidTriple { kp: 40, ki: 14, kd: 0 });
+        assert_eq!(p.current_triple(), PidTriple { kp: 60, ki: 40, kd: 0 });
+    }
+
+    #[test]
+    fn legacy_pids_reject_wrong_command() {
+        let payload = [0x64, 0x64, 0x28, 0x0e, 0x3c, 0x28];
+        assert!(matches!(
+            parse_legacy_pids(Command::ReadControlParam.code(), &payload),
+            Err(ParseError::CommandMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_pids_reject_short_payload() {
+        assert!(matches!(
+            parse_legacy_pids(Command::ReadPid.code(), &[0x64, 0x64]),
+            Err(ParseError::TooShort { expected: 6, got: 2 })
+        ));
+    }
+
+    #[test]
+    fn legacy_accel_parses() {
+        assert_eq!(parse_legacy_accel(Command::ReadAccel.code(), &[0, 0, 0, 0]).unwrap(), 0);
+        // i32 little-endian, and negative values must survive the round trip.
+        let payload = (-1234i32).to_le_bytes();
+        assert_eq!(
+            parse_legacy_accel(Command::ReadAccel.code(), &payload).unwrap(),
+            -1234
+        );
     }
 
     #[test]

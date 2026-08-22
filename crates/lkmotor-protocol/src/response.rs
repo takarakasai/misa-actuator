@@ -48,6 +48,23 @@ impl MotorState1 {
 /// Parse the payload of a `ReadMotorState1` (`0x9A`) response.
 pub fn parse_state1(command: u8, data: &[u8]) -> Result<MotorState1, ParseError> {
     expect_cmd(Command::ReadMotorState1, command)?;
+    parse_state1_payload(data)
+}
+
+/// Parse the payload of a `ClearError` (`0x9B`) response.
+///
+/// Manual §2: the reply is byte-for-byte a status-1 reply, only the command
+/// byte differs. **Read the returned `error_state` rather than assuming the
+/// clear worked** — the manual is explicit that "the error flags cannot be
+/// cleared while the motor state has not yet returned to normal", so a drive
+/// still sitting under its low-voltage threshold answers with the flag still
+/// set.
+pub fn parse_clear_error(command: u8, data: &[u8]) -> Result<MotorState1, ParseError> {
+    expect_cmd(Command::ClearError, command)?;
+    parse_state1_payload(data)
+}
+
+fn parse_state1_payload(data: &[u8]) -> Result<MotorState1, ParseError> {
     expect_len(data, 7)?;
     Ok(MotorState1 {
         temperature_c: data[0] as i8,
@@ -427,6 +444,22 @@ mod tests {
         assert_eq!(s.voltage_centivolt, 2400);
         assert!((s.voltage_v() - 24.0).abs() < 1e-3);
         assert_eq!(s.error_state, 0x07);
+    }
+
+    /// `0x9B` の応答は status1 と同型（マニュアル §2、コマンドバイトだけ違う）。
+    ///
+    /// **返ってくるのは「消した後の状態」で、成功フラグではない。**
+    /// 原因が残っているとフラグは立ったまま返る。
+    #[test]
+    fn clear_error_returns_the_flags_as_they_stand_after_the_attempt() {
+        // 19.80 V (1980 = 0x07BC), 42 °C, 低電圧保護が立ったまま。
+        let payload = [42, 0xBC, 0x07, 0, 0, 0, 0x01];
+        let st = parse_clear_error(Command::ClearError.code(), &payload).unwrap();
+        assert_eq!(st.error_state, 0x01, "消えなかったことが読み取れる必要がある");
+        assert_eq!(st.voltage_centivolt, 1980);
+        assert_eq!(st.temperature_c, 42);
+        // status1 の応答を取り違えない。
+        assert!(parse_clear_error(Command::ReadMotorState1.code(), &payload).is_err());
     }
 
     #[test]

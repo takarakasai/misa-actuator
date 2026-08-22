@@ -32,7 +32,7 @@
 
 use core::f32::consts::{PI, TAU};
 
-use lkmotor_protocol::response::{ENCODER_PERIOD, MotorState2};
+use lkmotor_protocol::response::{ENCODER_PERIOD, MotorState1, MotorState2};
 
 use crate::bus::{LkBus, LkCommands, parse_state2_from_response};
 use crate::error::{Error, Result};
@@ -347,6 +347,16 @@ impl Motor {
     pub fn read_absolute_angle<B: LkBus + ?Sized>(&mut self, bus: &mut B) -> Result<f32> {
         let centideg = bus.read_multi_turn_angle(self.id)?;
         Ok(centideg as f32 / 100.0 / DEG_PER_RAD / self.config.gear_ratio)
+    }
+
+    /// Clear the drive's latched error flags (`0x9B`).
+    ///
+    /// **Returns the status the drive answers with, not a success flag.**
+    /// Clearing fails silently while the underlying condition persists
+    /// (manual §2), so check `error_state` in the reply: still non-zero means
+    /// the cause is still there — low bus voltage, over-temperature, etc.
+    pub fn clear_error<B: LkBus + ?Sized>(&mut self, bus: &mut B) -> Result<MotorState1> {
+        bus.clear_error(self.id)
     }
 
     /// Read the single-turn absolute angle (`0x94`) as raw 0.01°/LSB,

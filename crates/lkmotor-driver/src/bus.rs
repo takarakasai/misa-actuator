@@ -12,8 +12,8 @@ use lkmotor_protocol::command::{Command, ControlParamId, SettingParamId};
 use lkmotor_protocol::response::{
     ControlParamValue, LegacyPids, MotorState1, MotorState2, PidTriple, SettingParamValue,
     parse_brake_state, parse_control_param, parse_legacy_accel, parse_legacy_pids,
-    parse_multi_turn_angle, parse_setting_param, parse_single_turn_angle, parse_state1,
-    parse_state2, parse_state2_payload,
+    parse_clear_error, parse_multi_turn_angle, parse_setting_param, parse_single_turn_angle,
+    parse_state1, parse_state2, parse_state2_payload,
 };
 
 use misa_actuator::Shared;
@@ -433,6 +433,19 @@ pub trait LkCommands: LkBus {
     fn read_multi_turn_angle(&mut self, motor_id: MotorId) -> Result<i64> {
         let resp = self.transact(Command::ReadMultiTurnAngle.code(), motor_id, &[])?;
         Ok(parse_multi_turn_angle(resp.command, &resp.data)?)
+    }
+
+    /// Clear the drive's latched error flags (`0x9B`) and return the status
+    /// it answers with.
+    ///
+    /// **The reply carries the flags as they stand after the attempt.**
+    /// Manual §2: "the error flags cannot be cleared while the motor state has
+    /// not yet returned to normal" — a drive still under its low-voltage
+    /// threshold answers with the flag still set. Callers must look at
+    /// `error_state` instead of treating `Ok(_)` as success.
+    fn clear_error(&mut self, motor_id: MotorId) -> Result<MotorState1> {
+        let resp = self.transact(Command::ClearError.code(), motor_id, &[])?;
+        Ok(parse_clear_error(resp.command, &resp.data)?)
     }
 
     /// Read the motor's single-turn absolute angle (`0x94`), 0.01°/LSB,

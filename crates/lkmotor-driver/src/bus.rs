@@ -388,6 +388,30 @@ pub trait LkCommands: LkBus {
     /// sends no reply, so this uses [`LkBus::send_only`] rather than
     /// [`LkBus::transact`] (which would otherwise time out waiting for a
     /// response that never arrives).
+    ///
+    /// # Not in the RS485 manual
+    ///
+    /// Documented only for CAN (§29 "Motor restart"). Whether the RS485
+    /// firmware honours it is unverified.
+    ///
+    /// **The CAN manual cannot tell you the RS485 framing.** On CAN every
+    /// command pads `DATA[1..7]` with nulls, so `0x92` and `0x95` look
+    /// identical there — yet over RS485 one carries `CMD[3] = 0x00` and the
+    /// other `CMD[3] = 0x07` with seven zero bytes. Guessing that wrong on
+    /// `0x95` left a multi-turn counter at an arbitrary value twice
+    /// (measured on MG4005, 2026-08-21).
+    ///
+    /// The empty payload used here (`CMD[3] = 0x00`) is the right bet
+    /// because **every argument-less command in the RS485 manual uses it** —
+    /// motor off/run/stop, read status, clear error, read multi-turn, read
+    /// single-turn. §24 (`0x95`) is the sole exception in the document.
+    ///
+    /// # It resets the multi-turn origin
+    ///
+    /// A power cycle is exactly what it says: the multi-turn frame restarts
+    /// at whatever position the shaft is in, so any calibration expressed in
+    /// the old frame is gone. Prefer [`Motor::restart`], which clears the
+    /// host-side tracker to match.
     fn motor_restart(&mut self, motor_id: MotorId) -> Result<()> {
         self.send_only(Command::MotorRestart.code(), motor_id, &[])
     }

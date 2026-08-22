@@ -349,6 +349,27 @@ impl Motor {
         Ok(centideg as f32 / 100.0 / DEG_PER_RAD / self.config.gear_ratio)
     }
 
+    /// Restart the drive (`0x07`) — **equivalent to a power cycle**.
+    ///
+    /// **Not documented for RS485** (CAN §29 only), and **it resets the
+    /// multi-turn origin** to wherever the shaft is now. The host-side turn
+    /// tracker and anchor are cleared to match, so the next
+    /// [`Self::measure`] starts a fresh frame — but any *caller-held* offset
+    /// against [`Self::read_absolute_angle`] must be re-established, and any
+    /// calibration expressed in the old frame is gone.
+    ///
+    /// No reply comes back, so success can only be confirmed by re-reading
+    /// status afterwards. See [`LkBus::motor_restart`] for why the framing
+    /// is what it is.
+    pub fn restart<B: LkBus + ?Sized>(&mut self, bus: &mut B) -> Result<()> {
+        bus.motor_restart(self.id)?;
+        self.turns = 0;
+        self.prev_raw = None;
+        self.raw_origin = 0;
+        self.motor_zero_centideg = None;
+        Ok(())
+    }
+
     /// Clear the drive's latched error flags (`0x9B`).
     ///
     /// **Returns the status the drive answers with, not a success flag.**

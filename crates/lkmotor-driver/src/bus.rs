@@ -557,11 +557,24 @@ pub trait LkCommands: LkBus {
     ///
     /// RAM only: lost at the next power-down.
     fn write_max_torque_ram(&mut self, motor_id: MotorId, value: i16) -> Result<i16> {
-        let resp = self.transact(
-            Command::WriteMaxTorqueRam.code(),
-            motor_id,
-            &value.to_le_bytes(),
-        )?;
+        // Six bytes, value at offset 2. **Not two.**
+        //
+        // The CAN example is `38 00 00 00 64 00 00 00`; `0x31` next to it is
+        // `31 00 64 64 32 28 32 32` and is confirmed on hardware to take six
+        // RS485 bytes — i.e. `DATA[2..8]`, dropping the command byte *and*
+        // one padding byte. The same slice of `0x38` is
+        // `[00, 00, lo, hi, 00, 00]`.
+        //
+        // The documented sibling agrees: `0x1E` written through `0xC1` puts
+        // its `int16` at `DATA[3..5]`, after the selector plus two padding
+        // bytes (manual §19). Two independent readings land on the same
+        // offset.
+        //
+        // A bare two-byte payload was tried first and silently did nothing —
+        // the drive answered the read (`0x37`) but kept its old limit.
+        let mut data = [0u8; 6];
+        data[2..4].copy_from_slice(&value.to_le_bytes());
+        let resp = self.transact(Command::WriteMaxTorqueRam.code(), motor_id, &data)?;
         Ok(parse_max_torque_write(resp.command, &resp.data)?)
     }
 

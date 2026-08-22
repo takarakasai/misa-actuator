@@ -125,6 +125,22 @@ pub fn parse_multi_turn_angle(command: u8, data: &[u8]) -> Result<i64, ParseErro
     Ok(i64::from_le_bytes(bytes))
 }
 
+/// Parse the payload of a `ReadSingleTurnAngle` (`0x94`) response.
+///
+/// Returns the single-turn absolute angle in 0.01°/LSB, `0..=35999`, measured
+/// clockwise from the encoder's zero point (manual §23).
+///
+/// **This is the only position reading that survives a power cycle.** `0x92`
+/// counts from wherever the shaft was at power-up; this one counts from a zero
+/// stored in the drive's ROM. The price is that it wraps every motor
+/// revolution, so the caller must resolve the turn some other way.
+pub fn parse_single_turn_angle(command: u8, data: &[u8]) -> Result<u32, ParseError> {
+    expect_cmd(Command::ReadSingleTurnAngle, command)?;
+    expect_len(data, 4)?;
+    let bytes: [u8; 4] = data[0..4].try_into().unwrap();
+    Ok(u32::from_le_bytes(bytes))
+}
+
 /// PID triple as exposed by the `0x0A`/`0x0B`/`0x0C` control parameters
 /// (raw integer units, 0..=2000 per the spec).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -411,6 +427,39 @@ mod tests {
         assert_eq!(s.voltage_centivolt, 2400);
         assert!((s.voltage_v() - 24.0).abs() < 1e-3);
         assert_eq!(s.error_state, 0x07);
+    }
+
+    #[test]
+    fn single_turn_angle_parses() {
+        // 180.00° = 18000 centideg = 0x4650, little-endian u32.
+        let payload = [0x50, 0x46, 0x00, 0x00];
+        let a = parse_single_turn_angle(Command::ReadSingleTurnAngle.code(), &payload).unwrap();
+        assert_eq!(a, 18000);
+    }
+
+    #[test]
+    fn single_turn_angle_spans_a_full_turn_unsigned() {
+        // The range is 0..=35999; the top of it must not come back negative
+        // the way a signed read would.
+        let payload = 35999u32.to_le_bytes();
+        let a = parse_single_turn_angle(Command::ReadSingleTurnAngle.code(), &payload).unwrap();
+        assert_eq!(a, 35999);
+    }
+
+    #[test]
+    fn single_turn_angle_rejects_the_multi_turn_reply() {
+        // 0x92 and 0x94 both "read an angle" and differ by one bit. Only the
+        // command-code guard separates them: an 8-byte signed multi-turn
+        // count would otherwise be read as a 4-byte unsigned single-turn one.
+        // (`expect_len` is a minimum, crate-wide, so length alone won't catch it.)
+        let payload = [0u8; 8];
+        assert!(parse_single_turn_angle(Command::ReadMultiTurnAngle.code(), &payload).is_err());
+    }
+
+    #[test]
+    fn single_turn_angle_rejects_a_truncated_payload() {
+        let payload = [0x50, 0x46, 0x00];
+        assert!(parse_single_turn_angle(Command::ReadSingleTurnAngle.code(), &payload).is_err());
     }
 
     #[test]

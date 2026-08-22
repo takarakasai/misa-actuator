@@ -349,6 +349,37 @@ impl Motor {
         Ok(centideg as f32 / 100.0 / DEG_PER_RAD / self.config.gear_ratio)
     }
 
+    /// Read the single-turn absolute angle (`0x94`) as raw 0.01°/LSB,
+    /// `0..=35999` — the motor-frame value exactly as the drive reports it.
+    ///
+    /// **This is the one reading that survives a power cycle.** The reference
+    /// is the encoder zero in the drive's ROM, not the power-up position, so
+    /// the same shaft position yields the same number across power cycles.
+    /// The catch is that it wraps every motor revolution: at gear ratio `g`
+    /// one wrap is `360/g` degrees of output, and which revolution the joint
+    /// is on has to come from somewhere else (a known power-on pose, a
+    /// mechanical stop, a stored last position).
+    ///
+    /// Returned raw rather than converted, because the diagnostic use is
+    /// "does this number reproduce?" — and a conversion only obscures that.
+    pub fn read_single_turn_angle_centideg<B: LkBus + ?Sized>(
+        &mut self,
+        bus: &mut B,
+    ) -> Result<u32> {
+        bus.read_single_turn_angle(self.id)
+    }
+
+    /// The single-turn angle (`0x94`) expressed in output-frame rad, i.e.
+    /// where the joint sits **within one motor revolution**.
+    ///
+    /// Spans `0 .. 2π/gear_ratio`. See
+    /// [`Self::read_single_turn_angle_centideg`] for what this can and cannot
+    /// tell you.
+    pub fn read_single_turn_angle<B: LkBus + ?Sized>(&mut self, bus: &mut B) -> Result<f32> {
+        let centideg = self.read_single_turn_angle_centideg(bus)?;
+        Ok(centideg as f32 / 100.0 / DEG_PER_RAD / self.config.gear_ratio)
+    }
+
     /// Velocity control (`0xA2`). `vel_rad_s` is output-frame.
     pub fn set_velocity<B: LkBus + ?Sized>(
         &mut self,

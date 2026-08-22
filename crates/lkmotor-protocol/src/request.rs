@@ -190,6 +190,16 @@ pub fn encode_read_multi_turn_angle(motor_id: u8, out: &mut [u8]) -> Result<usiz
     encode_simple(Command::ReadMultiTurnAngle, motor_id, out)
 }
 
+/// Read the single-turn absolute angle (`0x94`). No payload.
+///
+/// Manual §23. Unlike `0x92`, the reference is the **encoder's own zero point**
+/// (settable with `0x19`, stored in ROM), so the value survives a power cycle.
+/// It only locates the shaft **within one motor revolution** — resolving which
+/// revolution is the caller's problem.
+pub fn encode_read_single_turn_angle(motor_id: u8, out: &mut [u8]) -> Result<usize, EncodeError> {
+    encode_simple(Command::ReadSingleTurnAngle, motor_id, out)
+}
+
 /// Read a control parameter (`0xC0`).
 ///
 /// The request payload is `[param_id, 0, 0, 0, 0, 0, 0]` (7 bytes); the motor

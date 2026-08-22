@@ -12,8 +12,8 @@ use lkmotor_protocol::command::{Command, ControlParamId, SettingParamId};
 use lkmotor_protocol::response::{
     ControlParamValue, LegacyPids, MotorState1, MotorState2, PidTriple, SettingParamValue,
     parse_brake_state, parse_control_param, parse_legacy_accel, parse_legacy_pids,
-    parse_multi_turn_angle, parse_setting_param, parse_state1, parse_state2,
-    parse_state2_payload,
+    parse_multi_turn_angle, parse_setting_param, parse_single_turn_angle, parse_state1,
+    parse_state2, parse_state2_payload,
 };
 
 use misa_actuator::Shared;
@@ -433,6 +433,18 @@ pub trait LkCommands: LkBus {
     fn read_multi_turn_angle(&mut self, motor_id: MotorId) -> Result<i64> {
         let resp = self.transact(Command::ReadMultiTurnAngle.code(), motor_id, &[])?;
         Ok(parse_multi_turn_angle(resp.command, &resp.data)?)
+    }
+
+    /// Read the motor's single-turn absolute angle (`0x94`), 0.01°/LSB,
+    /// `0..=35999`.
+    ///
+    /// Referenced to the encoder zero stored in the drive's ROM, so **this
+    /// value reproduces across a power cycle** — unlike
+    /// [`Self::read_multi_turn_angle`], which restarts at 0 every power-up.
+    /// It only pins the shaft down within one motor revolution.
+    fn read_single_turn_angle(&mut self, motor_id: MotorId) -> Result<u32> {
+        let resp = self.transact(Command::ReadSingleTurnAngle.code(), motor_id, &[])?;
+        Ok(parse_single_turn_angle(resp.command, &resp.data)?)
     }
 
     /// Set the current position as the multi-turn zero point (`0x95`, **RAM only**).

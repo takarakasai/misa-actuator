@@ -164,6 +164,9 @@ pub fn parse_single_turn_angle(command: u8, data: &[u8]) -> Result<u32, ParseErr
 /// payload shape on RS485. The write echoes the stored value back, so the
 /// caller can confirm rather than assume.
 fn parse_max_torque_inner(data: &[u8]) -> Result<i16, ParseError> {
+    // The value is `int32` on the wire (same shape as `0x34`'s acceleration),
+    // but the useful range is far inside `i16`. Accept either width so a
+    // short reply is not mistaken for a parse failure, and read the low half.
     expect_len(data, 2)?;
     Ok(i16::from_le_bytes([data[0], data[1]]))
 }

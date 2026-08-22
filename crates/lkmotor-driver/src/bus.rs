@@ -557,24 +557,30 @@ pub trait LkCommands: LkBus {
     ///
     /// RAM only: lost at the next power-down.
     fn write_max_torque_ram(&mut self, motor_id: MotorId, value: i16) -> Result<i16> {
-        // Six bytes, value at offset 2. **Not two.**
+        // **Four bytes: the value is `int32`, not `int16`.**
         //
-        // The CAN example is `38 00 00 00 64 00 00 00`; `0x31` next to it is
-        // `31 00 64 64 32 28 32 32` and is confirmed on hardware to take six
-        // RS485 bytes — i.e. `DATA[2..8]`, dropping the command byte *and*
-        // one padding byte. The same slice of `0x38` is
-        // `[00, 00, lo, hi, 00, 00]`.
+        // The V2.3 spec has no `0x38`, but it does specify its sibling
+        // `0x34` (write acceleration): `Data length = 0x04`, four raw value
+        // bytes, **no padding**. Line the CAN examples up and the shape is
+        // unmistakable:
         //
-        // The documented sibling agrees: `0x1E` written through `0xC1` puts
-        // its `int16` at `DATA[3..5]`, after the selector plus two padding
-        // bytes (manual §19). Two independent readings land on the same
-        // offset.
+        // ```text
+        // A2 00 00 00 A0 8C 00 00   speed closed loop     int32 @ DATA[4..8]
+        // 34 00 00 00 B8 0B 00 00   write acceleration    int32 @ DATA[4..8]
+        // 38 00 00 00 64 00 00 00   write max torque      same shape
+        // ```
         //
-        // A bare two-byte payload was tried first and silently did nothing —
-        // the drive answered the read (`0x37`) but kept its old limit.
-        let mut data = [0u8; 6];
-        data[2..4].copy_from_slice(&value.to_le_bytes());
-        let resp = self.transact(Command::WriteMaxTorqueRam.code(), motor_id, &data)?;
+        // Two earlier guesses failed on hardware: two bytes (silently did
+        // nothing — the drive answered `0x37` but kept its old limit), and
+        // six bytes copied from `0x31`'s layout. `0x31` is a six-*parameter*
+        // command, so its length says nothing about a scalar write; `0x34`
+        // is the right yardstick.
+        let raw = i32::from(value);
+        let resp = self.transact(
+            Command::WriteMaxTorqueRam.code(),
+            motor_id,
+            &raw.to_le_bytes(),
+        )?;
         Ok(parse_max_torque_write(resp.command, &resp.data)?)
     }
 

@@ -435,6 +435,31 @@ pub trait LkCommands: LkBus {
         Ok(parse_multi_turn_angle(resp.command, &resp.data)?)
     }
 
+    /// Set the current position as the multi-turn zero point (`0x95`, **RAM only**).
+    ///
+    /// Manual §24. The effect on the multi-turn frame is exactly that of a
+    /// power cycle — the origin lands under the shaft where it is now — without
+    /// cutting power. Lost at the next real power-up.
+    ///
+    /// Not to be confused with `0x19` (`WriteCurrentPosAsZero`), which writes
+    /// ROM and costs flash cycles. This one writes nothing persistent.
+    ///
+    /// **The frame carries 7 zero data bytes and the drive replies** with the
+    /// same 8 bytes (manual §24). Both matter: sending an empty payload was
+    /// measured on MG4005 to leave the multi-turn counter at a large arbitrary
+    /// value (+293 rad on a joint that had been near zero, 2026-08-21).
+    ///
+    /// Callers holding a host-side frame offset (see `Motor::read_absolute_angle`)
+    /// must re-establish it afterwards; the motor's frame moved under them.
+    fn set_current_position_as_zero_ram(&mut self, motor_id: MotorId) -> Result<()> {
+        self.transact(
+            Command::SetCurrentPositionAsZeroRam.code(),
+            motor_id,
+            &[0u8; 7],
+        )?;
+        Ok(())
+    }
+
     /// Single-turn position control 1 (`0xA5`). `counterclockwise`: `false`=CW,
     /// `true`=CCW. `angle_centideg` is unsigned `0.01 deg/LSB`. Reply is
     /// State2-shaped — decode with [`parse_state2_from_response`].

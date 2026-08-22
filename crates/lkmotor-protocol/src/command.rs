@@ -31,8 +31,16 @@ pub enum Command {
     ReadMultiTurnAngle = 0x92,
     /// Read single-turn angle.
     ReadSingleTurnAngle = 0x94,
-    /// Clear stored motor angle (zero the multi-turn counter).
-    ClearMotorAngle = 0x95,
+    /// Set the current position as the multi-turn zero point (**RAM only**).
+    ///
+    /// Manual §24. Not "clear the counter": it puts the origin under the shaft
+    /// where it is now, exactly as a power-up does. Lost at the next power-up.
+    ///
+    /// **Carries 7 zero data bytes** (`CMD[3] = 0x07`) and **the drive replies**
+    /// with the same 8 bytes. Sending it with an empty payload produces
+    /// undefined behaviour — measured on MG4005 as a multi-turn counter left at
+    /// a large arbitrary value (2026-08-21).
+    SetCurrentPositionAsZeroRam = 0x95,
 
     /// Read motor state 1 (temperature, voltage, error flags).
     ReadMotorState1 = 0x9A,

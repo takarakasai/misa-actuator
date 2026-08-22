@@ -319,6 +319,29 @@ impl Motor {
         Ok(self.feedback_from_state2(s))
     }
 
+    /// Put the multi-turn origin under the shaft where it is now (`0x95`) —
+    /// a power cycle as far as the multi-turn frame is concerned, without
+    /// cutting power.
+    ///
+    /// Useful when the motor supply cannot be switched independently of the
+    /// host (one shared rail), which is the usual bench situation.
+    ///
+    /// **Writes nothing to ROM.** Unlike `0x19`
+    /// (`WriteCurrentPosAsZero`), this costs no flash cycles and is undone by
+    /// the next real power cycle.
+    ///
+    /// The host-side turn tracker and any anchor are reset too, so the next
+    /// [`Self::measure`] starts a fresh frame. Callers keeping their own
+    /// offset against [`Self::read_absolute_angle`] must re-read it.
+    pub fn clear_multi_turn<B: LkBus + ?Sized>(&mut self, bus: &mut B) -> Result<()> {
+        bus.set_current_position_as_zero_ram(self.id)?;
+        self.turns = 0;
+        self.prev_raw = None;
+        self.raw_origin = 0;
+        self.motor_zero_centideg = None;
+        Ok(())
+    }
+
     /// Read the absolute multi-turn position (`0x92`) in output-frame rad
     /// (motor power-on frame). Pairs with [`Self::set_position_absolute`].
     pub fn read_absolute_angle<B: LkBus + ?Sized>(&mut self, bus: &mut B) -> Result<f32> {

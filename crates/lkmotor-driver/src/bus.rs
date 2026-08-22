@@ -11,7 +11,7 @@ use std::time::Duration;
 use lkmotor_protocol::command::{Command, ControlParamId, SettingParamId};
 use lkmotor_protocol::response::{
     ControlParamValue, LegacyPids, MotorState1, MotorState2, PidTriple, SettingParamValue,
-    parse_brake_state, parse_control_param, parse_legacy_accel, parse_legacy_pids,
+    parse_brake_state, parse_control_param, parse_legacy_accel, parse_legacy_pids, parse_legacy_pids_write,
     parse_clear_error, parse_control_param_write, parse_max_torque, parse_max_torque_write,
     parse_multi_turn_angle, parse_setting_param, parse_single_turn_angle,
     parse_state1, parse_state2, parse_state2_payload,
@@ -488,6 +488,46 @@ pub trait LkCommands: LkBus {
         data[5..7].copy_from_slice(&pid.kd.to_le_bytes());
         let resp = self.transact(Command::WriteControlParamRam.code(), motor_id, &data)?;
         Ok(parse_control_param_write(resp.command, &resp.data, param)?)
+    }
+
+    /// Write PID gains into **RAM** through the legacy `0x31` command.
+    ///
+    /// **Undocumented in the RS485 manual.** The frame comes from the
+    /// vendor's CAN example list:
+    ///
+    /// ```text
+    /// 31 00 64 64 32 28 32 32  // 写入PID到RAM
+    /// //  ^^ padding, then posKp posKi spdKp spdKi curKp curKi
+    /// ```
+    ///
+    /// RS485 drops the CAN padding (see [`Self::read_max_torque`] for the
+    /// reasoning), so this is six bytes — the same six the `0x30` read
+    /// returns, in the same order.
+    ///
+    /// # There is no Kd here
+    ///
+    /// The legacy set is Kp/Ki for three loops and nothing else. Drives that
+    /// speak only this command set **cannot be given a derivative term** by
+    /// any route. Callers wanting a uniform tuning across a mixed fleet have
+    /// to work within that.
+    ///
+    /// Gains are `u8` here, against `u16` (0..=2000) on `0xC0`/`0xC1`.
+    /// Values above 255 cannot be expressed — the caller must decide what to
+    /// do rather than have them silently wrap.
+    ///
+    /// RAM only: lost at the next power-down. There is a ROM variant
+    /// (`0x32`); it is deliberately not wired.
+    fn write_legacy_pids_ram(&mut self, motor_id: MotorId, pids: LegacyPids) -> Result<LegacyPids> {
+        let data = [
+            pids.position_kp,
+            pids.position_ki,
+            pids.speed_kp,
+            pids.speed_ki,
+            pids.current_kp,
+            pids.current_ki,
+        ];
+        let resp = self.transact(Command::WritePidRam.code(), motor_id, &data)?;
+        Ok(parse_legacy_pids_write(resp.command, &resp.data)?)
     }
 
     /// Read the max-torque limit through the legacy `0x37` command.

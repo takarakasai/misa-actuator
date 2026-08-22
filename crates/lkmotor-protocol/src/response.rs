@@ -264,6 +264,23 @@ pub fn parse_legacy_pids(command: u8, data: &[u8]) -> Result<LegacyPids, ParseEr
     })
 }
 
+/// Parse the payload of a legacy `WritePidRam` (`0x31`) response.
+///
+/// Same six bytes as the read, only the command byte differs. **Returns what
+/// the drive stored, not a success flag.**
+pub fn parse_legacy_pids_write(command: u8, data: &[u8]) -> Result<LegacyPids, ParseError> {
+    expect_cmd(Command::WritePidRam, command)?;
+    expect_len(data, 6)?;
+    Ok(LegacyPids {
+        position_kp: data[0],
+        position_ki: data[1],
+        speed_kp: data[2],
+        speed_ki: data[3],
+        current_kp: data[4],
+        current_ki: data[5],
+    })
+}
+
 /// Parse the payload of a legacy `ReadAccel` (`0x33`) response.
 ///
 /// Wire layout (4 bytes): acceleration as an `i32` little-endian, in 1 dps/s.
@@ -539,6 +556,19 @@ mod tests {
             ControlParamId::PositionLoopPid
         )
         .is_err());
+    }
+
+    /// 旧 PID 書き込みは読み出しと同じ 6 バイト。**Kd の枠は無い。**
+    #[test]
+    fn legacy_pid_write_mirrors_the_read() {
+        let payload = [20u8, 0, 40, 14, 60, 40];
+        let p = parse_legacy_pids_write(Command::WritePidRam.code(), &payload).unwrap();
+        assert_eq!(p.position_kp, 20);
+        assert_eq!(p.position_ki, 0);
+        assert_eq!(p.current_kp, 60);
+        // 読みと書きを取り違えない。
+        assert!(parse_legacy_pids_write(Command::ReadPid.code(), &payload).is_err());
+        assert!(parse_legacy_pids(Command::WritePidRam.code(), &payload).is_err());
     }
 
     /// 旧インタフェースの最大トルクは 2 バイト（`int16` LE）。

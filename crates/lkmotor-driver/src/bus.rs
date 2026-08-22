@@ -489,6 +489,33 @@ pub trait LkCommands: LkBus {
         Ok(parse_control_param_write(resp.command, &resp.data, param)?)
     }
 
+    /// Write an `int16` control parameter into **RAM** (`0xC1`, manual §19).
+    ///
+    /// The payload layout differs from the PID triples: the value sits in
+    /// `DATA[3..5]`, not `DATA[1..3]`. Getting that wrong writes zero and
+    /// looks like it worked.
+    ///
+    /// The one that matters for compliance is
+    /// [`ControlParamId::TorqueLimit`] (`0x1E`, 0..=2000 on MG). **Lowering
+    /// it is the direct lever**: PID gains change how hard the drive *tries*
+    /// to correct, but the current limit caps how hard it *can* push, which
+    /// is what a hand pushing the joint feels.
+    ///
+    /// RAM only — lost at the next power-down, which is what makes it safe
+    /// to experiment with.
+    fn write_control_i16_ram(
+        &mut self,
+        motor_id: MotorId,
+        param: ControlParamId,
+        value: i16,
+    ) -> Result<ControlParamValue> {
+        let mut data = [0u8; 7];
+        data[0] = param.code();
+        data[3..5].copy_from_slice(&value.to_le_bytes());
+        let resp = self.transact(Command::WriteControlParamRam.code(), motor_id, &data)?;
+        Ok(parse_control_param_write(resp.command, &resp.data, param)?)
+    }
+
     /// Clear the drive's latched error flags (`0x9B`) and return the status
     /// it answers with.
     ///

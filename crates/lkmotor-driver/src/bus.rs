@@ -12,7 +12,7 @@ use lkmotor_protocol::command::{Command, ControlParamId, SettingParamId};
 use lkmotor_protocol::response::{
     ControlParamValue, LegacyPids, MotorState1, MotorState2, PidTriple, SettingParamValue,
     parse_brake_state, parse_control_param, parse_legacy_accel, parse_legacy_pids,
-    parse_clear_error, parse_multi_turn_angle, parse_setting_param, parse_single_turn_angle,
+    parse_clear_error, parse_control_param_write, parse_multi_turn_angle, parse_setting_param, parse_single_turn_angle,
     parse_state1, parse_state2, parse_state2_payload,
 };
 
@@ -457,6 +457,36 @@ pub trait LkCommands: LkBus {
     fn read_multi_turn_angle(&mut self, motor_id: MotorId) -> Result<i64> {
         let resp = self.transact(Command::ReadMultiTurnAngle.code(), motor_id, &[])?;
         Ok(parse_multi_turn_angle(resp.command, &resp.data)?)
+    }
+
+    /// Write a PID triple into **RAM** (`0xC1`, manual §19).
+    ///
+    /// **RAM only: the value takes effect immediately and is lost at the next
+    /// power-down.** That is the point — gains can be tried on the bench and
+    /// undone by cutting power. There is a ROM variant in the manual; it is
+    /// deliberately not wired here.
+    ///
+    /// Each gain is `u16`, range 0..=2000 per the parameter table. The drive
+    /// echoes the write back in the same shape as [`Self::read_control_param`],
+    /// so the caller can confirm what actually landed rather than assuming.
+    ///
+    /// **Not every drive answers this.** Firmware generations differ: on one
+    /// MG4005 fleet, 5 of 12 axes answered only the undocumented `0x30`
+    /// family and 7 answered only `0xC0`/`0xC1` (measured 2026-08-22).
+    /// Pair this with the interface that the *read* succeeded on.
+    fn write_control_pid_ram(
+        &mut self,
+        motor_id: MotorId,
+        param: ControlParamId,
+        pid: PidTriple,
+    ) -> Result<ControlParamValue> {
+        let mut data = [0u8; 7];
+        data[0] = param.code();
+        data[1..3].copy_from_slice(&pid.kp.to_le_bytes());
+        data[3..5].copy_from_slice(&pid.ki.to_le_bytes());
+        data[5..7].copy_from_slice(&pid.kd.to_le_bytes());
+        let resp = self.transact(Command::WriteControlParamRam.code(), motor_id, &data)?;
+        Ok(parse_control_param_write(resp.command, &resp.data, param)?)
     }
 
     /// Clear the drive's latched error flags (`0x9B`) and return the status

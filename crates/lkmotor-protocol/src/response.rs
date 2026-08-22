@@ -276,6 +276,28 @@ pub fn parse_control_param(
     expected: ControlParamId,
 ) -> Result<ControlParamValue, ParseError> {
     expect_cmd(Command::ReadControlParam, command)?;
+    parse_control_param_payload(data, expected)
+}
+
+/// Parse the payload of a `WriteControlParamRam` (`0xC1`) response.
+///
+/// The drive echoes the write back in the same shape as the read, only the
+/// command byte differs (manual §19). **Read it instead of assuming the write
+/// landed** — the value that comes back is what the drive actually stored,
+/// and it can differ from what was asked for (range clamping).
+pub fn parse_control_param_write(
+    command: u8,
+    data: &[u8],
+    expected: ControlParamId,
+) -> Result<ControlParamValue, ParseError> {
+    expect_cmd(Command::WriteControlParamRam, command)?;
+    parse_control_param_payload(data, expected)
+}
+
+fn parse_control_param_payload(
+    data: &[u8],
+    expected: ControlParamId,
+) -> Result<ControlParamValue, ParseError> {
     expect_len(data, 7)?;
     if data[0] != expected.code() {
         return Err(ParseError::ParamIdMismatch {
@@ -460,6 +482,38 @@ mod tests {
         assert_eq!(st.temperature_c, 42);
         // status1 の応答を取り違えない。
         assert!(parse_clear_error(Command::ReadMotorState1.code(), &payload).is_err());
+    }
+
+    /// 書き込みの応答は**書き込んだ後の値**を返す（マニュアル §19）。
+    ///
+    /// **`Ok(_)` を成功と読まず、返ってきた値を見ること。** 範囲外を
+    /// 投げるとクランプされた値が返る。
+    #[test]
+    fn a_control_param_write_echoes_what_the_drive_stored() {
+        // Kp=60, Ki=100, Kd=0 を書いた応答。
+        let payload = [
+            ControlParamId::PositionLoopPid.code(),
+            60,
+            0,
+            100,
+            0,
+            0,
+            0,
+        ];
+        let v = parse_control_param_write(
+            Command::WriteControlParamRam.code(),
+            &payload,
+            ControlParamId::PositionLoopPid,
+        )
+        .unwrap();
+        assert_eq!(v, ControlParamValue::Pid(PidTriple { kp: 60, ki: 100, kd: 0 }));
+        // 読み出し (0xC0) の応答と取り違えない。
+        assert!(parse_control_param_write(
+            Command::ReadControlParam.code(),
+            &payload,
+            ControlParamId::PositionLoopPid
+        )
+        .is_err());
     }
 
     #[test]

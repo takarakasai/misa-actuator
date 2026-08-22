@@ -158,6 +158,31 @@ pub fn parse_single_turn_angle(command: u8, data: &[u8]) -> Result<u32, ParseErr
     Ok(u32::from_le_bytes(bytes))
 }
 
+/// Parse a legacy max-torque reply (`0x37` read / `0x38` write).
+///
+/// **Undocumented.** Two bytes, `int16` little-endian, mirroring `0xA1`'s
+/// payload shape on RS485. The write echoes the stored value back, so the
+/// caller can confirm rather than assume.
+fn parse_max_torque_inner(data: &[u8]) -> Result<i16, ParseError> {
+    expect_len(data, 2)?;
+    Ok(i16::from_le_bytes([data[0], data[1]]))
+}
+
+/// Parse the payload of a legacy `ReadMaxTorque` (`0x37`) response.
+pub fn parse_max_torque(command: u8, data: &[u8]) -> Result<i16, ParseError> {
+    expect_cmd(Command::ReadMaxTorque, command)?;
+    parse_max_torque_inner(data)
+}
+
+/// Parse the payload of a legacy `WriteMaxTorqueRam` (`0x38`) response.
+///
+/// **Returns what the drive stored, not a success flag.** Out-of-range
+/// values come back clamped.
+pub fn parse_max_torque_write(command: u8, data: &[u8]) -> Result<i16, ParseError> {
+    expect_cmd(Command::WriteMaxTorqueRam, command)?;
+    parse_max_torque_inner(data)
+}
+
 /// PID triple as exposed by the `0x0A`/`0x0B`/`0x0C` control parameters
 /// (raw integer units, 0..=2000 per the spec).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -514,6 +539,30 @@ mod tests {
             ControlParamId::PositionLoopPid
         )
         .is_err());
+    }
+
+    /// 旧インタフェースの最大トルクは 2 バイト（`int16` LE）。
+    ///
+    /// **RS485 は CAN のパディングを落とす。** CAN の例は
+    /// `38 00 00 00 64 00 00 00` で値が DATA[4..6] にあるが、RS485 では
+    /// `0xA1` が `CMD[3] = 0x02` で値 2 バイトだけ（マニュアル §10）なのと
+    /// 同じ形になる。**ここを取り違えると 0 を書いて成功したように見える。**
+    #[test]
+    fn legacy_max_torque_is_two_bytes() {
+        let payload = 400i16.to_le_bytes();
+        assert_eq!(
+            parse_max_torque(Command::ReadMaxTorque.code(), &payload).unwrap(),
+            400
+        );
+        assert_eq!(
+            parse_max_torque_write(Command::WriteMaxTorqueRam.code(), &payload).unwrap(),
+            400
+        );
+        // 読みと書きを取り違えない。
+        assert!(parse_max_torque(Command::WriteMaxTorqueRam.code(), &payload).is_err());
+        assert!(parse_max_torque_write(Command::ReadMaxTorque.code(), &payload).is_err());
+        // 1 バイトしか来なければ拒む（0 を読んだことにしない）。
+        assert!(parse_max_torque(Command::ReadMaxTorque.code(), &payload[..1]).is_err());
     }
 
     #[test]

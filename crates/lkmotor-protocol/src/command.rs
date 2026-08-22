@@ -17,6 +17,15 @@ pub enum Command {
     WritePidRom = 0x32,
     /// Read acceleration value.
     ReadAccel = 0x33,
+    /// Read the max-torque limit (**undocumented in the RS485 manual**;
+    /// the frame appears in the vendor's CAN example list as 读取最大扭矩).
+    ReadMaxTorque = 0x37,
+    /// Write the max-torque limit to RAM (**undocumented**; 写入最大扭矩到RAM).
+    ///
+    /// The legacy counterpart of [`ControlParamId::TorqueLimit`] (`0x1E`
+    /// via `0xC1`). Drives that answer the old `0x30` family but not `0xC0`
+    /// need this one instead.
+    WriteMaxTorqueRam = 0x38,
     /// Write acceleration value to RAM.
     WriteAccelRam = 0x34,
 

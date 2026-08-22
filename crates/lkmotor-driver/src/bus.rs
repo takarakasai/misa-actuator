@@ -12,7 +12,8 @@ use lkmotor_protocol::command::{Command, ControlParamId, SettingParamId};
 use lkmotor_protocol::response::{
     ControlParamValue, LegacyPids, MotorState1, MotorState2, PidTriple, SettingParamValue,
     parse_brake_state, parse_control_param, parse_legacy_accel, parse_legacy_pids,
-    parse_clear_error, parse_control_param_write, parse_multi_turn_angle, parse_setting_param, parse_single_turn_angle,
+    parse_clear_error, parse_control_param_write, parse_max_torque, parse_max_torque_write,
+    parse_multi_turn_angle, parse_setting_param, parse_single_turn_angle,
     parse_state1, parse_state2, parse_state2_payload,
 };
 
@@ -487,6 +488,41 @@ pub trait LkCommands: LkBus {
         data[5..7].copy_from_slice(&pid.kd.to_le_bytes());
         let resp = self.transact(Command::WriteControlParamRam.code(), motor_id, &data)?;
         Ok(parse_control_param_write(resp.command, &resp.data, param)?)
+    }
+
+    /// Read the max-torque limit through the legacy `0x37` command.
+    ///
+    /// **Undocumented in the RS485 manual.** The frame comes from the
+    /// vendor's CAN example list (`37 00 00 00 00 00 00 00`, 读取最大扭矩).
+    /// RS485 drops the CAN padding — compare `0xA1`, which is
+    /// `A1 00 00 00 64 00 00 00` on CAN but `CMD[3] = 0x02` with just the
+    /// two value bytes on RS485 (manual §10). So this one carries no
+    /// payload, exactly like `0x30` (which is observed to work that way).
+    ///
+    /// Same board-dependent availability as [`Self::read_legacy_pids`]:
+    /// firmware generations differ, and the drives that answer `0xC0` may
+    /// not answer this.
+    fn read_max_torque(&mut self, motor_id: MotorId) -> Result<i16> {
+        let resp = self.transact(Command::ReadMaxTorque.code(), motor_id, &[])?;
+        Ok(parse_max_torque(resp.command, &resp.data)?)
+    }
+
+    /// Write the max-torque limit into **RAM** through the legacy `0x38`.
+    ///
+    /// **Undocumented**; see [`Self::read_max_torque`] for where the frame
+    /// comes from and why it is two bytes. This is the legacy counterpart of
+    /// `0x1E` via `0xC1` — **the lever that actually makes a joint
+    /// back-drivable**, and the only way to reach it on drives that speak
+    /// only the old command set.
+    ///
+    /// RAM only: lost at the next power-down.
+    fn write_max_torque_ram(&mut self, motor_id: MotorId, value: i16) -> Result<i16> {
+        let resp = self.transact(
+            Command::WriteMaxTorqueRam.code(),
+            motor_id,
+            &value.to_le_bytes(),
+        )?;
+        Ok(parse_max_torque_write(resp.command, &resp.data)?)
     }
 
     /// Write an `int16` control parameter into **RAM** (`0xC1`, manual §19).

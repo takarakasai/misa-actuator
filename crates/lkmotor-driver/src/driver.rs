@@ -18,7 +18,9 @@ use crate::bus::{LkBus, Response};
 use crate::error::{Error, Result};
 use crate::motor_id::MotorId;
 
-/// Default per-byte read timeout used when polling for a response.
+/// Initial read timeout applied when the port is opened. Each receive loop
+/// then narrows it to the time left before its own deadline, so this is only
+/// the value in effect before the first `response_timeout` window starts.
 const READ_POLL_TIMEOUT: Duration = Duration::from_millis(20);
 
 /// RS485 (V3 protocol) bus for the LKMTech servo motor family.
@@ -139,11 +141,19 @@ impl Rs485Driver {
                 }
             }
 
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 return Err(Error::Timeout {
                     motor_id: motor_id.get(),
                 });
             }
+            // Shrink the poll(2) window to whatever is left before the
+            // deadline. With the port stuck at READ_POLL_TIMEOUT, a silent bus
+            // sleeps the full 20 ms no matter how small `response_timeout` is,
+            // so the configured value never takes effect. `set_timeout` on a
+            // TTYPort is a plain field assignment, so doing this per read costs
+            // nothing, and a reply still wakes the poll immediately.
+            let _ = self.port.set_timeout(deadline - now);
 
             match self.port.read(&mut scratch) {
                 Ok(0) => {}
@@ -301,9 +311,14 @@ impl Rs485Driver {
                     }
                 }
 
-                if Instant::now() >= deadline {
+                let now = Instant::now();
+                if now >= deadline {
                     break;
                 }
+                // Same deadline-tracking as `recv_for`: without this the reply
+                // window is floored at READ_POLL_TIMEOUT instead of
+                // `response_timeout`.
+                let _ = self.port.set_timeout(deadline - now);
 
                 match self.port.read(&mut scratch) {
                     Ok(0) => {}

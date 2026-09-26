@@ -1,0 +1,15 @@
+[package]
+name = "fashionstar-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Pure protocol layer for FashionStar UART bus servos (no_std-friendly)"
+
+[features]
+default = []
+# When enabled, brings in `alloc` for the owned streaming `ResponseParser`.
+alloc = []
+
+[dependencies]

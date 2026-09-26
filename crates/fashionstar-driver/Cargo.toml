@@ -1,0 +1,28 @@
+[package]
+name = "fashionstar-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Rust driver for FashionStar UART bus servos (Star Arm 102 / reBot Arm 102)"
+
+[dependencies]
+misa-actuator = { workspace = true }
+fashionstar-protocol = { workspace = true, features = ["alloc"] }
+serialport = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+env_logger = { workspace = true }
+clap = { workspace = true }
+ctrlc = { workspace = true }
+
+[[example]]
+name = "scan"
+path = "examples/scan.rs"
+
+[[example]]
+name = "monitor"
+path = "examples/monitor.rs"

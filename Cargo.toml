@@ -25,6 +25,8 @@ default-members = [
     "crates/myactuator-protocol",
     "crates/myactuator-driver",
     "crates/myactuator-cli",
+    "crates/fashionstar-protocol",
+    "crates/fashionstar-driver",
     "crates/misa-sysid",
 ]
 
@@ -46,6 +48,8 @@ members = [
     "crates/myactuator-protocol",
     "crates/myactuator-driver",
     "crates/myactuator-cli",
+    "crates/fashionstar-protocol",
+    "crates/fashionstar-driver",
     "crates/misa-sysid",
 ]
 
@@ -70,6 +74,8 @@ damiao-protocol = { path = "crates/damiao-protocol", version = "0.1.0" }
 damiao-driver = { path = "crates/damiao-driver", version = "0.1.0" }
 myactuator-protocol = { path = "crates/myactuator-protocol", version = "0.1.0" }
 myactuator-driver = { path = "crates/myactuator-driver", version = "0.1.0" }
+fashionstar-protocol = { path = "crates/fashionstar-protocol", version = "0.1.0" }
+fashionstar-driver = { path = "crates/fashionstar-driver", version = "0.1.0" }
 misa-sysid = { path = "crates/misa-sysid", version = "0.1.0" }
 
 # Shared third-party deps

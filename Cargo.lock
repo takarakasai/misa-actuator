@@ -412,6 +412,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "fashionstar-driver"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "ctrlc",
+ "env_logger",
+ "fashionstar-protocol",
+ "log",
+ "misa-actuator",
+ "serialport",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "fashionstar-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

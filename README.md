@@ -32,7 +32,9 @@ crates/
 ├── damiao-cli/             # CLI test app for DAMIAO
 ├── myactuator-protocol/    # MyActuator RMD CAN-V3 frame codec (no_std)
 ├── myactuator-driver/      # MyActuator RMD driver (SocketCAN), impl Actuator
-└── myactuator-cli/         # CLI test app for MyActuator RMD
+├── myactuator-cli/         # CLI test app for MyActuator RMD
+├── fashionstar-protocol/   # FashionStar UART bus-servo frame codec (no_std)
+└── fashionstar-driver/     # FashionStar driver (UART), impl Actuator
 ```
 
 ## Supported motors
@@ -43,6 +45,7 @@ crates/
 | LK Motor (上海凌控) V3 | MG4005 etc. | RS485 | current-based torque (`--kt`), soft zero |
 | DAMIAO | DM-J4310, DM-J3507 | CAN classic / CAN-FD | register-based run modes |
 | MyActuator RMD (CAN V3) | RMD-X / RMD-L V3 firmware | CAN | output-shaft wire units, native motion (MIT) mode |
+| FashionStar bus servo | Star Arm 102 (reBot Arm 102) joints | UART (CH340, 1 Mbit/s) | position only; `sync_monitor` reads a whole arm per request; `set_zero` writes NVM |
 
 "CAN" above means any transport `misa-can` supports, selected by the
 `--interface` string:

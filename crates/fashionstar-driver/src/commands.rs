@@ -184,6 +184,23 @@ pub trait FsCommands: FsBus {
             .collect())
     }
 
+    /// [`Self::sync_monitor`] split into requests of at most `chunk` servos.
+    ///
+    /// Measured on a Star Arm 102 LD through its CH340 hub at 1 Mbps
+    /// (2026-10-02): in one sync request the **4th and later** replies lose
+    /// bytes 25–35 % of the time, whichever servos they are, while groups of
+    /// up to 3 (63 bytes of back-to-back replies) arrive intact every time.
+    /// The adapter's receive FIFO apparently overruns on longer bursts. With
+    /// 7 servos: one request 133 Hz with 3 joints dropping a quarter of their
+    /// readings; chunks of 3 (3+3+1) 95 Hz with none dropped.
+    fn sync_monitor_chunked(&mut self, ids: &[u8], chunk: usize) -> Result<Vec<Option<Monitor>>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for group in ids.chunks(chunk.max(1)) {
+            out.extend(self.sync_monitor(group)?);
+        }
+        Ok(out)
+    }
+
     /// Stop with `mode` and the SDK's default power argument (0).
     ///
     /// [`StopMode::Release`] makes the joint limp (how the leader arm is

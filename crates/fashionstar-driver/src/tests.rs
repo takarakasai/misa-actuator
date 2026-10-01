@@ -188,6 +188,24 @@ fn sync_monitor_whole_arm_any_order_with_echo() {
 }
 
 #[test]
+fn sync_monitor_chunked_splits_requests_and_keeps_order() {
+    let mut bank = Bank::arm(&LEADER);
+    bank.reverse = true;
+    let mut bus = bank.into_bus(Duration::from_millis(500));
+    let got = bus.sync_monitor_chunked(&LEADER, 3).unwrap();
+    assert_eq!(got.len(), 7);
+    for (i, m) in got.iter().enumerate() {
+        assert_eq!(m.expect("every servo answered").id, LEADER[i]);
+    }
+    // 3 + 3 + 1: three sync requests, each listing its own ids.
+    let written = bus.transport().written();
+    assert_eq!(written.len(), 3);
+    assert_eq!(&written[0][6..10], &[3, 0, 1, 2]);
+    assert_eq!(&written[1][6..10], &[3, 3, 4, 5]);
+    assert_eq!(&written[2][6..8], &[1, 6]);
+}
+
+#[test]
 fn sync_monitor_missing_and_invalid_become_none() {
     let mut bank = Bank::arm(&LEADER);
     bank.servos.remove(&4);
